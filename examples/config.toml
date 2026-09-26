@@ -1,0 +1,129 @@
+# ai-code configuration
+#
+# Layers, lowest precedence first:
+#   built-in defaults
+#   $XDG_CONFIG_HOME/ai-code/config.toml   (this file)
+#   ./.ai-code/config.toml                 (per project)
+#   AI_CODE_* environment variables
+#   command-line flags
+#
+# Later layers override earlier ones key by key. A project file that sets one
+# key does not discard everything else.
+
+default_provider = "home"
+default_mode     = "build"
+
+# Overrides $VISUAL and $EDITOR for Ctrl-G and /editor.
+# editor = "nvim"
+
+[ui]
+theme                = "auto"       # a chroma style name, or "none"
+reasoning            = "collapsed"  # off | collapsed | full
+color                = "auto"       # auto | always | never
+status_line          = true
+context_warn_percent = 80
+
+[agent]
+# max_iterations = 200            # 0 (the default) is unlimited: a task runs
+                                  # until the model finishes. A turn count
+                                  # cannot tell a long task from a stuck one,
+                                  # and loop_guard and auto_compact handle the
+                                  # cases that actually run away. Set a number
+                                  # only on a metered provider.
+# max_tokens   = 8192              # 0 (the default) sends no cap: the server
+                                   # generates until the model stops or the
+                                   # context window is full. Set a number only
+                                   # if you want a ceiling -- a fixed cap is a
+                                   # shrinking fraction of a growing window, and
+                                   # on a reasoning model the thinking channel
+                                   # spends it before the answer starts.
+# thinking     = "high"            # starting thinking level: none, minimal,
+                                   # low, medium, high, xhigh or max. Which of
+                                   # them a model distinguishes is its own
+                                   # business; the set of words is closed here
+                                   # because no backend validates it. Unset
+                                   # sends no field at all, leaving the
+                                   # server's default. /think changes it
+                                   # mid-session.
+# temperature  = 0.7
+parallel_reads = true               # run read-only tools concurrently
+loop_guard     = 4                  # stop after N identical tool calls in a row
+# context_override = 32768          # when the server reports nothing usable
+
+auto_compact               = true   # summarise at the reserve instead of stopping
+compact_reserve_tokens     = 16384  # room kept free: one full response plus the
+                                    # summarisation call compaction itself makes.
+                                    # This is the only ceiling ai-code puts on a
+                                    # response, and reaching it compacts rather
+                                    # than truncates.
+compact_keep_recent_tokens = 20000  # tail kept verbatim rather than paraphrased
+
+auto_checkpoint            = true   # while the prompt sits idle, summarise the
+                                    # session and keep the summary *beside* the
+                                    # transcript, so a later model swap, a
+                                    # narrower window or a restart does not have
+                                    # to stop and make one. It replaces nothing,
+                                    # and the next key you press abandons it.
+auto_checkpoint_idle_delay = "120s" # how long the prompt must sit untouched
+                                    # first. 0 means as soon as the prompt
+                                    # appears; auto_checkpoint = false is how
+                                    # the feature is switched off. Lower it if
+                                    # the server has lemonade's auto_evict on,
+                                    # so the checkpoint lands before the 60s
+                                    # downsize_idle_timeout drops the KV cache.
+
+[tools.bash]
+timeout          = "120s"
+max_output_bytes = 60000
+# shell          = "/bin/bash"
+
+[tools.read]
+max_bytes = 400000
+max_lines = 2000
+
+[tools.grep]
+max_results = 200
+
+# --- Providers -------------------------------------------------------------
+#
+# class is required, and is not cosmetic: ai-code confirms before moving a live
+# session onto a "cloud" provider, showing what would be sent, and never asks
+# about an "on-premises" one.
+
+[provider.home]
+kind          = "lemonade"
+base_url      = "https://ai.example.internal/api/v1"
+class         = "on-premises"
+default_model = "Qwen3.6-27B"
+
+# Self-hosted TLS, all first-class:
+tls_insecure = true                 # blunt, and sometimes exactly right
+# ca_file     = "/etc/ssl/certs/my-internal-ca.pem"
+# ca_dir      = "/etc/ssl/my-cas"
+# client_cert = "/etc/ssl/client.pem"   # mutual TLS; both halves required
+# client_key  = "/etc/ssl/client-key.pem"
+
+# Any OpenAI-compatible endpoint: llama.cpp, vLLM, Ollama, LM Studio, TGI.
+# [provider.workstation]
+# kind     = "openai"
+# base_url = "http://workstation.lan:8080/v1"
+# class    = "on-premises"
+
+# [provider.openrouter]
+# kind     = "openrouter"                # not "openai": it selects the reasoning
+#                                        # dialect OpenRouter actually reads
+# base_url = "https://openrouter.ai/api/v1"
+# class    = "cloud"
+# api_key  = "env:OPENROUTER_API_KEY"   # env: keeps the key out of this file
+
+# --- Modes -----------------------------------------------------------------
+#
+# Modes are prompt steering and nothing else. Every tool stays available in
+# every mode: gathering information legitimately involves running commands.
+
+# [mode.debug]
+# description = "Reproduce first, then diagnose."
+# prompt = """
+# Reproduce the problem before theorising about it. Write the smallest script or
+# test that triggers it, confirm it fails, and only then look for the cause.
+# """

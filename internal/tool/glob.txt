@@ -1,0 +1,11 @@
+Find files by path pattern.
+
+`**` matches any number of directories, so `**/*_test.go` finds test files at
+any depth and `internal/**/*.go` restricts that to one subtree. A pattern with
+no slash in it is matched against the filename alone, so `*.toml` finds TOML
+files anywhere under the search root.
+
+Results are paths relative to the search root, sorted. Files ignored by
+.gitignore and dotfiles are excluded unless `all` is set.
+
+Use this to locate files by name. To find files by what is inside them, use grep.

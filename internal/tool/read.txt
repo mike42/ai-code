@@ -1,0 +1,11 @@
+Read a file from the filesystem.
+
+Returns the file's contents with 1-based line numbers, which you can quote back
+in an edit or reference in your explanation.
+
+Reading a file is a precondition for editing it: the edit tool refuses to touch
+a file it has not seen, and refuses again if the file changed after you read it.
+
+For a large file, read the region you need with `offset` and `limit` rather than
+the whole thing. Output beyond the configured size limit is truncated from the
+middle, keeping both ends.

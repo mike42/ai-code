@@ -1,0 +1,61 @@
+{
+ "argv": [
+  "@BIN@",
+  "--runtime",
+  "devcontainer"
+ ],
+ "cwd": "@ROOT@/dcproj",
+ "env": {
+  "XDG_CONFIG_HOME": "@ROOT@/xdg",
+  "XDG_RUNTIME_DIR": "@XRUN@"
+ },
+ "outdir": "@ROOT@/out",
+ "name": "devcontainer",
+ "script": [
+  [
+   1.0,
+   "snap",
+   "1. Idle prompt, devcontainer runtime"
+  ],
+  [
+   2.0,
+   "type",
+   "spawn 2 background jobs\n"
+  ],
+  [
+   9.0,
+   "snap",
+   "2. Both workers started inside the container"
+  ],
+  [
+   11.0,
+   "type",
+   "are you still there?\n"
+  ],
+  [
+   16.0,
+   "snap",
+   "3. Answered while both container workers run"
+  ],
+  [
+   30.0,
+   "snap",
+   "4. Reports back -- different DAEMON pids, different cwds"
+  ],
+  [
+   32.0,
+   "type",
+   "check cwd\n"
+  ],
+  [
+   38.0,
+   "snap",
+   "5. Parent cwd is still /workspace, unmoved by either worker"
+  ],
+  [
+   40.0,
+   "stop",
+   ""
+  ]
+ ]
+}

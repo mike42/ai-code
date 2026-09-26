@@ -1,0 +1,46 @@
+{
+ "argv": [
+  "@BIN@",
+  "--runtime",
+  "devcontainer"
+ ],
+ "cwd": "@ROOT@/dcproj",
+ "env": {
+  "XDG_CONFIG_HOME": "@ROOT@/xdg",
+  "XDG_RUNTIME_DIR": "@XRUN@"
+ },
+ "outdir": "@ROOT@/out",
+ "name": "devcontainer-slots",
+ "script": [
+  [
+   2.0,
+   "type",
+   "spawn 2 slow container jobs\n"
+  ],
+  [
+   9.0,
+   "snap",
+   "1. Both container workers past their bash, now thinking"
+  ],
+  [
+   11.0,
+   "type",
+   "are you still there?\n"
+  ],
+  [
+   16.0,
+   "snap",
+   "2. Answered while both workers hold a model slot INSIDE the devcontainer"
+  ],
+  [
+   26.0,
+   "snap",
+   "3. Reports back"
+  ],
+  [
+   28.0,
+   "stop",
+   ""
+  ]
+ ]
+}

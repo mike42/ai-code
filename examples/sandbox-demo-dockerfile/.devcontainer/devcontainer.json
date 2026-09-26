@@ -1,0 +1,12 @@
+{
+  "name": "retro-dev",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "runArgs": ["--userns=keep-id"],
+  "remoteUser": "ubuntu",
+  "overrideCommand": true
+}

@@ -1,0 +1,71 @@
+{
+ "argv": [
+  "@BIN@",
+  "--runtime",
+  "host"
+ ],
+ "cwd": "@ROOT@/proj",
+ "env": {
+  "XDG_CONFIG_HOME": "@ROOT@/xdg",
+  "XDG_RUNTIME_DIR": "@XRUN@"
+ },
+ "outdir": "@ROOT@/out",
+ "name": "slots",
+ "script": [
+  [
+   1.0,
+   "snap",
+   "1. Idle prompt, nothing running"
+  ],
+  [
+   1.5,
+   "type",
+   "spawn 2 slow jobs\n"
+  ],
+  [
+   5.0,
+   "snap",
+   "2. Both workers started; prompt is back and the marker says [2 working]"
+  ],
+  [
+   6.0,
+   "type",
+   "are you still there?"
+  ],
+  [
+   7.0,
+   "snap",
+   "3. Typing a new prompt while both workers are mid-generation"
+  ],
+  [
+   7.5,
+   "type",
+   "\n"
+  ],
+  [
+   11.0,
+   "snap",
+   "4. Answered -- while both workers are STILL running"
+  ],
+  [
+   18.5,
+   "snap",
+   "5. Reports arrive in the scrollback on their own; marker clears"
+  ],
+  [
+   20.0,
+   "type",
+   "what did they find?\n"
+  ],
+  [
+   25.0,
+   "snap",
+   "6. Reports folded into the conversation as a one-line echo"
+  ],
+  [
+   27.0,
+   "stop",
+   ""
+  ]
+ ]
+}

@@ -1,0 +1,7 @@
+List the entries in a directory.
+
+Directories are shown first with a trailing slash, then files with their sizes.
+Dotfiles are hidden unless `all` is set.
+
+For finding files by name across a tree, use glob. For finding files by their
+contents, use grep.

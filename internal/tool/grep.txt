@@ -1,0 +1,14 @@
+Search file contents with a regular expression.
+
+Returns matching lines as `path:line: text`, grouped by file. Files ignored by
+.gitignore are skipped, as are dotfiles and binaries, so a search of a
+repository returns source rather than build output.
+
+The syntax is RE2: character classes, groups, alternation, anchors and
+quantifiers all work. Backreferences and lookaround do not, because RE2 has no
+backtracking -- rephrase with an explicit pattern, or filter with grep in a
+bash call.
+
+Narrow the search with `path` to search a subtree, and `glob` to restrict it to
+matching filenames (for example `*.go`). Use `files_only` when you want to know
+which files match rather than where.

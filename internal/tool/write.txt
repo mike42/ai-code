@@ -1,0 +1,11 @@
+Write a file, creating it or replacing its entire contents.
+
+Use this to create new files, and as the escape hatch when an edit is too
+sprawling to express as a string replacement. Prefer the edit tool for changes
+to an existing file: a whole-file write destroys anything you were not looking
+at, including parts of the file you never read.
+
+Overwriting an existing file requires having read it first, for the same reason
+editing does.
+
+Parent directories are created as needed.

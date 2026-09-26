@@ -1,0 +1,334 @@
+package agent
+
+import (
+	"context"
+	"io"
+	"strings"
+	"sync"
+
+	"ai-code/internal/provider"
+)
+
+// scriptedClient replays a fixed sequence of assistant turns.
+//
+// It exists so the loop, cancellation and message-shape handling can be tested
+// deterministically. The parts of this system that must never be flaky --
+// message validation, interrupt repair, tool dispatch ordering -- are exactly
+// the parts a live model would make flaky.
+type scriptedClient struct {
+	mu    sync.Mutex
+	turns []scriptedTurn
+	n     int
+	seen  [][]provider.Message
+	// reqs keeps the whole request, not just the messages: max_tokens and the
+	// thinking level are computed per turn, so they can only be checked against
+	// what actually went on the wire.
+	reqs []provider.Request
+	// charsPerToken, when set, makes the client report usage computed from the
+	// request it was actually given, at this density. A canned usage figure
+	// cannot exercise the running token count, because the count's whole job is
+	// to predict the next prompt_tokens from the conversation it can see -- and
+	// against numbers unrelated to the messages, any prediction looks wrong.
+	charsPerToken float64
+	// tokenizer, when set, counts a request instead of charsPerToken. It
+	// exists so a test can make the server disagree with the harness's own
+	// character approximation, which is the only way to exercise calibration
+	// honestly: a fake that counts exactly the way the agent estimates proves
+	// the agent agrees with itself.
+	tokenizer func(provider.Request) int
+	onStream  func()
+	// refuseOver, when set, rejects any request whose counted size exceeds it,
+	// the way a backend rejects a prompt longer than its window.
+	refuseOver int
+
+	// workerTurns, when set, is the script for requests carrying the worker
+	// system prompt, with its own counter.
+	//
+	// Workers run beside the parent rather than inside its turn, so both draw
+	// from this client at once and a single sequence would hand whichever
+	// goroutine arrived first whatever came next. Two scripts make the test
+	// about what each agent was sent rather than about who won the race.
+	workerTurns []scriptedTurn
+	workerN     int
+	// onWorkerStream runs when a worker request is served, off the lock, so a
+	// test can hold a worker open without reaching into these fields from
+	// another goroutine.
+	onWorkerStream func()
+}
+
+// isWorkerRequest reports whether this request belongs to a worker.
+func isWorkerRequest(req provider.Request) bool {
+	for _, m := range req.Messages {
+		if m.Role == provider.RoleSystem && strings.Contains(m.Content, "worker agent") {
+			return true
+		}
+	}
+	return false
+}
+
+// requestTokens measures a request the way a server would, at the client's
+// configured density.
+func (c *scriptedClient) requestTokens(req provider.Request) int {
+	if c.tokenizer != nil {
+		return c.tokenizer(req)
+	}
+	chars := 0
+	for _, m := range req.Messages {
+		chars += messageChars(m)
+	}
+	for _, t := range req.Tools {
+		chars += len(t.Name) + len(t.Description) + len(t.Schema) + messageOverheadChars
+	}
+	return int(float64(chars) / c.charsPerToken)
+}
+
+type scriptedTurn struct {
+	text      string
+	reasoning string
+	calls     []provider.ToolCall
+	stop      provider.StopReason
+	usage     provider.Usage
+	err       error
+}
+
+func (c *scriptedClient) Name() string          { return "scripted" }
+func (c *scriptedClient) Class() provider.Class { return provider.ClassOnPrem }
+
+func (c *scriptedClient) Models(ctx context.Context) ([]provider.ModelInfo, error) {
+	return []provider.ModelInfo{{ID: "test-model", ContextWindow: 65536, SupportsTools: true}}, nil
+}
+
+func (c *scriptedClient) Stream(ctx context.Context, req provider.Request) (provider.Stream, error) {
+	c.mu.Lock()
+	// Refused before anything is recorded or the script advances: a request
+	// the server rejected never produced a turn.
+	if c.refuseOver > 0 && c.requestTokens(req) > c.refuseOver {
+		c.mu.Unlock()
+		return nil, &provider.APIError{Status: 400,
+			Message: "the request exceeds the available context length of this model"}
+	}
+
+	snapshot := make([]provider.Message, len(req.Messages))
+	copy(snapshot, req.Messages)
+	c.seen = append(c.seen, snapshot)
+	c.reqs = append(c.reqs, req)
+
+	var t scriptedTurn
+	switch {
+	case len(c.workerTurns) > 0 && isWorkerRequest(req):
+		if c.workerN < len(c.workerTurns) {
+			t = c.workerTurns[c.workerN]
+			c.workerN++
+		} else {
+			t = scriptedTurn{text: "(worker script exhausted)", stop: provider.StopEnd}
+		}
+	case c.n < len(c.turns):
+		t = c.turns[c.n]
+		c.n++
+	default:
+		t = scriptedTurn{text: "(script exhausted)", stop: provider.StopEnd}
+	}
+	hook := c.onStream
+	workerHook := c.onWorkerStream
+	ratio := c.charsPerToken
+	c.mu.Unlock()
+
+	if workerHook != nil && isWorkerRequest(req) {
+		workerHook()
+	}
+
+	if ratio > 0 || c.tokenizer != nil {
+		t.usage.PromptTokens = c.requestTokens(req)
+		if t.usage.CompletionTokens == 0 {
+			// Measured the same way as the prompt. A server counts the tool
+			// call it generated; a fake that counts only the text credits the
+			// assistant message with far fewer tokens than it will cost as part
+			// of the next prompt, which looks exactly like an estimator bug.
+			den := ratio
+			if den <= 0 {
+				den = 4
+			}
+			t.usage.CompletionTokens = int(float64(messageChars(provider.Message{
+				Role: provider.RoleAssistant, Content: t.text, ToolCalls: t.calls,
+			})) / den)
+		}
+		t.usage.TotalTokens = t.usage.PromptTokens + t.usage.CompletionTokens
+	}
+
+	if hook != nil {
+		hook()
+	}
+	if t.err != nil {
+		return nil, t.err
+	}
+	return newScriptedStream(t), nil
+}
+
+func (c *scriptedClient) requests() [][]provider.Message {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.seen
+}
+
+// maxTokens is the cap sent on each request, in order.
+func (c *scriptedClient) maxTokens() []int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]int, 0, len(c.reqs))
+	for _, r := range c.reqs {
+		out = append(out, r.MaxTokens)
+	}
+	return out
+}
+
+func (c *scriptedClient) lastFullRequest() provider.Request {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.reqs) == 0 {
+		return provider.Request{}
+	}
+	return c.reqs[len(c.reqs)-1]
+}
+
+func (c *scriptedClient) lastRequest() []provider.Message {
+	reqs := c.requests()
+	if len(reqs) == 0 {
+		return nil
+	}
+	return reqs[len(reqs)-1]
+}
+
+type scriptedStream struct {
+	turn   scriptedTurn
+	events []provider.Event
+	i      int
+}
+
+func newScriptedStream(t scriptedTurn) *scriptedStream {
+	s := &scriptedStream{turn: t}
+	if t.reasoning != "" {
+		s.events = append(s.events, provider.Event{Kind: provider.EventReasoning, Text: t.reasoning})
+	}
+	if t.text != "" {
+		// Deliver text in fragments, as a real stream does, so consumers cannot
+		// accidentally depend on receiving whole lines.
+		for _, chunk := range chunks(t.text, 7) {
+			s.events = append(s.events, provider.Event{Kind: provider.EventText, Text: chunk})
+		}
+	}
+	for i, tc := range t.calls {
+		s.events = append(s.events, provider.Event{
+			Kind: provider.EventToolCallStart, ToolIndex: i, ToolID: tc.ID, ToolName: tc.Name,
+		})
+		s.events = append(s.events, provider.Event{
+			Kind: provider.EventToolCallArgs, ToolIndex: i, ToolID: tc.ID, ToolName: tc.Name, Text: tc.Args,
+		})
+	}
+	if t.usage.PromptTokens > 0 || t.usage.CompletionTokens > 0 {
+		s.events = append(s.events, provider.Event{Kind: provider.EventUsage, Usage: t.usage})
+	}
+	return s
+}
+
+func chunks(s string, n int) []string {
+	var out []string
+	for len(s) > n {
+		out = append(out, s[:n])
+		s = s[n:]
+	}
+	if s != "" {
+		out = append(out, s)
+	}
+	return out
+}
+
+func (s *scriptedStream) Recv() (provider.Event, error) {
+	if s.i >= len(s.events) {
+		return provider.Event{}, io.EOF
+	}
+	e := s.events[s.i]
+	s.i++
+	return e, nil
+}
+
+func (s *scriptedStream) Message() provider.Message {
+	return provider.Message{
+		Role:      provider.RoleAssistant,
+		Content:   s.turn.text,
+		Reasoning: s.turn.reasoning,
+		ToolCalls: s.turn.calls,
+	}
+}
+
+func (s *scriptedStream) Usage() provider.Usage { return s.turn.usage }
+
+func (s *scriptedStream) StopReason() provider.StopReason {
+	if s.turn.stop != "" {
+		return s.turn.stop
+	}
+	if len(s.turn.calls) > 0 {
+		return provider.StopToolCalls
+	}
+	return provider.StopEnd
+}
+
+func (s *scriptedStream) Close() error { return nil }
+
+// collectSink accumulates events for assertions.
+type collectSink struct {
+	mu     sync.Mutex
+	events []Event
+}
+
+func (c *collectSink) Emit(e Event) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.events = append(c.events, e)
+}
+
+func (c *collectSink) kinds() []EventKind {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]EventKind, 0, len(c.events))
+	for _, e := range c.events {
+		out = append(out, e.Kind)
+	}
+	return out
+}
+
+func (c *collectSink) text() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := ""
+	for _, e := range c.events {
+		if e.Kind == EvText {
+			s += e.Text
+		}
+	}
+	return s
+}
+
+// contexts returns every context figure published, in order.
+func (c *collectSink) contexts() []ContextState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []ContextState
+	for _, e := range c.events {
+		if e.Context != nil {
+			out = append(out, *e.Context)
+		}
+	}
+	return out
+}
+
+func (c *collectSink) notices() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []string
+	for _, e := range c.events {
+		if e.Kind == EvNotice || e.Kind == EvError {
+			out = append(out, e.Text)
+		}
+	}
+	return out
+}

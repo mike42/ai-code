@@ -1,0 +1,22 @@
+Run a shell command.
+
+The working directory persists between calls: a `cd` in one call affects the
+next. Exported environment variables persist the same way. Nothing else does --
+each call is a fresh shell, so shell functions, aliases and `set` options do not
+carry over.
+
+Output is stdout and stderr interleaved, as you would see in a terminal. Long
+output is truncated from the middle, keeping the beginning and the end, because
+the interesting line in a build log is usually the last one.
+
+Shell output does not register a file as read. cat, sed and head will show you a
+file, but the edit tool only accepts files the read tool has seen, so use the
+read tool on anything you intend to change.
+
+Standard input is connected to /dev/null. A command that waits for input gets
+EOF immediately rather than hanging. Interactive commands do not work: use
+`git rebase` with explicit arguments rather than `-i`, and pass `--yes` or
+equivalent to anything that prompts.
+
+Commands that exceed the timeout are killed along with everything they spawned.
+For something genuinely long-running, redirect to a file and poll it.

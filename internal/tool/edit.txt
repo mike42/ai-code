@@ -1,0 +1,17 @@
+Replace an exact string in a file.
+
+`old_string` must appear EXACTLY ONCE in the file, matched byte for byte
+including indentation. If it appears more than once, add surrounding lines until
+the match is unique, or set `replace_all` to change every occurrence.
+
+You must read a file with the read tool before editing it, and the file must not
+have changed since you read it. Both rules exist for the same reason: an edit
+applied to content that is no longer there either fails loudly or corrupts the
+file quietly, and loudly is better. Viewing a file with cat, sed or head in the
+bash tool does not satisfy this -- only the read tool records what it saw.
+
+Copy `old_string` from the output of the read tool, minus its line-number
+prefix. Do not retype it from memory -- indentation is the usual thing that
+differs, and tabs and spaces are not interchangeable.
+
+To create a new file, or to replace a file wholesale, use the write tool.
