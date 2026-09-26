@@ -1,12 +1,6 @@
 // Package devcontainer reads a devcontainer.json and turns it into the
-// decisions a container engine needs: which image to run or build, how the
-// workspace is mounted, who the tools run as, and what else the file asked for.
-//
-// The file is JSONC -- comments are legal, trailing commas are not -- so it is
-// stripped of comments before being handed to encoding/json. Every top-level
-// key is also kept in raw form, because a key this build does not act on must
-// still be reportable: a configuration that is silently half-applied is worse
-// than one that is refused, and worse again than one that says what it ignored.
+// decisions a container engine needs: image, workspace mount, and the rest.
+// Top-level keys are kept raw so anything unacted on is still reported.
 package devcontainer
 
 import (
@@ -31,7 +25,6 @@ type Config struct {
 
 	Name string `json:"name"`
 
-	// --- image or build ---
 	Image string `json:"image"`
 	Build *Build `json:"build"`
 	// DockerfileLegacy and ContextLegacy are the pre-"build" spellings. Both
@@ -39,15 +32,13 @@ type Config struct {
 	DockerfileLegacy string `json:"dockerFile"`
 	ContextLegacy    string `json:"context"`
 
-	// --- compose (recognised so it can be refused precisely, not run) ---
+	// Recognised only so the configuration can be refused precisely, not run.
 	DockerComposeFile json.RawMessage `json:"dockerComposeFile"`
 	Service           string          `json:"service"`
 
-	// --- workspace ---
 	WorkspaceFolder string `json:"workspaceFolder"`
 	WorkspaceMount  string `json:"workspaceMount"`
 
-	// --- container shape ---
 	Mounts       []Mount           `json:"mounts"`
 	RunArgs      []string          `json:"runArgs"`
 	ContainerEnv map[string]string `json:"containerEnv"`
@@ -101,9 +92,9 @@ type Mount struct {
 	Source   string `json:"source"`
 	Target   string `json:"target"`
 	ReadOnly bool   `json:"readonly"`
-	// raw is kept when the entry arrived as a string, so it can be passed to
-	// the engine exactly as written rather than round-tripped through fields
-	// this struct may not model.
+	// raw is kept when the entry arrived as a string, so it passes to the
+	// engine exactly as written rather than through fields this struct may not
+	// model.
 	raw string
 }
 
@@ -159,13 +150,8 @@ func (m Mount) String() string {
 	return strings.Join(parts, ",")
 }
 
-// acted is every top-level key this build actually applies. Anything in the
-// file and not in here is reported by Unsupported.
-//
-// Keys that are meaningless to a terminal harness are listed too, with a reason
-// in supportNote: "ignored because there is no editor here" is a different
-// statement from "not implemented yet", and conflating them would make the
-// report useless as a progress signal.
+// acted is every top-level key this build applies. Anything in the file and
+// not in here is reported by Unsupported.
 var acted = map[string]bool{
 	"name": true, "image": true, "build": true,
 	"dockerFile": true, "context": true,
@@ -179,8 +165,8 @@ var acted = map[string]bool{
 	"otherPortsAttributes": true,
 }
 
-// supportNote explains a key that is read but deliberately not acted on, so the
-// report can distinguish "not for us" from "not yet".
+// supportNote explains a key that is read but not acted on, so the report can
+// distinguish "editor-specific" from "not yet".
 var supportNote = map[string]string{
 	"customizations":       "editor-specific",
 	"forwardPorts":         "editor-specific",
@@ -188,14 +174,14 @@ var supportNote = map[string]string{
 	"otherPortsAttributes": "editor-specific",
 }
 
-// Unsupported lists the keys present in the file that this build does not act
-// on, in the order they should be reported. Editor-only keys are omitted: the
-// user does not need to be told that a terminal has no extension list.
-// EnvRewrites names the environment entries whose ${localWorkspaceFolder}
-// was resolved to the container's path instead of the host's, so the session
-// can say so rather than quietly disagreeing with the file.
+// EnvRewrites names the environment entries whose ${localWorkspaceFolder} was
+// resolved to the container's path instead of the host's, so the rewrite is
+// reported rather than quietly disagreeing with the file.
 func (c *Config) EnvRewrites() []string { return c.envRewrites }
 
+// Unsupported lists the top-level keys present in the file that this build does
+// not act on, sorted. Editor-only keys are omitted: a terminal has no extension
+// list to configure.
 func (c *Config) Unsupported() []string {
 	var out []string
 	for k := range c.Present {
@@ -223,10 +209,8 @@ const (
 )
 
 // Kind reports how this configuration expects its container to be obtained.
-//
-// The order matters: "image" wins over "build" because that is what the schema
-// says when a file somehow has both, and compose is checked first because a
-// compose file with an image key is still a compose configuration.
+// Compose is checked first -- a compose file with an image key is still
+// compose -- and image wins over build, as the schema says.
 func (c *Config) Kind() Kind {
 	switch {
 	case len(c.DockerComposeFile) > 0:
@@ -241,7 +225,7 @@ func (c *Config) Kind() Kind {
 }
 
 // Dockerfile returns the configured Dockerfile path as written, preferring the
-// "build" object over the legacy top-level key, or "" if neither is set.
+// "build" object over the legacy top-level key.
 func (c *Config) Dockerfile() string {
 	if c.Build != nil && c.Build.Dockerfile != "" {
 		return c.Build.Dockerfile
@@ -249,8 +233,8 @@ func (c *Config) Dockerfile() string {
 	return c.DockerfileLegacy
 }
 
-// DockerfilePath returns the absolute path to the Dockerfile. Relative paths in
-// a devcontainer.json resolve against the directory holding the file.
+// DockerfilePath returns the absolute path to the Dockerfile, resolving
+// relative paths against the directory holding devcontainer.json.
 func (c *Config) DockerfilePath() string {
 	df := c.Dockerfile()
 	if df == "" {
@@ -262,9 +246,9 @@ func (c *Config) DockerfilePath() string {
 	return filepath.Join(c.Dir, filepath.FromSlash(df))
 }
 
-// ContextPath returns the absolute build context directory. It defaults to the
-// directory holding devcontainer.json, which is what the schema specifies -- not
-// to the project root, and not to the Dockerfile's directory.
+// ContextPath returns the absolute build context directory, defaulting to the
+// directory holding devcontainer.json -- not the project root, and not the
+// Dockerfile's directory.
 func (c *Config) ContextPath() string {
 	ctx := c.ContextLegacy
 	if c.Build != nil && c.Build.Context != "" {
@@ -320,10 +304,9 @@ func Parse(raw []byte, path string) (*Config, error) {
 	return cfg, nil
 }
 
-// trailingCommaHint adds a note when the parse failure looks like the one
-// mistake the format specifically disallows. devcontainer.json permits comments
-// but not trailing commas, which is a surprising enough combination that the
-// bare "invalid character '}'" is worth explaining.
+// trailingCommaHint explains the one mistake the format disallows:
+// devcontainer.json permits comments but not trailing commas, so the bare
+// "invalid character '}'" is worth elaborating.
 func trailingCommaHint(b []byte, err error) string {
 	var se *json.SyntaxError
 	if !asSyntaxError(err, &se) {
@@ -357,13 +340,9 @@ func asSyntaxError(err error, target **json.SyntaxError) bool {
 	return ok
 }
 
-// stripComments removes // and /* */ comments, leaving everything else byte for
-// byte -- including the length, since each removed byte becomes a space. Keeping
-// the offsets intact means encoding/json's error positions still point at the
-// right place in the original file.
-//
-// Comments inside strings are not comments, so the scanner tracks string state
-// and its escapes.
+// stripComments removes // and /* */ comments, replacing each byte with a space
+// so offsets and line numbers survive and encoding/json's error positions still
+// point into the original file. Comments inside strings are not comments.
 func stripComments(b []byte) []byte {
 	out := make([]byte, len(b))
 	copy(out, b)

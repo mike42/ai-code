@@ -12,13 +12,8 @@ import (
 )
 
 // complete supplies Tab candidates for the line up to the cursor: slash
-// command names, model ids after /model, and otherwise a path.
-//
-// The offset it returns is where the candidates replace the line, so a path
-// can be completed in the middle of a sentence. That is the whole reason file
-// completion exists here: there is no @file sigil and nothing is attached by
-// typing a path, but a path spelled the way the tools expect saves the model
-// the turns it would otherwise spend hunting for the file with ls and grep.
+// command names, model ids after /model, and otherwise a path. The offset is
+// where the candidates replace the line.
 func (a *App) complete(line string) (int, []string) {
 	name, argAt, arg, ok := commandContext(line)
 	if !ok {
@@ -42,10 +37,8 @@ func (a *App) complete(line string) (int, []string) {
 }
 
 // commandContext splits a slash-command line into the command name and its
-// argument, with argAt -1 while the name itself is still being typed.
-//
-// A word with a further slash in it is a path someone began the line with, not
-// a command: "/usr/local/..." must still complete as a file.
+// argument, with argAt -1 while the name is still being typed. A further slash
+// means the line began with a path, not a command.
 func commandContext(line string) (name string, argAt int, arg string, ok bool) {
 	if !strings.HasPrefix(line, "/") {
 		return "", 0, "", false
@@ -71,17 +64,11 @@ func (a *App) modelCandidates(prefix string) []string {
 	if a.client == nil {
 		return nil
 	}
-	// Under .nocloud a cloud model is not merely refused when selected: its
-	// name is never shown, so completion cannot become the route by which a
-	// tree that forbids cloud ends up on one.
+	// Under .nocloud a cloud model's name is never shown.
 	if a.noCloud && a.client.Class() == provider.ClassCloud {
 		return nil
 	}
-	// Tab never reaches the network. A keystroke that occasionally blocks on a
-	// provider round trip is worse than one that occasionally completes
-	// nothing, so only the on-disk catalogue is read -- expired included,
-	// since the names in it are still the best guess available and /model
-	// checks the chosen one against the provider anyway.
+	// Tab never reaches the network: only the on-disk catalogue is read, expiry ignored.
 	cached, _ := loadModelCache(a.client.Name())
 	if cached == nil {
 		return nil
@@ -97,21 +84,12 @@ func (a *App) modelCandidates(prefix string) []string {
 }
 
 // completePath completes the last whitespace-delimited word as a path,
-// relative to the working directory, one segment at a time.
-//
-// One directory read per Tab, never a tree walk: in a repository of any size
-// the walk is the difference between a completion and a pause. A name
-// containing a space completes only as far as its first space, which is
-// visibly nothing rather than quietly the wrong path.
+// relative to the working directory, one segment at a time: one directory
+// read per Tab, never a tree walk.
 func completePath(cwd, root, line string) (int, []string) {
 	start := strings.LastIndexAny(line, " \t") + 1
 	word := line[start:]
-	// An empty word lists the working directory, as a shell does, whether the
-	// line is bare or the cursor sits after a trailing space. Tab means nothing
-	// else in this editor, so either press is someone reaching for a filename;
-	// answering one and ignoring the other would be a rule to remember rather
-	// than a saved keystroke. The listing costs a screen at worst -- it is
-	// capped, and it prints above the prompt without touching what is typed.
+	// An empty word lists the working directory, as a shell does.
 	dir, base := path.Split(word)
 	readDir := filepath.FromSlash(dir)
 	if !path.IsAbs(word) {

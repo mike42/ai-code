@@ -9,8 +9,7 @@ import (
 	"ai-code/internal/tool"
 )
 
-// roles renders a message list compactly, for failure messages that say what
-// the conversation actually looked like.
+// roles renders a message list compactly, for failure messages.
 func roles(msgs []provider.Message) string {
 	var b strings.Builder
 	for i, m := range msgs {
@@ -29,10 +28,8 @@ func roles(msgs []provider.Message) string {
 	return b.String()
 }
 
-// A steering message must land after the tool results of the round it arrived
-// during, never between an assistant message that requested tools and those
-// results. That ordering is not a preference: the provider rejects the request,
-// and it does so on the turn after the one that broke it.
+// Steering must land after the round's tool results; the provider rejects a
+// request whose tool results are not immediately after their call.
 func TestSteeringIsInsertedAtATurnBoundary(t *testing.T) {
 	ft := &fakeTool{name: "probe", readOnly: true}
 	client := &scriptedClient{turns: []scriptedTurn{
@@ -42,8 +39,7 @@ func TestSteeringIsInsertedAtATurnBoundary(t *testing.T) {
 	sink := &collectSink{}
 	a := newAgent(t, client, sink, ft)
 
-	// Steer while the first request is in flight, which is when a user actually
-	// types: the model is talking and they have seen enough to correct it.
+	// Steer while the first request is in flight, the moment steering is for.
 	client.onStream = func() { a.Steer("use the other file") }
 
 	if err := a.Run(context.Background(), "start"); err != nil {
@@ -54,8 +50,6 @@ func TestSteeringIsInsertedAtATurnBoundary(t *testing.T) {
 		t.Fatalf("conversation invalid after steering: %v\n%s", err, roles(a.Messages()))
 	}
 
-	// The second request must carry the steering message, and it must come
-	// after the tool result.
 	req := client.requests()[1]
 	steerAt, toolAt := -1, -1
 	for i, m := range req {
@@ -74,10 +68,6 @@ func TestSteeringIsInsertedAtATurnBoundary(t *testing.T) {
 	}
 }
 
-// Steering that arrives while the model is delivering its final answer must not
-// be dropped. Dropping it is the failure people actually hit: you read the
-// reply, see it going the wrong way, type a correction, and it evaporates
-// because the turn happened to end first.
 func TestSteeringAfterTheModelStopsReopensTheTurn(t *testing.T) {
 	client := &scriptedClient{turns: []scriptedTurn{
 		{text: "Here is my answer."},
@@ -109,9 +99,6 @@ func TestSteeringAfterTheModelStopsReopensTheTurn(t *testing.T) {
 	}
 }
 
-// A message typed in the instant a turn ends has nowhere to go yet. It stays
-// queued rather than being lost, and the next turn takes it up ahead of
-// whatever is typed at the prompt -- which is the order it was written in.
 func TestSteeringQueuedBetweenTurnsIsDeliveredFirst(t *testing.T) {
 	client := &scriptedClient{turns: []scriptedTurn{{text: "ok"}}}
 	a := newAgent(t, client, &collectSink{})
@@ -150,8 +137,7 @@ func TestSteerIgnoresBlankInput(t *testing.T) {
 	}
 }
 
-// The message has to be announced when it is folded in, so the scrollback shows
-// why the model changed course.
+// Steering is announced so the scrollback shows why the model changed course.
 func TestSteeringEmitsAnEvent(t *testing.T) {
 	client := &scriptedClient{turns: []scriptedTurn{{text: "one"}, {text: "two"}}}
 	sink := &collectSink{}
@@ -181,16 +167,11 @@ func TestSteeringEmitsAnEvent(t *testing.T) {
 	}
 }
 
-// Auto-compaction has to fire inside the run, at a turn boundary, and the run
-// has to continue afterwards. Stopping to ask is what a session dying at 90%
-// looks like from the user's side.
+// Auto-compaction fires inside the run, at a turn boundary, and the run
+// continues afterwards.
 func TestAutoCompactionRunsInlineAndTheTurnContinues(t *testing.T) {
-	// guardContext runs at the top of the loop, so the summarisation call is
-	// the first request the client sees, before any agent turn.
-	// Two summarisation calls, then the turn itself. This session is all
-	// prose, which does not compress the way tool output does when it is
-	// serialised, so there is more new material than one request can carry
-	// and it is folded into the checkpoint in two pieces.
+	// Summarisation runs at the top of the loop, before any agent turn; this
+	// prose session folds into the checkpoint in two pieces.
 	summary := scriptedTurn{text: "## Goal\nFinish the work.\n\n## Next Steps\n1. Carry on."}
 	client := &scriptedClient{charsPerToken: 4, turns: []scriptedTurn{
 		summary,
@@ -235,10 +216,8 @@ func TestAutoCompactionRunsInlineAndTheTurnContinues(t *testing.T) {
 	if compacted == nil {
 		t.Fatal("no compaction happened; the run should not have reached the model with a full window")
 	}
-	// Not "the request got smaller". Summarising is non-destructive now: the
-	// request was already being trimmed to fit, and what the checkpoint buys
-	// is that the dropped prefix is represented at all rather than silently
-	// missing. It may cost a few tokens more than sending the tail alone.
+	// Summarising is non-destructive: the checkpoint represents the dropped
+	// prefix, so the request may cost a few tokens more than the tail alone.
 	if compacted.SummarisedThrough <= 0 {
 		t.Errorf("the checkpoint covers nothing: SummarisedThrough = %d", compacted.SummarisedThrough)
 	}
@@ -256,9 +235,8 @@ func TestAutoCompactionRunsInlineAndTheTurnContinues(t *testing.T) {
 	}
 }
 
-// The tail kept verbatim is budgeted in tokens, and the cut never lands on a
-// tool result -- a result separated from its call is the message-shape
-// violation Validate exists to catch.
+// The cut never lands on a tool result: a result separated from its call fails
+// Validate.
 func TestCutPointNeverCutsAToolResultFromItsCall(t *testing.T) {
 	a := newAgent(t, &scriptedClient{}, &collectSink{})
 	a.messages = []provider.Message{

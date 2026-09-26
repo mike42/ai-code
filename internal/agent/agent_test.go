@@ -84,7 +84,6 @@ func TestLoopRunsToolsThenStops(t *testing.T) {
 		t.Errorf("text = %q, want %q", got, "All done.")
 	}
 
-	// The final message list must be a valid conversation.
 	if err := Validate(a.Messages()); err != nil {
 		t.Errorf("conversation is invalid after a normal run: %v", err)
 	}
@@ -104,8 +103,7 @@ func TestToolResultsFollowTheirCall(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The second request must carry both tool results, in call order,
-	// immediately after the assistant message.
+	// Both tool results must follow their assistant message in call order.
 	req := client.requests()[1]
 	var idx int
 	for i, m := range req {
@@ -139,7 +137,6 @@ func TestReadOnlyToolsRunConcurrently(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- a.Run(context.Background(), "go") }()
 
-	// Wait for all three to be in flight simultaneously.
 	deadline := time.After(2 * time.Second)
 	for {
 		ft.mu.Lock()
@@ -178,9 +175,6 @@ func TestWritingToolsAreSerialised(t *testing.T) {
 	}
 }
 
-// The failure this guards is the one ranked most costly in the design notes:
-// a cancellation leaving a tool_use with no matching tool_result, which makes
-// every subsequent request fail with a 400 far from its cause.
 func TestCancellationLeavesTheConversationSendable(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
@@ -199,7 +193,6 @@ func TestCancellationLeavesTheConversationSendable(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx, "go") }()
 
-	// Cancel once the first tool is running.
 	deadline := time.After(2 * time.Second)
 	for {
 		ft.mu.Lock()
@@ -229,7 +222,8 @@ func TestCancellationLeavesTheConversationSendable(t *testing.T) {
 		t.Fatalf("conversation is unsendable after cancellation: %v", err)
 	}
 
-	// Both calls must be answered, and the answers must say state may have changed.
+	// Both calls must be answered, and the answers must say the work was
+	// interrupted.
 	answered := map[string]string{}
 	for _, m := range a.Messages() {
 		if m.Role == provider.RoleTool {
@@ -332,9 +326,7 @@ func TestContextAccountingUsesProviderUsage(t *testing.T) {
 	}
 }
 
-// With auto_compact off, a full window is still a hard stop with an intact
-// session. That is the honest behaviour when the user has said not to rewrite
-// their conversation without asking.
+// With auto_compact off, a full window is a hard stop, not an implicit rewrite.
 func TestContextFullRefusesTheTurnAndKeepsTheSession(t *testing.T) {
 	client := &scriptedClient{turns: []scriptedTurn{
 		{text: "ok", usage: provider.Usage{PromptTokens: 64000, CompletionTokens: 2000}},
@@ -361,9 +353,6 @@ func TestContextFullRefusesTheTurnAndKeepsTheSession(t *testing.T) {
 }
 
 func TestContextWarningFiresOnceAtThreshold(t *testing.T) {
-	// Both turns sit in the band between the heads-up and compaction. Derived
-	// from the budget rather than written out, so tuning the formula does not
-	// silently move this test off the band it is aiming at.
 	const window = 65536
 	usable := window - BudgetFor(window).Reserve
 	trigger := usable * 80 / 100
@@ -442,9 +431,8 @@ func TestExecutorFailureBecomesAToolResult(t *testing.T) {
 	}
 }
 
-// scriptLongRun builds n distinct tool-calling turns followed by a final
-// answer. Distinct arguments matter: identical ones would trip the loop guard
-// and prove nothing about the turn count.
+// scriptLongRun builds n distinct tool-calling turns followed by a final answer.
+// Distinct arguments keep the loop guard from firing.
 func scriptLongRun(n int) []scriptedTurn {
 	turns := make([]scriptedTurn, 0, n+1)
 	for i := range n {
@@ -505,13 +493,6 @@ func TestConfiguredIterationLimitIsHonoured(t *testing.T) {
 	}
 }
 
-// A turn that produces nothing must not look like a turn that hung.
-//
-// EvDone paints no text, and reasoning in collapsed mode only ever reaches
-// the transient zone, which EvDone then clears. So a model that answered with
-// nothing -- or thought for the whole turn and then stopped -- left the
-// scrollback completely unchanged, which is indistinguishable from the
-// session having stopped responding.
 func TestATurnThatSaysNothingSaysSo(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -543,7 +524,6 @@ func TestATurnThatSaysNothingSaysSo(t *testing.T) {
 	}
 }
 
-// A turn that did say something must not be labelled empty.
 func TestAnOrdinaryTurnIsNotReportedAsEmpty(t *testing.T) {
 	sink := &collectSink{}
 	client := &scriptedClient{turns: []scriptedTurn{{text: "here is the answer"}}}

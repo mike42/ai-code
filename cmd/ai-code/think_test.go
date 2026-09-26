@@ -14,8 +14,7 @@ func thinkApp(t *testing.T) *App {
 	return statusApp(t, provider.ModelInfo{ID: "a-model", ContextWindow: 262144})
 }
 
-// The point of the command: change how hard the model thinks without paying
-// for a model swap, and have it take effect on the next request.
+// /think changes effort without a model swap, effective on the next request.
 func TestThinkChangesTheLevelSentOnTheWire(t *testing.T) {
 	a := thinkApp(t)
 	if a.agent.Effort() != provider.EffortUnset {
@@ -51,8 +50,6 @@ func TestThinkAcceptsTheUsualWordsAndRejectsTherest(t *testing.T) {
 	}
 }
 
-// The level asked for is the level sent. There is no per-model translation
-// table, because nothing here knows anything about specific models.
 func TestTheLevelAskedForIsTheLevelSent(t *testing.T) {
 	a := thinkApp(t)
 	captureOut(t, func() { _ = a.cmdThink(context.Background(), "high") })
@@ -80,8 +77,8 @@ func TestThinkSurvivesRestart(t *testing.T) {
 	}
 }
 
-// Summarising is mechanical. Paying max-effort thinking for it is minutes of
-// wall clock on a local model, at the moment the session is already stuck.
+// Summarising is mechanical: max-effort thinking would cost minutes on a
+// local model while the session is already stuck.
 func TestCompactionIgnoresTheSessionThinkingLevel(t *testing.T) {
 	a := thinkApp(t)
 	captureOut(t, func() { _ = a.cmdThink(context.Background(), "high") })
@@ -103,8 +100,8 @@ func TestCompactionIgnoresTheSessionThinkingLevel(t *testing.T) {
 	}
 }
 
-// Sending what was asked is the expected behaviour, not a caveat. A note
-// appears only when the model is known to do something else.
+// A note appears only when the model is known to do something other than what
+// was asked.
 func TestThinkSaysNothingWhenThereIsNothingToSay(t *testing.T) {
 	a := thinkApp(t)
 

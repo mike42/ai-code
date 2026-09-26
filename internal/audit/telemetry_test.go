@@ -8,9 +8,9 @@ import (
 	"testing"
 )
 
-// ai-code makes no network connection except to the provider the user configured.
-// That is a promise in the README, and a promise nobody checks is a promise
-// that quietly stops being true. These tests are the check.
+// ai-code makes no network connection except to the provider it is configured
+// with. That is a promise in the README, and a promise nobody checks is a
+// promise that quietly stops being true. These tests are the check.
 
 func TestNoAnalyticsDependencies(t *testing.T) {
 	out, err := exec.Command("go", "list", "-deps", "./...").Output()

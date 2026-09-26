@@ -9,11 +9,8 @@ import (
 	"ai-code/internal/tool"
 )
 
-// fillSession sets a two-message conversation sized to occupy roughly want
-// tokens, so tests can stand the session at a chosen point in the window.
-//
-// Deterministic because a fresh agent has not calibrated yet: the ratio is
-// defaultCharsPerToken until a response has been measured.
+// fillSession sizes a two-message conversation to roughly want tokens. The
+// ratio is deterministic because a fresh agent has not calibrated yet.
 func fillSession(t *testing.T, a *Agent, want int) {
 	t.Helper()
 	a.SetMessages([]provider.Message{
@@ -25,18 +22,13 @@ func fillSession(t *testing.T, a *Agent, want int) {
 		t.Fatalf("a %d-token session is smaller than the system prompt and tool schemas", want)
 	}
 	a.messages[1].Content = strings.Repeat("x", pad)
-	// The transcript, not the assembled request: once a session is over budget
-	// the request is trimmed to fit, so measuring that would report the cap
-	// back rather than how full the session actually is.
+	// The transcript, not the assembled request: an over-budget request is
+	// trimmed to fit.
 	if got := a.estimate(a.transcriptChars()); got < want-4 || got > want+4 {
 		t.Fatalf("fillSession: used = %d, want about %d", got, want)
 	}
 }
 
-// The cap has to track the window as the session fills. A flat number is wrong
-// at both ends: too small it truncates a long answer for no reason connected to
-// the session, too large it lets a thinking model generate straight through the
-// compaction reserve and overflow mid-stream.
 func TestMaxTokensShrinksAsTheSessionFills(t *testing.T) {
 	out := strings.Repeat("internal/render/screen.go:142: func (s *Screen) commitLocked\n", 650)
 	bt := &bigTool{name: "grep", out: out}
@@ -68,9 +60,8 @@ func TestMaxTokensShrinksAsTheSessionFills(t *testing.T) {
 	}
 }
 
-// Whatever the cap is, prompt plus cap must fit. This is the property the whole
-// change exists for: the request the model is answering cannot be allowed to
-// have room to overrun the window it is being answered in.
+// Prompt plus cap must fit the window: a request must not have room to overrun
+// it.
 func TestMaxTokensNeverExceedsTheRemainingWindow(t *testing.T) {
 	out := strings.Repeat("internal/render/screen.go:142: func (s *Screen) commitLocked\n", 650)
 	bt := &bigTool{name: "grep", out: out}
@@ -105,9 +96,6 @@ func TestMaxTokensNeverExceedsTheRemainingWindow(t *testing.T) {
 	}
 }
 
-// An explicit agent.max_tokens is a ceiling. Honouring it as written would
-// reintroduce exactly the failure this change fixes: OpenCode sends 32000
-// blindly and overruns a window that had a million tokens available.
 func TestConfiguredMaxTokensIsACeilingNotAFloor(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -146,7 +134,7 @@ func TestConfiguredMaxTokensIsACeilingNotAFloor(t *testing.T) {
 }
 
 // An unknown window is a reason to let the server decide, not to guess at a
-// number: it knows its own --n-predict and we do not.
+// number.
 func TestUnknownWindowSendsNoCap(t *testing.T) {
 	client := &scriptedClient{turns: []scriptedTurn{{text: "ok"}}}
 	exec := tool.NewLocalExecutor(tool.NewState(t.TempDir()))
@@ -176,10 +164,6 @@ func TestBackendOutputLimitLowersTheCap(t *testing.T) {
 	}
 }
 
-// Room to sit in is not room to answer in. A turn that fits but leaves a
-// hundred tokens for the reply is a request that cannot produce anything
-// useful, so compaction has to happen before it is sent rather than after it
-// comes back truncated.
 func TestNoRoomToAnswerCompactsInsteadOfSendingADoomedRequest(t *testing.T) {
 	client := &scriptedClient{turns: []scriptedTurn{
 		{text: "## Goal\nDo the thing.\n\n## Next Steps\n1. Continue."},
@@ -191,8 +175,7 @@ func TestNoRoomToAnswerCompactsInsteadOfSendingADoomedRequest(t *testing.T) {
 		ContextLimit: 8192, AutoCompact: true, KeepRecentTokens: 100,
 	})
 
-	// Filled to within 300 tokens of the budget: enough to send, not enough to
-	// answer. Derived, so the margin survives a change to the reserve.
+	// Filled to leave under minOutputTokens of room to answer.
 	fillSession(t, a, a.Usable()-300)
 	if room := a.Usable() - a.estimate(a.transcriptChars()); room >= minOutputTokens {
 		t.Fatalf("test setup leaves %d tokens, which is above the %d floor", room, minOutputTokens)
@@ -223,17 +206,12 @@ func TestNoRoomToAnswerCompactsInsteadOfSendingADoomedRequest(t *testing.T) {
 	}
 }
 
-// Summarising is mechanical work. On a local model at 1-2 tokens/sec, letting a
-// max-effort model think about it first costs minutes for a checkpoint that
-// reads no better -- and it is charged exactly when the session is already
-// stalled waiting for room.
 func TestCompactionRunsWithThinkingOff(t *testing.T) {
 	client := &scriptedClient{turns: []scriptedTurn{
 		{text: "## Goal\nDo the thing.\n\n## Next Steps\n1. Continue."},
 	}}
 	a := newAgent(t, client, &collectSink{})
-	// Large enough that a compaction actually pays for itself: a session
-	// smaller than the checkpoint it would be given is declined outright.
+	// Large enough that compaction pays for itself.
 	a.SetMessages([]provider.Message{
 		{Role: provider.RoleUser, Content: strings.Repeat("earlier work. ", 8000)},
 		{Role: provider.RoleAssistant, Content: strings.Repeat("and the reply. ", 8000)},

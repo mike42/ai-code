@@ -10,30 +10,13 @@ import (
 	"github.com/alecthomas/chroma/v2/styles"
 )
 
-// Markdown renders streamed markdown to the screen one committed line at a time.
-//
-// The problem this solves: a naive streaming renderer prints bytes as they
-// arrive, then discovers three tokens later that it was inside a code fence and
-// styled everything wrongly. It cannot take that back -- the text has scrolled.
-// Harnesses work around this by owning the whole screen and redrawing, which
-// costs native scrollback and selection.
-//
-// The way out is that markdown's block structure is decided at line
-// granularity. Fences, headings, list markers and block quotes are all
-// determined by the start of a line, and inline spans resolve within one. So a
-// line's final appearance is knowable the instant its newline arrives, and
-// never afterwards revised.
-//
-// Therefore: buffer the current line, and hold it in the transient zone as
-// plain unstyled text so the user watches it arrive live. When the newline
-// comes, style the whole line and commit it. Nothing in the scrollback is ever
-// wrong, and nothing ever needs redrawing.
+// Markdown renders streamed markdown one committed line at a time. Block
+// structure is decided per line, so a finished line is styled once and never
+// revised; the line still arriving is previewed in the transient zone.
 type Markdown struct {
-	// commit receives finished lines destined for the scrollback; partial
-	// receives the line still arriving. Decoupling these from Screen keeps the
-	// renderer testable -- the golden tests assert on exactly these two streams
-	// -- and lets one owner compose the transient zone from the partial line
-	// and the status line together.
+	// commit receives finished lines; partial the line still arriving.
+	// Decoupling them from Screen keeps the renderer testable and lets one
+	// owner compose the transient zone from the partial line and the status line.
 	commit  func(string)
 	partial func([]string)
 
@@ -48,14 +31,14 @@ type Markdown struct {
 	fenceLang string
 	fenceBody []string
 
-	// tableBuf holds a table's rows until its extent is known; tableRaw says
+	// tableBuf holds a table's rows until its extent is known; tableRaw means
 	// the buffer was given up on and the rest of this table streams unaligned.
 	tableBuf []string
 	tableRaw bool
 
 	chromaStyle *chroma.Style
-	// pending holds the styled prefix of a partially-emitted paragraph so the
-	// transient preview shows what is arriving.
+	// lastCommitBlank records whether the last line committed was blank, so
+	// runs of blank lines collapse.
 	lastCommitBlank bool
 }
 
@@ -74,10 +57,8 @@ func NewMarkdown(commit func(string), partial func([]string), style Style, color
 	return m
 }
 
-// resolveChromaStyle picks a syntax theme. "auto" selects one that is legible
-// on both light and dark terminals and, importantly, does not paint its own
-// background: a code block with a hardcoded background colour looks wrong in
-// every terminal but the one it was designed for.
+// resolveChromaStyle picks a syntax theme. "auto" avoids a background colour,
+// which looks wrong in every terminal but the one it was designed for.
 func resolveChromaStyle(name string) *chroma.Style {
 	switch name {
 	case "", "auto":
@@ -112,26 +93,17 @@ func (m *Markdown) Write(text string) {
 }
 
 // preview shows the in-progress line in the transient zone, styled and wrapped
-// as it will finally appear.
-//
-// Speculating here is safe in a way that speculating in the scrollback is not:
-// the transient zone is erased and repainted on every frame, so a guess that
-// turns out wrong costs one frame, not a corrupted line the user has already
-// scrolled past. What it buys is that the text does not move when the line
-// lands -- the markers never appear, so they never have to disappear.
-//
-// Code is previewed verbatim. A fenced line is committed byte for byte, and the
-// preview has no business showing it any other way.
+// as it will appear. A wrong guess costs one frame here, not a corrupted
+// scrollback line, and code is previewed verbatim.
 func (m *Markdown) preview() {
 	if m.partial == nil {
 		return
 	}
 	line := m.line.String()
 	if len(m.tableBuf) > 0 {
-		// Buffered rows exist nowhere else yet, so the transient zone stands in
-		// for the scrollback until the table can be laid out. They are shown as
-		// the model wrote them: the widths are not known until the last row is
-		// in, so an aligned preview would shift on every row anyway.
+		// Buffered rows exist nowhere else yet, so the transient zone stands
+		// in for the scrollback until the table can be laid out, shown as the
+		// model wrote them: widths are not known until the last row arrives.
 		rows := m.tableBuf
 		if len(rows) > tablePreviewRows {
 			rows = rows[len(rows)-tablePreviewRows:]
@@ -160,13 +132,9 @@ func (m *Markdown) preview() {
 	m.partial(wrapStyled(styled, cont, m.proseWidth()))
 }
 
-// proseWidth is the column budget a prose line is wrapped to.
-//
-// One column short of the terminal, because the preview has to draw the same
-// line inside the transient zone, where every row is truncated to width-1 to
-// keep the erase count exact (see Screen.setTransient). Wrapping both paths to
-// the same budget is what makes the committed line identical to the preview it
-// replaces, instead of reflowing by a word at the moment it lands.
+// proseWidth is one column short of the terminal: the preview truncates every
+// transient row to width-1 to keep the erase count exact, and wrapping both
+// paths to the same budget keeps the committed line identical to the preview.
 func (m *Markdown) proseWidth() int {
 	return max(m.width()-1, 1)
 }
@@ -178,7 +146,7 @@ func (m *Markdown) Flush() {
 		m.line.Reset()
 	}
 	if m.inFence {
-		// The model ended mid-fence. Close it rather than leaving the renderer
+		// The model ended mid-fence; close it rather than leaving the renderer
 		// in code mode for whatever comes next.
 		m.inFence = false
 		m.fenceBody = nil
@@ -197,8 +165,8 @@ func (m *Markdown) commitLine(line string) {
 			m.bufferTableRow(trimmed)
 			return
 		}
-		// Whatever ends the table is committed after it, never before: the rows
-		// it ends are still sitting in the buffer.
+		// Whatever ends the table is committed after it: the rows it ends are
+		// still sitting in the buffer.
 		m.flushTable()
 	}
 
@@ -234,19 +202,16 @@ func (m *Markdown) commitLine(line string) {
 	}
 }
 
-// commitCodeLine highlights one line of a fenced block.
-//
-// The whole block accumulated so far is re-lexed on each line, and only the
-// newly finished line is emitted. Re-lexing is what makes multi-line constructs
-// -- block comments, raw strings -- highlight correctly, and emitting only the
-// last line is what keeps the output append-only.
+// commitCodeLine highlights one line of a fenced block. The whole block is
+// re-lexed each time, so multi-line constructs highlight correctly, and only
+// the finished line is emitted, which keeps output append-only.
 func (m *Markdown) commitCodeLine(line string) {
 	m.fenceBody = append(m.fenceBody, line)
 	m.lastCommitBlank = false
 
 	if m.chromaStyle == nil || len(m.fenceBody) > 2000 {
-		// Very large blocks fall back to plain text rather than re-lexing
-		// thousands of lines once per line.
+		// Very large blocks fall back to plain text rather than re-lexing once
+		// per line.
 		m.commit(line)
 		return
 	}
@@ -274,7 +239,7 @@ func (m *Markdown) highlightLast() (string, bool) {
 		return "", false
 	}
 
-	// Split the token stream into lines and keep only the last one.
+	// Split the token stream into lines.
 	lineTokens := [][]chroma.Token{{}}
 	for _, tok := range iter.Tokens() {
 		parts := strings.Split(tok.Value, "\n")
@@ -305,18 +270,16 @@ func (m *Markdown) highlightLast() (string, bool) {
 	return strings.TrimRight(b.String(), "\n"), true
 }
 
-// styleProse applies block and inline markdown styling to one complete line,
-// and reports the indent a wrapped continuation of that line should carry so
-// the text stays aligned under its bullet, number or quote rather than
-// resetting to column zero.
+// styleProse styles one complete line and reports the indent a wrapped
+// continuation carries, so text stays aligned under its bullet, number or quote
+// rather than resetting to column zero.
 func (m *Markdown) styleProse(line string) (styled, contIndent string) {
 	return m.styleProseWith(line, m.inline)
 }
 
-// speculate renders a line that is still arriving as though it were already
-// complete: a span that has opened is styled through to the end on the
-// assumption it will close, and a trailing fragment that may still grow is held
-// back. Both keep a delimiter from being shown and then taken away.
+// speculate renders a line that is still arriving as though it were complete:
+// an open span is styled through to the end, and a trailing fragment that may
+// still grow is held back, so a delimiter is never shown and then taken away.
 func (m *Markdown) speculate(line string) (styled, contIndent string) {
 	if !m.color {
 		return m.styleProse(line)
@@ -325,8 +288,8 @@ func (m *Markdown) speculate(line string) (styled, contIndent string) {
 }
 
 // holdBack drops a trailing fragment that would appear for one frame and then
-// vanish: a lone "*" on its way to "**", the delimiter that closes a span, or
-// the "#" of a heading that has not reached its space yet.
+// vanish: a lone "*" on its way to "**", a closing delimiter, or the "#" of a
+// heading that has not reached its space yet.
 func holdBack(line string) string {
 	if t := strings.TrimLeft(line, " \t"); t != "" && strings.Trim(t, "#") == "" {
 		return ""
@@ -381,15 +344,15 @@ func (m *Markdown) styleProseWith(line string, inline func(string) string) (styl
 	return indent + inline(trimmedLeft), cont
 }
 
-// inline styles spans within a line: code, bold and italic.
+// inline styles spans within a line: code and bold.
 func (m *Markdown) inline(s string) string {
 	s = m.spanReplace(s, "`", m.style.Code)
 	s = m.spanReplace(s, "**", m.style.Bold)
 	return s
 }
 
-// spanReplace styles paired delimiters, leaving an unmatched delimiter alone.
-// An unmatched backtick is common in prose about shell commands and must not
+// spanReplace styles paired delimiters, leaving an unmatched delimiter alone:
+// an unmatched backtick is common in prose about shell commands and must not
 // swallow the rest of the line.
 func (m *Markdown) spanReplace(s, delim string, style func(string) string) string {
 	if !strings.Contains(s, delim) {
@@ -452,21 +415,6 @@ func orderedListItem(s string) (marker, rest string, ok bool) {
 	return "", "", false
 }
 
-// ---------------------------------------------------------------------------
-// Word wrapping
-//
-// Only prose is wrapped. Code inside a fence is committed byte for byte at its
-// real indentation, because the whole point of an inline renderer is that a
-// block selected out of the scrollback is the code that was written; a wrap
-// inserted into it is a corruption that survives the paste.
-//
-// Wrapping prose does cost something. Committed lines are never revised, so a
-// paragraph broken at today's width stays broken there when the terminal is
-// resized, where an unwrapped line would have reflowed natively. That is the
-// trade: a narrowed window leaves earlier scrollback ragged until it is widened
-// again, and in exchange no word is ever sliced down the middle.
-// ---------------------------------------------------------------------------
-
 // cell is one unit of a styled line: a visible rune, or a zero-width escape
 // sequence that must travel with the text around it.
 type cell struct {
@@ -498,12 +446,9 @@ func splitCells(s string) []cell {
 	return cells
 }
 
-// wrapStyled breaks an already-styled line at word boundaries, returning the
-// visual lines to commit. A line that fits comes back untouched.
-//
-// A break inside a styled span closes the run and reopens it on the next line:
-// an escape left dangling bleeds into everything committed after it, and a span
-// that silently loses its colour halfway through a sentence looks like a bug.
+// wrapStyled breaks an already-styled prose line at word boundaries, returning
+// the lines to commit. A break inside a span closes the run and reopens it, so
+// no escape bleeds into what follows; code is never wrapped.
 func wrapStyled(line, contIndent string, width int) []string {
 	if width <= 0 {
 		return []string{line}
@@ -591,11 +536,8 @@ func join(cells []cell) string {
 }
 
 // inlineOpen is inline for a line that is still arriving: a span whose closing
-// delimiter has not turned up yet is styled anyway, on the assumption that it
-// will. When the assumption is wrong -- a lone backtick in prose about shell
-// commands is the usual way -- the committed line restores the literal
-// delimiter and the text shifts by a character, which is the whole cost of the
-// guess and is paid far less often than the shift it removes.
+// delimiter has not turned up is styled on the assumption that it will. When it
+// does not, the committed line restores the literal delimiter.
 func (m *Markdown) inlineOpen(s string) string {
 	s = m.spanReplaceOpen(s, "`", m.style.Code)
 	s = m.spanReplaceOpen(s, "**", m.style.Bold)
@@ -617,37 +559,26 @@ func (m *Markdown) spanReplaceOpen(s, delim string, style func(string) string) s
 	return b.String()
 }
 
-// ---------------------------------------------------------------------------
-// Tables
-//
-// A column's width is a property of every row, so a table cannot be laid out
-// until the last row arrives. Tables alone are therefore buffered, echoed into
-// the transient zone as they accumulate and committed in one piece.
-//
-// Every path that can end a table must flush it -- the first line that is not
-// a row, an opening fence, the row bound below, and Flush -- because losing
-// the model's output is worse than a misaligned column.
-// ---------------------------------------------------------------------------
-
 // tableMaxRows bounds the buffer. Past it rows are committed unaligned, so a
 // pathological input degrades rather than growing without limit.
 const tableMaxRows = 2000
 
-// tablePreviewRows bounds how much of the buffer is echoed while it fills. The
-// transient zone is repainted on every token and erased by counted cursor
-// moves, so the tail is the only part worth showing.
+// tablePreviewRows bounds how much of the buffer the transient zone echoes: the
+// zone is repainted on every token and erased by counted cursor moves, so only
+// the tail is worth showing.
 const tablePreviewRows = 40
 
-// tableMinCol is the narrowest a column may be squeezed to before the whole
-// table is given up on. Below about this width a cell shows two characters and
-// an ellipsis, which destroys information the reader cannot recover; a row that
-// the terminal wraps is ugly but still says what the model said.
+// tableMinCol is the narrowest a column may be squeezed to before the table is
+// given up on and committed raw: a cell of two characters and an ellipsis
+// destroys information the reader cannot recover.
 const tableMinCol = 8
 
 // tableAlign is the delimiter row's marker for one column: ":---", "---:" or
-// ":---:". Both false is the default, which is left.
+// ":---:". The default is left.
 type tableAlign struct{ left, right bool }
 
+// bufferTableRow holds a row until the table's extent is known, since a
+// column's width depends on every row.
 func (m *Markdown) bufferTableRow(row string) {
 	if m.tableRaw {
 		m.commitTableRowRaw(row)
@@ -664,10 +595,9 @@ func (m *Markdown) bufferTableRow(row string) {
 	}
 }
 
-// commitTableRowRaw emits a row the way the renderer did before it could align
-// one. A table row is structure, not prose: breaking it at a space moves cells
-// onto their own lines and the columns stop meaning anything, so it goes out
-// whole and the terminal deals with it.
+// commitTableRowRaw emits a row whole when the table cannot be aligned. A table
+// row is structure, not prose: breaking it at a space moves cells onto their own
+// lines and the columns stop meaning anything.
 func (m *Markdown) commitTableRowRaw(row string) {
 	styled, _ := m.styleProse(row)
 	m.commit(styled)
@@ -680,9 +610,8 @@ func (m *Markdown) flushTable() {
 		return
 	}
 	rows := m.tableBuf
-	// Cleared before anything is committed. commit is a callback into the
-	// owner of the screen, and a table still sitting in the buffer when it
-	// re-enters would be emitted a second time.
+	// Cleared before committing: commit re-enters through the owner of the
+	// screen, and a buffered table would be emitted a second time.
 	m.tableBuf = nil
 	for _, l := range m.renderTable(rows) {
 		m.commit(l)
@@ -715,18 +644,16 @@ func (m *Markdown) renderTable(rows []string) []string {
 		return m.rawTable(rows)
 	}
 	for len(aligns) < cols {
-		// A row with more cells than the delimiter declared is common. The
-		// extra is content, so it gets a column, where a spec-following parser
-		// would drop it on the floor.
+		// A row with more cells than the delimiter declared gets a column: the
+		// extra is content, not something to drop.
 		aligns = append(aligns, tableAlign{})
 	}
 
 	widths := make([]int, cols)
 	for _, cells := range grid {
 		for j, c := range cells {
-			// Measured on the styled text, because visibleWidth skips the
-			// escapes. Measuring the source instead counts the markers of every
-			// bold or code cell as content and the columns drift by two.
+			// Measured on the styled text: visibleWidth skips the escapes,
+			// and counting the markers as content would drift the columns.
 			widths[j] = max(widths[j], visibleWidth(c))
 		}
 	}
@@ -762,8 +689,8 @@ func (m *Markdown) rawTable(rows []string) []string {
 }
 
 // styleCell applies inline markdown to a cell. With colour off the source is
-// left alone, which is what styleProseWith does with a whole line: the markers
-// are the only thing left to convey the emphasis.
+// left alone, as styleProseWith does with a whole line, so the markers still
+// convey the emphasis.
 func (m *Markdown) styleCell(s string) string {
 	if !m.color {
 		return s
@@ -771,13 +698,9 @@ func (m *Markdown) styleCell(s string) string {
 	return m.inline(s)
 }
 
-// fitTable decides the final column widths, and reports false when the table
-// should not be aligned at all.
-//
-// Alignment is only worth anything if every line of it fits on one row: a table
-// laid out to a width the terminal does not have is wrapped by the terminal at
-// an arbitrary column, which scrambles the columns far more thoroughly than
-// never having aligned them.
+// fitTable decides the final column widths, reporting false when the table
+// should not be aligned: every line has to fit one row, and a terminal-wrapped
+// table is scrambled far worse than an unaligned one.
 func fitTable(nat []int, avail int) ([]int, bool) {
 	overhead := 1 + 3*len(nat)
 	total, floor := overhead, overhead
@@ -798,17 +721,16 @@ func fitTable(nat []int, avail int) ([]int, bool) {
 		got += w
 	}
 	if got > avail {
-		// Arithmetic guard: an over-budget layout is the one outcome that must
-		// never reach the terminal, and raw output is always safe.
+		// Arithmetic guard: an over-budget layout must never reach the
+		// terminal, and raw output is always safe.
 		return nil, false
 	}
 	return out, true
 }
 
-// fitColumns shares a budget out between columns. A column narrower than its
-// fair share is paid in full and its change handed back to the rest, so a
-// column of "y"/"n" does not sit in a third of the terminal while the column of
-// file paths is cut to pieces.
+// fitColumns shares a budget out between columns: a column narrower than its
+// fair share is paid in full and its change handed back to the rest, so short
+// columns do not sit wide while long ones are cut to pieces.
 func fitColumns(nat []int, budget int) []int {
 	out := make([]int, len(nat))
 	done := make([]bool, len(nat))
@@ -880,24 +802,13 @@ func truncateCell(s string, w int) string {
 	return truncateVisible(s, w-1) + "…"
 }
 
-// tableRule redraws the delimiter row at the measured widths, in ASCII with the
-// alignment colons kept. Box drawing would look better and would stop the table
-// being the markdown it arrived as -- and a table selected out of the
-// scrollback is usually on its way into a file.
-// Box-drawing rather than the markdown the model wrote. A rendered table is
-// something to read, and the pipes and dashes it arrived as are markup, not
-// content. Every glyph here is one column wide, so the width arithmetic above
-// is unchanged.
-//
-// The cost is that selecting a rendered table no longer yields valid GFM. That
-// is the trade the border is worth: the transcript on disk keeps the model's
-// original markdown either way.
+// Every glyph is one column wide, so the width arithmetic above is unchanged.
 const (
 	tableVertical   = "\u2502"
 	tableHorizontal = "\u2500"
 )
 
-// tableRule describes one of the three horizontal rules by its corners.
+// tableRuleStyle is one of the three horizontal rules, by its corners.
 type tableRuleStyle struct{ left, join, right string }
 
 var (
@@ -906,10 +817,9 @@ var (
 	tableBottom = tableRuleStyle{"\u2514", "\u2534", "\u2518"}
 )
 
-// tableRule draws a horizontal rule. Alignment is not marked on it the way a
-// markdown delimiter row does with colons: the padding in the cells above and
-// below already shows which way each column is set, and a colon in a drawn
-// border reads as a typo.
+// tableRule draws a horizontal rule in box drawing rather than the markdown the
+// model wrote: the pipes and dashes are markup, not content. Alignment is shown
+// by the cell padding, not by colons.
 func tableRule(widths []int, st tableRuleStyle) string {
 	var b strings.Builder
 	b.WriteString(st.left)
@@ -923,8 +833,7 @@ func tableRule(widths []int, st tableRuleStyle) string {
 	return b.String()
 }
 
-// tableAlignments reads the delimiter row, which a table must have as its
-// second line to be a table at all.
+// tableAlignments reads the delimiter row a table must have as its second line.
 func tableAlignments(rows []string) ([]tableAlign, bool) {
 	if len(rows) < 2 {
 		return nil, false
@@ -948,9 +857,8 @@ func tableAlignments(rows []string) ([]tableAlign, bool) {
 }
 
 // splitTableCells breaks a row on its unescaped pipes. The outer pair is the
-// table's own border rather than an empty first and last cell, but only when it
-// is there: models drop the trailing pipe often enough that requiring it would
-// lose the last column of the row.
+// table's border rather than empty cells, but only when present: models drop the
+// trailing pipe often enough that requiring it would lose the last column.
 func splitTableCells(line string) []string {
 	s := strings.TrimSpace(line)
 	var (

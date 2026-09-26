@@ -39,9 +39,8 @@ func TestMultilineEchoShowsEveryLineBetweenRules(t *testing.T) {
 	}
 }
 
-// Indentation, not a gutter character. A vertical bar down the left edge is
-// picked up by selection, which is the thing this renderer refuses to do to
-// text the user may want to copy back out.
+// Indentation, not a gutter character: a vertical bar down the left edge is
+// picked up by selection.
 func TestMultilineEchoDoesNotPutAGutterInTheTextColumns(t *testing.T) {
 	got := Echo(Style{}, "prompt", "line one\nline two")
 	for _, l := range got {
@@ -74,9 +73,8 @@ func TestLongEchoIsCapped(t *testing.T) {
 	}
 }
 
-// A line long enough to matter is bounded, but from the middle: the opening
-// words say what was asked and the closing ones carry the path or the
-// constraint added last, and losing either makes two prompts indistinguishable.
+// A long line is bounded from the middle: the opening words say what was asked
+// and the closing ones carry the path or the constraint added last.
 func TestBoundLineCutsTheMiddleAndKeepsBothEnds(t *testing.T) {
 	text := "START " + strings.Repeat("filler ", 5000) + "END"
 	got := BoundLine(text)

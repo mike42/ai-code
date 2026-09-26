@@ -8,13 +8,8 @@ import (
 )
 
 // setProcessGroup puts the command in its own process group so that cancelling
-// it kills the whole tree.
-//
-// Killing the PID alone is not enough and the difference is not academic: a
-// `make -j8` or a `npm test` spawns children that keep running, keep holding
-// file handles, and keep writing to a pipe nobody is reading. Every subsequent
-// tool call then contends with orphans from a command the user thought they
-// cancelled.
+// it kills the whole tree. Killing the PID alone leaves children running,
+// holding file handles and writing to a pipe nobody is reading.
 func setProcessGroup(c *exec.Cmd) {
 	if c.SysProcAttr == nil {
 		c.SysProcAttr = &syscall.SysProcAttr{}

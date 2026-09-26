@@ -13,8 +13,7 @@ func TestWorkerReportLabelIsPickedOut(t *testing.T) {
 	}
 }
 
-// Anything else is shown in full. A steer that is not a worker report is the
-// user talking, and summarising that to nothing would lose it.
+// Anything else is shown in full, not summarised to nothing.
 func TestAnOrdinarySteerIsNotTreatedAsAReport(t *testing.T) {
 	for _, in := range []string{
 		"stop and check the tests first",

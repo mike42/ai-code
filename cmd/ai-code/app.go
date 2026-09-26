@@ -34,116 +34,77 @@ type App struct {
 	model        provider.ModelInfo
 	modeName     string
 	limitSource  string
-	// noCloud is true when a .nocloud file was found in the working directory
-	// or a parent. Cloud providers are then unavailable for the whole session.
+	// noCloud is true when a .nocloud file marks the tree; cloud providers are
+	// then unavailable.
 	noCloud bool
 
-	// hostGitRoot is the repository root on this machine. env.GitRoot may
-	// hold the container's path instead, and AGENTS.md files are read from
-	// the host's filesystem either way.
+	// hostGitRoot is the repository root on this machine, where AGENTS.md is read.
 	hostGitRoot string
-	// showPath maps a host path to the one the model should be told about.
-	// nil when they are the same, which is every session that is not running
-	// its tools in a container. The bool is false for a file the container
-	// cannot see at all: its content still reaches the model, but naming a
-	// path the model cannot act on is worse than naming none.
+	// showPath maps a host path to the model's view, and reports false when the
+	// container cannot see the file.
 	showPath func(string) (string, bool)
 
 	exec      tool.Executor
 	toolState *tool.State
 	agent     *agent.Agent
 
-	// workers is the set of sub-agents running beside this session. They
-	// outlive the turn that started them, so they are the session's and not
-	// the turn's.
+	// workers are the sub-agents running beside this session.
 	workers *agent.Workers
-	// editor is the live prompt, set for as long as the REPL owns the
-	// terminal. A worker finishing while the user is typing reaches the
-	// screen through it; nil in a piped session, where there is no prompt to
-	// write above.
+	// editor is the live prompt while the REPL owns the terminal; nil when piped.
 	editorMu sync.Mutex
 	editor   *ui.Editor
 
-	// rt is the resolved execution environment for this session. It is fixed at
-	// startup and never changes.
+	// rt is the resolved execution environment, fixed at startup.
 	rt *runtime.Runtime
 
 	screen      *render.Screen
 	interactive *render.Interactive
 	env         prompt.Env
 
-	// ctxState is the context figure as last published by the agent. See
-	// noteContext: it is adopted, never computed.
+	// ctxState is the context figure last published by the agent; see noteContext.
 	ctxMu    sync.Mutex
 	ctxState agent.ContextState
 
 	// verbosity is the renderer's detail level, driven by /verbose and /quiet.
-	// Both the terminal and the plain renderer offer it; the JSON stream does
-	// not, and there it is nil.
 	verbosity interface{ SetVerbose(bool) bool }
 
 	sess    *session.Session
 	resumed []provider.Message
-	// resumedInputs is the command history recovered from the session file, so
-	// a /restart or a --resume does not land the user at a prompt with no Up
-	// arrow.
+	// resumedInputs is the command history recovered from the session file.
 	resumedInputs []string
 	recorded      int
-	// recordedSummary is the standby checkpoint already on disk, so the same
-	// text is not appended again every turn.
+	// recordedSummary is the standby checkpoint already on disk.
 	recordedSummary string
 
-	// resumedSummary is the standby checkpoint recovered from the session
-	// file, and resumedThrough how much of the transcript it accounts for.
-	// Without these a restart throws away the summary it was most likely to
-	// need -- the swap that prompted the restart is the next thing to happen.
+	// resumedSummary is the recovered checkpoint, resumedThrough how much it covers.
 	resumedSummary string
 	resumedThrough int
-	// resumedCut is the boundary a compaction in the recorded session chose,
-	// zero when the checkpoint was a standby one. Without it a resumed
-	// session would assemble from the whole replayed transcript and undo the
-	// compaction it is resuming from.
+	// resumedCut is the boundary a recorded compaction chose, zero for a standby
+	// checkpoint.
 	resumedCut int
 
-	// queuedCmds are slash commands typed while a turn was running. They run
-	// at the turn boundary; see startSteering.
-	// steerMu guards steering, which says whether the terminal is already
-	// open for input somewhere up the stack.
+	// steerMu guards steering: whether the terminal is already open for input.
 	steerMu  sync.Mutex
 	steering bool
 
 	cmdMu      sync.Mutex
 	queuedCmds []string
-	// deferredPrompts are lines submitted while a model swap was running, to
-	// be run once it finishes, on whichever model it loaded.
+	// deferredPrompts are lines submitted during a model swap, run after it.
 	deferredPrompts []string
-	// turnErr is an errQuit or a restart raised by one of them, which has to
-	// leave the turn before it can be acted on.
+	// turnErr is an errQuit or restart raised at the turn boundary.
 	turnErr error
 
-	// knownModel is the model the scrollback last said this session was on:
-	// the startup banner, a /model line, or a change notice that a prompt
-	// has since been submitted underneath.
-	//
-	// One invariant governs the whole report: the line above the prompt
-	// shows the difference between what the scrollback says and what is
-	// true. Equal means nothing is shown, which is why swapping away and
-	// back leaves no trace, and why a session that has sent nothing still
-	// reports -- its banner made a claim that is no longer true.
+	// knownModel is the model the scrollback last said this session was on.
 	knownModel string
 
-	// pendingInput is text the user was part-way through typing when the last
-	// turn ended. It seeds the next prompt.
+	// pendingInput seeds the next prompt.
 	pendingInput string
 
-	// flags is what this process was launched with, kept so /restart can hand
-	// the display options on to its replacement.
+	// flags is what this process was launched with, for /restart.
 	flags *flags
 
-	// peers is what this window publishes about itself for the others to
-	// read, and coordDir is the directory they share. Both are usable when
-	// nil or empty: coordination is an improvement on a session that works
-	// without it.
+	// peers is this window's registration and coordDir the directory windows
+	// share; both may be nil or empty.
 	peers    *coord.Registration
 	coordDir string
 }
@@ -171,8 +132,7 @@ func (a *App) openSession(f *flags) error {
 		a.recordedSummary = a.resumedSummary
 
 		if s.Meta.Project != "" && s.Meta.Project != a.projectRoot {
-			// A moved or renamed repository. Say so rather than silently
-			// resuming against paths that may no longer exist.
+			// A moved or renamed repository: say so rather than resume stale paths.
 			a.note(fmt.Sprintf("This session was recorded in %s, which is not where you are now. "+
 				"File paths in its history may be stale.", s.Meta.Project))
 		}
@@ -201,10 +161,8 @@ func (a *App) closeSession() {
 }
 
 // recordInput logs a submitted line so command history survives a restart.
-//
-// Separate from recordNew because a slash command never reaches the agent's
-// message list at all, and the prompts that do are wrapped and later dropped
-// by compaction. Neither round-trips as something to press Up and re-run.
+// Separate from recordNew, because a slash command never reaches the agent's
+// message list and a prompt is wrapped and later dropped by compaction.
 func (a *App) recordInput(line string) {
 	if a.sess == nil || strings.TrimSpace(line) == "" {
 		return
@@ -232,15 +190,9 @@ func (a *App) note(text string) {
 	fmt.Fprintf(os.Stderr, "note: %s\n", text)
 }
 
-// progress reports what a slow tool call is waiting for.
-//
-// Into the transient zone, where each line replaces the last and the status
-// line sits underneath it, so a container start that takes minutes says what
-// it is doing the whole time without scrolling a screen of history for it.
-// The scrollback gets one line at the end instead; see noteReady.
-//
-// Without a terminal there is no transient zone, so it goes to stderr, where
-// a piped run still shows why it paused.
+// progress reports what a slow tool call is waiting for, into the transient
+// zone where each line replaces the last. Without a terminal it goes to
+// stderr; the scrollback gets one line at the end instead.
 func (a *App) progress(p tool.Phase) {
 	if a.interactive == nil {
 		fmt.Fprintf(os.Stderr, "note: %s\n", p.Note)
@@ -272,9 +224,7 @@ func (a *App) runTurn(parent context.Context, input string) error {
 	defer restore()
 	defer cancel()
 
-	// Under the same lock a swap decides with: take whatever is loaded and
-	// declare this session working on it, so a swap either waits for this
-	// turn or this turn yields to the swap. Nothing in between.
+	// Take what is loaded and declare this session working on it, under the swap lock.
 	a.claimModel(ctx)
 
 	a.peers.SetBusy(true)
@@ -285,8 +235,7 @@ func (a *App) runTurn(parent context.Context, input string) error {
 
 	stopSteering := a.startSteering(cancel)
 
-	// For the whole turn, not just the parts that emit events. Compaction
-	// runs between requests and emits nothing while it works.
+	// For the whole turn: compaction emits nothing while it works.
 	if a.interactive != nil {
 		a.interactive.SetBusy(true)
 		defer a.interactive.SetBusy(false)
@@ -294,14 +243,10 @@ func (a *App) runTurn(parent context.Context, input string) error {
 
 	err := a.agent.Run(ctx, input)
 
-	// Anything half-typed when the turn ended goes to the next prompt rather
-	// than into the void.
 	a.pendingInput = stopSteering()
 
 	if ctx.Err() != nil {
-		// The turn was cancelled. A steering message queued but not yet folded
-		// in belongs to the course the user has just abandoned, so it is
-		// dropped rather than delivered with whatever they type next.
+		// The turn was cancelled: steering queued but not folded in is dropped.
 		if n := len(a.agent.TakeSteering()); n > 0 {
 			noun := "steering message"
 			if n > 1 {
@@ -312,30 +257,21 @@ func (a *App) runTurn(parent context.Context, input string) error {
 	}
 
 	a.recordNew()
-	// An automatic compaction inside the turn leaves a checkpoint behind.
 	a.recordCheckpoint()
 
-	// The turn is over and the message list is complete: the loop boundary
-	// where a new user message is legal, and the first moment since the turn
-	// began that a summary can be written. A swap announced while this turn
-	// was running has been waiting for exactly this.
+	// The turn is over, so the message list is complete and a summary can be written.
 	a.prepareForSwap(parent, nil)
 
-	// A /quit or /restart typed during the turn could not act from inside
-	// it; this is where it leaves.
+	// A /quit or /restart typed during the turn could not act from inside it.
 	if a.turnErr != nil {
 		err, a.turnErr = a.turnErr, nil
 	}
 	return err
 }
 
-// startSteering opens the terminal for input while the turn runs, and returns a
-// function that closes it and yields whatever was typed but not submitted.
-//
-// Steering is best-effort. If the terminal cannot be put into the mode it needs
-// -- not a tty, an unsupported platform, an ioctl that fails -- the turn runs
-// exactly as it did before, with the status line and nothing else. It is not
-// worth failing a request over.
+// startSteering opens the terminal for input while the turn runs and returns a
+// function that closes it. Steering is best-effort: a terminal that cannot be
+// put into the mode it needs leaves the turn running unchanged.
 func (a *App) startSteering(cancel context.CancelFunc) func() string {
 	return a.steerWith(cancel, nil)
 }
@@ -347,10 +283,7 @@ func (a *App) steerWith(cancel context.CancelFunc, submit func(string)) func() s
 		return func() string { return "" }
 	}
 
-	// One reader of the terminal at a time. A /model typed mid-turn runs at
-	// the loop boundary, inside a turn that already has the terminal open,
-	// and a second reader on the same descriptor means two goroutines
-	// racing for each keystroke.
+	// One reader at a time: a command can run where the terminal is open.
 	a.steerMu.Lock()
 	if a.steering {
 		a.steerMu.Unlock()
@@ -368,8 +301,7 @@ func (a *App) steerWith(cancel context.CancelFunc, submit func(string)) func() s
 	}
 	st.Interrupt = cancel
 	st.Control = a.interactive.Control
-	// The same candidates the prompt offers. A path is no easier to type
-	// while a turn is running than it is at the prompt.
+	// The same candidates the prompt offers.
 	st.Completions = a.complete
 
 	if err := st.Start(); err != nil {
@@ -390,19 +322,9 @@ func (a *App) steerWith(cancel context.CancelFunc, submit func(string)) func() s
 
 func (a *App) steerSubmit(text string) {
 	{
-		// A slash command typed mid-turn is a command, the same as one typed
-		// at the prompt. It runs at the turn boundary rather than here,
-		// because that is where the conversation is in a state a command can
-		// safely change -- and it is the same point steering is folded in,
-		// so the two stay in the order they were typed.
+		// A slash command runs at the turn boundary, where steering is folded in.
 		if strings.HasPrefix(strings.TrimSpace(text), "/") {
-			// Most commands wait for the turn boundary, below. These two do
-			// not: they change only how output is drawn, touching neither the
-			// conversation nor the model, and waiting defeats the point of
-			// them. A turn boundary arrives after the next round of tool
-			// results, which on a model thinking at a few tokens a second is
-			// minutes away -- and the thinking the user turned verbose on to
-			// read is over by then.
+			// Only output drawing: no conversation change, so no need to wait.
 			if renderOnlyCommand(text) {
 				if err := a.command(context.Background(), text); err != nil {
 					a.reportError(err)
@@ -416,33 +338,22 @@ func (a *App) steerSubmit(text string) {
 		if !a.agent.Steer(text) {
 			return
 		}
-		// The status line acknowledges it; the scrollback does not. The agent
-		// emits EvSteer when the message is actually folded into the
-		// conversation, and that is the honest moment to commit a line saying
-		// so -- until then the model is still working from the old
-		// instruction, and a line in the scrollback would be read as the point
-		// at which it changed course.
+		// The status line acknowledges it; the scrollback waits for EvSteer.
 		a.interactive.SetQueued(a.agent.Pending() + a.pendingCommands())
 	}
 }
-
-// ---------------------------------------------------------------------------
-// REPL
-// ---------------------------------------------------------------------------
 
 func (a *App) repl(ctx context.Context, cancel context.CancelFunc, opening string) error {
 	editor := ui.NewEditor(os.Stdin, os.Stdout)
 	editor.EditorCommand = a.cfg.Editor
 	editor.Completions = a.complete
-	// Published for as long as this loop owns the terminal, so a worker
-	// finishing between turns has somewhere to print.
+	// Published while this loop owns the terminal, so a worker has somewhere to print.
 	a.setEditor(editor)
 	defer a.setEditor(nil)
 
 	a.banner()
 
-	// Before anything typed this run, so Up walks back through the whole
-	// session rather than only the part since the last restart.
+	// Before anything typed this run, so Up walks back through the session.
 	for _, h := range a.resumedInputs {
 		editor.AddHistory(h)
 	}
@@ -463,8 +374,7 @@ func (a *App) repl(ctx context.Context, cancel context.CancelFunc, opening strin
 	}
 
 	for {
-		// A prompt typed during a model swap runs now, on the model the swap
-		// loaded, without being retyped.
+		// A prompt typed during a model swap runs now, on the model it loaded.
 		if line, ok := a.takeDeferredPrompt(); ok {
 			a.echoPrompt(line)
 			if err := a.handleInput(ctx, line); err != nil {
@@ -484,8 +394,7 @@ func (a *App) repl(ctx context.Context, cancel context.CancelFunc, opening strin
 			editor.Preload(a.pendingInput)
 			a.pendingInput = ""
 		}
-		// Built before the background work starts, because it reads the same
-		// agent state that work is about to write to.
+		// Built before the background work starts: it reads state that work writes.
 		prompt := a.promptString()
 		stopIdle := a.startIdleCheckpoint(ctx, editor)
 		line, err := editor.ReadLine(prompt)
@@ -496,18 +405,14 @@ func (a *App) repl(ctx context.Context, cancel context.CancelFunc, opening strin
 			a.out("")
 			return nil
 		case errors.Is(err, ui.ErrInterrupt):
-			// Ctrl-C on an empty prompt is the only gesture that reaches a
-			// background worker: the turn that started it has long since
-			// ended, so there is no run to interrupt instead.
+			// Ctrl-C on an empty prompt reaches a background worker.
 			a.stopWorkers()
 			continue
 		case err != nil:
 			return err
 		}
 
-		// Whatever the header said now describes the exchange below it: it
-		// stops being rewritten, stays where it is, and becomes what the
-		// scrollback says this session is on.
+		// The header now describes the exchange below it and becomes scrollback.
 		editor.ForgetHeader()
 		a.knownModel = a.model.ID
 
@@ -548,12 +453,7 @@ func (a *App) handleInput(ctx context.Context, line string) error {
 	return a.runTurn(ctx, line)
 }
 
-// echoPrompt puts a prompt into the scrollback before the answer to it
-// arrives. Without this the transcript has a gap exactly where the question
-// should be.
-//
-// It is for input the terminal was never left showing: /editor composes
-// somewhere else entirely and returns with the prompt line untouched.
+// echoPrompt puts a prompt into the scrollback before the answer arrives.
 func (a *App) echoPrompt(text string) {
 	if a.screen == nil || !a.screen.IsTTY() {
 		return
@@ -561,9 +461,7 @@ func (a *App) echoPrompt(text string) {
 	a.out(render.Echo(render.NewStyle(a.screen.Color()), "prompt", text)...)
 }
 
-// echoTypedPrompt is echoPrompt for input that came back from the line editor,
-// which finishes drawing a single line where it will stay but can only
-// summarise a multi-line one.
+// echoTypedPrompt is echoPrompt for line-editor input.
 func (a *App) echoTypedPrompt(text string) {
 	if !render.IsMultiline(text) {
 		return
@@ -571,8 +469,7 @@ func (a *App) echoTypedPrompt(text string) {
 	a.echoPrompt(text)
 }
 
-// runtimeLabel is the canonical --runtime value for the session's execution
-// environment, for the session transcript. It stays fixed for the session.
+// runtimeLabel is the canonical --runtime value for the session, fixed for its lifetime.
 func (a *App) runtimeLabel() string {
 	if a.rt == nil {
 		return "host"
@@ -586,9 +483,7 @@ func (a *App) banner() {
 
 	cls := ""
 	if a.client.Class() == provider.ClassCloud {
-		// Only cloud needs flagging: it is the one case where the provider name
-		// does not already say where the data goes. "home · on-premises" is
-		// redundant, so the class is omitted for on-premises providers.
+		// Only cloud needs flagging: a provider name does not say where the data goes.
 		cls = " · " + style.Warn(string(a.client.Class()))
 	}
 
@@ -597,15 +492,11 @@ func (a *App) banner() {
 		if a.rt.Sandboxed() {
 			rtLine = "   " + style.Dim("runtime: "+a.rt.ShortLabel())
 		} else {
-			// The unsandboxed case is deliberately louder. Running tools directly
-			// on the host is always an explicit choice, and the banner should not
-			// let it fade into the noise of the other status text.
+			// Host tools are an explicit choice, so the banner flags them loudly.
 			rtLine = "   " + style.Warn("runtime: "+a.rt.ShortLabel())
 		}
 	}
 
-	// The slot arrangement qualifies the context figure, so it belongs beside
-	// it rather than on a line of its own.
 	ctx := compactInt(limit) + " ctx"
 	if s := slotSummary(a.model); s != "" {
 		ctx += " (" + s + ")"
@@ -628,12 +519,9 @@ func (a *App) banner() {
 	)
 }
 
-// noteContext adopts a context figure from the event stream.
-//
-// The App is a consumer like the renderer, not a second source: asking the
-// agent directly is how the prompt marker and the status line came to
-// disagree after a /compact, one of them reading a value the other had never
-// been told about.
+// noteContext adopts a context figure from the event stream. The App is a
+// consumer like the renderer, not a second source, so the prompt marker and
+// the status line read the same value.
 func (a *App) noteContext(e agent.Event) {
 	if e.Context == nil {
 		return
@@ -653,11 +541,8 @@ func (a *App) promptString() string {
 	style := render.NewStyle(a.screen.Color())
 	cs := a.contextState()
 
-	// ASCII ">", not a chevron. The prompt marker is the one character that is
-	// on screen in every session and in every screenshot and paste of one, and
-	// U+203A is exactly the sort of character that a font falls back on, a
-	// terminal mismeasures, or a copy into a bug report turns into a question
-	// mark. Nothing about it was worth that.
+	// ASCII ">", not a chevron: a font can fall back on U+203A, and a copy-paste
+	// can mismeasure it.
 	marker := promptMarker
 	if a.modeName != "build" {
 		marker = a.modeName + " " + promptMarker
@@ -672,11 +557,6 @@ func (a *App) promptString() string {
 	return workers + style.Bold(marker)
 }
 
-// ---------------------------------------------------------------------------
-// Slash commands
-// ---------------------------------------------------------------------------
-
-// promptMarker is the prompt, and the steering prompt shown mid-turn.
 const promptMarker = "> "
 
 type command struct {
@@ -788,8 +668,7 @@ func (a *App) cmdTools(ctx context.Context, args string) error {
 }
 
 // cmdTokens reports how full the context is and when something happens about
-// it. Those are the only two numbers here, because the status line is absent
-// between turns and the prompt marker is silent below the warning threshold.
+// it: the status line is absent between turns.
 func (a *App) cmdTokens(ctx context.Context, args string) error {
 	cs := a.contextState()
 	style := render.NewStyle(a.screen.Color())
@@ -810,8 +689,6 @@ func (a *App) cmdTokens(ctx context.Context, args string) error {
 		head += style.Dim(fmt.Sprintf(" · %s at %s", what, compactInt(usable)))
 	}
 
-	// The second line says where the window came from, and is omitted when
-	// there is nothing notable about that.
 	var notes []string
 	if limit <= 0 {
 		notes = append(notes, "no window reported, so the server decides")
@@ -873,18 +750,8 @@ func (a *App) rebuildSystemPrompt(modePrompt string) {
 }
 
 // projectInstructions finds the AGENTS.md files for this session and names
-// them the way the model can use.
-//
-// Discovery walks this machine's filesystem, because that is where the files
-// are, and it is bounded by this machine's git root -- not by env.GitRoot,
-// which inside a container holds the mounted path and would send the walk up
-// past the project into the user's home directory.
-//
-// The paths then have to be translated, because the model is told container
-// paths everywhere else and acts through tools that run there. Handing it
-// "/home/someone/proj/AGENTS.md" and a tool that can only see
-// "/workspace/AGENTS.md" is how a request to edit the file turns into a
-// file-not-found the model cannot explain.
+// them the way the model can use. Discovery walks this machine, bounded by the
+// host git root, not env.GitRoot, which holds the container's path.
 func (a *App) projectInstructions() []prompt.AgentsFile {
 	files := prompt.DiscoverAgents(a.cwd, a.hostGitRoot)
 	if a.showPath == nil {
@@ -901,9 +768,7 @@ func (a *App) projectInstructions() []prompt.AgentsFile {
 }
 
 func (a *App) cmdClear(ctx context.Context, args string) error {
-	// Clears the visible screen only. The scrollback is deliberately left
-	// intact: it is the session's history and the reason ai-code does not use the
-	// alternate screen.
+	// Clears the visible screen only; the scrollback stays intact.
 	if a.screen.IsTTY() {
 		fmt.Print("\x1b[2J\x1b[H")
 	}
@@ -913,20 +778,14 @@ func (a *App) cmdClear(ctx context.Context, args string) error {
 func (a *App) cmdQuit(ctx context.Context, args string) error { return errQuit }
 
 // cmdRestart replaces the running process with a fresh copy of the binary and
-// resumes this session in it.
-//
-// It exists for one workflow: rebuild ai-code, then pick up the conversation on
-// the new binary instead of abandoning it. The exec happens in main, not here,
-// because exec replaces the process image and a defer that has not run by then
-// never runs at all -- including the one that flushes this session to disk.
+// resumes this session in it. The exec happens in main: a defer that has not
+// run by then never runs, including the flush of this session to disk.
 func (a *App) cmdRestart(ctx context.Context, args string) error {
 	if a.sess == nil {
 		return errors.New("this session is not being recorded, so there would be nothing to resume")
 	}
 
-	// Resolving the name rather than asking for this process's own image is the
-	// whole point: after a rebuild the name refers to the new file, while
-	// /proc/self/exe still refers to the inode this process started from.
+	// Resolve the name, not /proc/self/exe: after a rebuild the name is the new file.
 	binary, err := exec.LookPath(os.Args[0])
 	if err != nil {
 		return fmt.Errorf("could not find the ai-code binary to restart: %w", err)
@@ -939,9 +798,8 @@ func (a *App) cmdRestart(ctx context.Context, args string) error {
 	return &restartRequest{binary: binary, argv: a.restartArgv(binary)}
 }
 
-// restartArgv describes the session as it stands now rather than as it was
-// launched, so a provider, model or mode changed part-way through survives the
-// restart instead of reverting to whatever was on the original command line.
+// restartArgv describes the session as it stands now, so a provider, model or
+// mode changed part-way through survives the restart.
 func (a *App) restartArgv(binary string) []string {
 	argv := []string{binary,
 		"--resume", a.sess.Meta.ID,
@@ -1018,8 +876,7 @@ func (a *App) setVerbose(on bool) error {
 	}
 	was := a.verbosity.SetVerbose(on)
 
-	// Written back to the flags because /restart rebuilds the process from
-	// them: without this the restart silently undoes the toggle.
+	// Written back to the flags because /restart rebuilds the process from here.
 	if a.flags != nil {
 		a.flags.verbose = on
 	}
@@ -1051,13 +908,9 @@ func (a *App) cmdNew(ctx context.Context, args string) error {
 	return nil
 }
 
-// queuePrompt holds a line submitted while a model swap is in progress.
-//
-// It is a prompt, not a correction to a running turn: nothing is running.
-// Steering's usual action would queue it against a turn that does not
-// exist, where it would sit unanswered until something else started one.
-// Running it after the swap, on the model being loaded, is what typing
-// during a swap meant.
+// queuePrompt holds a line submitted while a model swap is in progress. It is
+// a prompt, not steering: nothing is running, and it should run after the swap
+// on the model being loaded.
 func (a *App) queuePrompt(line string) {
 	line = strings.TrimSpace(line)
 	if line == "" {
@@ -1111,10 +964,8 @@ func (a *App) pendingCommands() int {
 	return len(a.queuedCmds)
 }
 
-// runQueuedCommands executes what was typed during the turn, at the boundary
-// where the conversation is complete. It reports whether the run should end:
-// a command that changes the model, or quits, cannot sensibly be followed by
-// another iteration of the run it interrupted.
+// runQueuedCommands executes commands typed during the turn at the boundary,
+// and reports whether the run should end.
 func (a *App) runQueuedCommands(ctx context.Context) bool {
 	a.cmdMu.Lock()
 	queued := a.queuedCmds
@@ -1128,8 +979,7 @@ func (a *App) runQueuedCommands(ctx context.Context) bool {
 		switch {
 		case err == nil:
 		case errors.Is(err, errQuit), isRestart(err):
-			// Neither can happen inside a turn, so the run ends and the error
-			// is handed back to the loop that knows what to do with it.
+			// Neither can happen inside a turn.
 			a.turnErr = err
 			return true
 		default:

@@ -7,21 +7,10 @@ import (
 	"ai-code/internal/provider"
 )
 
-// Pruning: reclaiming context without a model call.
-//
-// Most of the weight in a coding session is tool output, and most of it is
-// dead the moment the model has read it -- a directory listing from forty
-// turns ago, the grep that found the file already open. Summarising it costs
-// a whole model call, which on a local backend is minutes; emptying it costs
-// nothing.
-//
-// So this runs first, and a compaction only happens when it was not enough.
-// On a session heavy with tool results that turns most compactions into an
-// operation with no latency at all.
+// Pruning reclaims context without a model call.
 
-// clearedMarker opens the text left in place of removed output. The call and
-// its arguments stay, because "we ran this" is the part the model reasons
-// from; only the output goes.
+// clearedMarker opens the text left in place of removed output; the call and
+// its arguments stay, only the output goes.
 const clearedMarker = "[Output removed to free context"
 
 func clearedNotice(chars int) string {
@@ -38,21 +27,11 @@ type Cleared struct {
 	Tokens  int
 }
 
-// Prune empties the output of completed tool results that are old enough to
-// be safe to lose.
-//
-// Three things are protected, and each for its own reason:
-//
-//   - the last two turns, whatever their size, because that is what the model
-//     is working from right now;
-//   - the most recent results up to half the verbatim tail budget, because a
-//     tail of nothing but "output removed" is a tail that cannot be continued
-//     from, whatever its token count says;
-//   - anything already pruned, which also ends the walk: everything older has
-//     been through this before.
-//
-// Derived from the tail budget rather than fixed, so it stays coherent across
-// window sizes for the same reason every other size here is derived.
+// ClearOldOutput empties the output of completed tool results old enough to
+// lose, protecting three things: the last two turns, which the model is
+// working from; the most recent results up to half the tail budget, so the
+// tail can still be continued from; and anything already pruned, which ends
+// the walk.
 func (a *Agent) ClearOldOutput() Cleared {
 	budget := a.budget().KeepOutput
 	var res Cleared
@@ -85,19 +64,15 @@ func (a *Agent) ClearOldOutput() Cleared {
 	}
 
 	if res.Results > 0 {
-		// The messages that were sent have changed underneath every figure
-		// recorded against them, so ground truth is invalidated the same way
-		// a compaction invalidates it.
+		// The messages changed under every recorded figure, so ground truth is
+		// invalidated as a compaction would invalidate it.
 		a.requestChanged()
 		a.publish()
 	}
 	return res
 }
 
-// recentTurnsKept is how much of the recent conversation is never pruned. Two,
-// because one is only the exchange in progress: the model regularly reads a
-// file in one turn and edits it in the next, and emptying the read between
-// them is how a session starts re-reading what it already has.
+// recentTurnsKept is how much of the recent conversation is never pruned.
 const recentTurnsKept = 2
 
 // compactChars formats a byte count for a message a person reads.

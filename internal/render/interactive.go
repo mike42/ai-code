@@ -11,11 +11,9 @@ import (
 	"ai-code/internal/agent"
 )
 
-// Interactive is the terminal renderer.
-//
-// It owns the transient zone and composes it from two things: the line
-// currently streaming, and the status line. Everything else it writes goes
-// straight to the scrollback, once.
+// Interactive is the terminal renderer. It owns the transient zone -- the line
+// currently streaming and the status line -- and writes everything else to the
+// scrollback, once.
 type Interactive struct {
 	screen *Screen
 	style  Style
@@ -32,70 +30,52 @@ type Interactive struct {
 	tokens       int
 	samples      []rateSample
 	activeTool   string
-	// reasonTrace is everything the model has thought this turn, kept so that
-	// turning /verbose on part-way through can show the thinking that has
-	// already happened rather than only what comes next. Reset each turn and
-	// otherwise unbounded, because one turn's reasoning is already bounded by
-	// the output cap the turn was sent with.
+	// reasonTrace is everything the model has thought this turn, so /verbose
+	// turned on part-way through can show it. Reset each turn.
 	reasonTrace strings.Builder
-	// busy is set for as long as a turn is running, which is not the same as
-	// streaming: the agent also works between requests -- summarising to free
-	// context, most of all -- and during that the status line has to keep
-	// moving or the session looks hung. See SetBusy.
+	// busy is set for the whole turn, not just streaming: the agent also works
+	// between requests, and the status line has to keep moving. See SetBusy.
 	busy         bool
 	toolStarted  time.Time
 	ctxState     agent.ContextState
 	streaming    bool
 	spinnerIndex int
 	reasoning    string
-	// notice is transient progress from outside the turn loop, such as a
-	// model swap. See SetNotice.
+	// notice is transient progress from outside the turn loop, such as a model swap. See SetNotice.
 	notice     string
 	reasonMode string
 	sawText    bool
 
-	// verbose is the /verbose toggle: full thinking, tool arguments and tool
-	// output, all committed. It is read on the agent's goroutine as events
-	// arrive and written on the input goroutine when the command is run, so it
-	// lives under the same mutex as the rest of the display state.
+	// verbose is the /verbose toggle: full thinking, tool arguments and output,
+	// all committed. Read on the agent goroutine, written on the input
+	// goroutine, so it lives under the same mutex as the display state.
 	verbose bool
 	// reasonBuf holds the tail of a thinking delta that has not reached a
-	// newline yet, and reasonOpen whether a thinking block is currently being
-	// committed. Only used in verbose mode.
+	// newline; reasonOpen whether a thinking block is being committed.
 	reasonBuf  string
 	reasonOpen bool
 
-	// Steering state. steerActive is what decides whether the bottom line is a
-	// prompt or the status line -- not whether steerText is empty, because the
-	// two differ for exactly one keystroke: the moment the user deletes the
-	// last character, which is when the status line has to come back.
+	// Steering state. steerActive decides whether the bottom line is a prompt
+	// or the status line -- not whether steerText is empty, because the two
+	// differ for the one keystroke that deletes the last character.
 	steerText   string
 	steerCol    int
 	steerActive bool
-	// steerQueued counts messages submitted but not yet folded in. Between
-	// those two moments the model is still working from the old instruction,
-	// and the wait can be a whole tool call long -- so the status line has to
-	// say the message was received, or Enter looks like it did nothing.
+	// steerQueued counts messages submitted but not yet folded in. The status
+	// line has to say they were received, or Enter looks like it did nothing.
 	steerQueued int
 
-	// dirty coalesces transient-zone repaints. A fast model emits hundreds of
-	// deltas a second, and repainting on each one floods the terminal with
-	// escape sequences -- which is what makes streaming output impossible to
-	// read and pointlessly expensive over ssh. Deltas set this flag; the ticker
-	// does the repaint at a fixed rate.
+	// dirty coalesces transient-zone repaints: deltas set it, and the ticker
+	// repaints at a fixed rate rather than once per delta.
 	dirty bool
 
 	stop chan struct{}
 	done chan struct{}
 }
 
-// rateSample is one reading of the running token count.
-//
-// The rate is computed over a trailing window rather than the whole turn. A
-// cumulative average is the wrong statistic for a live readout: it is dominated
-// by everything that came before, so when the true rate changes the displayed
-// number converges as 1/t. That looks exactly like generation slowing down on
-// its own, while on screen it plainly is not.
+// rateSample is one reading of the running token count; the rate is computed
+// over a trailing window, since a cumulative average converges as 1/t after a
+// change and reads as generation slowing down.
 type rateSample struct {
 	at time.Time
 	n  int
@@ -103,8 +83,8 @@ type rateSample struct {
 
 const rateWindow = 5 * time.Second
 
-// spinner uses braille dots: they occupy one column in every terminal and do
-// not shift the line width as they animate.
+// spinner uses braille dots: one column in every terminal, so the line width
+// does not shift as they animate.
 var spinner = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 type InteractiveOptions struct {
@@ -112,12 +92,10 @@ type InteractiveOptions struct {
 	Theme       string
 	Reasoning   string // off | collapsed | full
 	WarnPercent int
-	// Verbose is the starting detail level, from -v. /verbose and /quiet move
-	// it afterwards.
+	// Verbose is the starting detail level, from -v; /verbose and /quiet move it.
 	Verbose bool
-	// SteerPrompt is the marker drawn in place of the status line while the
-	// user is typing during a turn. Passed in rather than defined here so that
-	// there is one definition of the prompt marker in the program.
+	// SteerPrompt is the marker drawn in place of the status line while typing
+	// during a turn. Passed in so the program has one definition of it.
 	SteerPrompt string
 }
 
@@ -159,12 +137,8 @@ func (r *Interactive) setPartial(lines []string) {
 	}
 }
 
-// Start begins the status-line ticker.
-//
-// The redraw rate is capped deliberately. A fast model emitting hundreds of
-// tokens a second would otherwise repaint the status line hundreds of times a
-// second, which is precisely the churn that makes a streaming terminal
-// impossible to read.
+// Start begins the status-line ticker. The redraw rate is capped so a fast
+// model does not churn the terminal with hundreds of repaints a second.
 func (r *Interactive) Start() {
 	go func() {
 		defer close(r.done)
@@ -209,19 +183,15 @@ func (r *Interactive) Close() {
 }
 
 func (r *Interactive) Emit(e agent.Event) {
-	// Any event that is not another thinking delta ends the thinking block, so
-	// the half-line held back waiting for its newline is committed here --
-	// before whatever this event commits, which is the only order in which the
-	// scrollback reads as it happened.
+	// Any event that is not a thinking delta ends the thinking block: commit
+	// the half-line held for its newline before whatever this event commits,
+	// so the scrollback order matches arrival.
 	if e.Kind != agent.EvReasoning {
 		r.flushReasoning()
 	}
 
-	// One consumer rule: the context figure is adopted wherever it arrives and
-	// is never computed here. The renderer used to update it on three event
-	// kinds out of twelve, so a /compact -- which emits none of them -- left
-	// the pre-compaction occupancy on the status line until the next turn
-	// ended.
+	// The context figure is adopted wherever it arrives; it is never computed
+	// here.
 	if e.Context != nil {
 		r.mu.Lock()
 		r.ctxState = *e.Context
@@ -230,9 +200,8 @@ func (r *Interactive) Emit(e agent.Event) {
 
 	switch e.Kind {
 	case agent.EvContext:
-		// Carried above. Nothing is drawn for it on its own: the status line
-		// repaints on its own timer, and committing a line per context change
-		// would put one in the scrollback for every tool result.
+		// Carried above; nothing is drawn for it on its own, or every tool
+		// result would put a line in the scrollback.
 		return
 	case agent.EvTurnStart:
 		r.mu.Lock()
@@ -289,20 +258,15 @@ func (r *Interactive) Emit(e agent.Event) {
 		r.redraw()
 
 	case agent.EvSteer:
-		// Into the scrollback, always -- including for a single line. What the
-		// user typed mid-turn only ever existed in the transient zone, and the
-		// next committed line erases that. Without this the model visibly
-		// changes course in response to nothing.
+		// Always into the scrollback, even a single line: it only ever existed
+		// in the transient zone, which the next committed line erases.
 		r.md.Flush()
 		r.mu.Lock()
 		r.steerQueued = max(0, r.steerQueued-1)
 		r.mu.Unlock()
 		if label, ok := workerReportLabel(e.Text); ok {
-			// A worker's report was committed in full when it arrived, so
-			// repeating the body here would print the same findings twice.
-			// The line still has to appear: it is the moment the model was
-			// given them, and without it the model changes course in
-			// response to nothing.
+			// The report body was committed in full when it arrived, so only
+			// the moment it was given to the model belongs here.
 			r.screen.CommitBlock(Echo(r.style, "steering", "worker report: "+label)...)
 			return
 		}
@@ -333,11 +297,8 @@ func (r *Interactive) Emit(e agent.Event) {
 		r.screen.CommitBlock("", prefix+"  "+e.Text)
 
 	case agent.EvError:
-		// A failed turn is a finished turn. Without this the renderer stays in
-		// its streaming state for the rest of the session: the ticker keeps
-		// repainting the transient zone ten times a second, on top of the
-		// prompt the line editor has drawn underneath it, and the prompt looks
-		// like it is being wiped out as fast as it appears.
+		// A failed turn is a finished turn: clear the streaming state, or the
+		// ticker keeps repainting over the prompt the line editor has drawn.
 		r.md.Flush()
 		r.mu.Lock()
 		r.streaming = false
@@ -356,17 +317,12 @@ func (r *Interactive) Emit(e agent.Event) {
 	}
 }
 
-// handleReasoning keeps the thinking channel out of the scrollback.
-//
-// Reasoning is long, repetitive and rarely worth re-reading. In "collapsed"
-// mode it appears only in the transient zone, so the user can watch the model
-// think without any of it landing in their scrollback or their clipboard.
-// /verbose is the escape hatch from that, and it overrides ui.reasoning: the
-// command asks for everything, and a configured default is a default.
+// handleReasoning keeps the thinking channel out of the scrollback. In
+// "collapsed" mode it appears only in the transient zone; /verbose overrides
+// ui.reasoning.
 func (r *Interactive) handleReasoning(text string) {
-	// Counted before the mode check: reasoning tokens are generated at the same
-	// rate whether or not they are shown, and on a reasoning model they are
-	// most of the response.
+	// Counted before the mode check: reasoning tokens are generated whether or
+	// not they are shown.
 	r.mu.Lock()
 	r.countTokenLocked()
 	verbose := r.verbose
@@ -385,19 +341,16 @@ func (r *Interactive) handleReasoning(text string) {
 	}
 	r.mu.Lock()
 	r.reasonTrace.WriteString(text)
-	// Only the tail is ever displayed, so only the marquee keeps the tail --
-	// but the trim is by rune, not by byte. Slicing a UTF-8 string at a byte offset lands in
-	// the middle of a multi-byte rune about half the time it is used on
-	// non-ASCII text, and the orphaned continuation bytes reach the terminal as
-	// a replacement character or, on some terminals, as nothing at all while
-	// still consuming a column.
+	// Only the tail is displayed, but the trim is by rune, not by byte: an
+	// orphaned continuation byte reaches the terminal as a replacement
+	// character, or as nothing while still consuming a column.
 	r.reasoning = tailRunes(r.reasoning+text, reasoningKeep)
 	r.dirty = true
 	r.mu.Unlock()
 }
 
-// reasoningKeep is how much of the thinking channel is retained for the
-// marquee. It only has to cover the widest line any terminal will show.
+// reasoningKeep is how much of the thinking channel the marquee retains; it
+// covers the widest line any terminal will show.
 const reasoningKeep = 512
 
 func tailRunes(s string, n int) string {
@@ -415,27 +368,21 @@ func (r *Interactive) commitBlankIfNeeded() {
 	r.screen.Commit("")
 }
 
-// SetVerbose switches the detail level and reports the level that was in
-// effect before, so the caller can say the session was already there.
+// SetVerbose switches the detail level and reports the previous level.
 func (r *Interactive) SetVerbose(v bool) bool {
-	// Flushed before the switch, not after: the half-line still buffered was
-	// produced under the old level and is only committed under the verbose one.
+	// Flushed before the switch: the buffered half-line was produced under the
+	// old level and is only committed under the verbose one.
 	r.flushReasoning()
 
 	r.mu.Lock()
 	was := r.verbose
 	r.verbose = v
 	// The marquee and the committed thinking are the same text, so the
-	// retained tail goes with the switch. Keeping it would show the thinking
-	// twice going into verbose, and would strand a frozen tail in the
-	// transient zone for the rest of the turn coming out of it -- verbose
-	// never refreshes the marquee, so nothing would ever move it on.
+	// retained tail goes with the switch; otherwise it would show twice going
+	// into verbose and freeze in the transient zone coming out.
 	r.reasoning = ""
-	// Turning verbose on part-way through a turn is a request to read the
-	// thinking, and most of it has usually already happened -- at a few
-	// tokens a second there is time to decide you want it only once it is
-	// well underway. Showing just the remainder answers a question nobody
-	// asked.
+	// Verbose turned on part-way through asks to read the thinking, most of
+	// which has already happened; commit the trace, not just the remainder.
 	var caught string
 	if v && !was {
 		caught = r.reasonTrace.String()
@@ -453,12 +400,8 @@ func (r *Interactive) SetVerbose(v bool) bool {
 }
 
 // commitReasoning puts the thinking channel into the scrollback a line at a
-// time.
-//
-// Deltas do not arrive on line boundaries, so the tail of one is held back
-// until its newline. Committing it early would split a sentence across two
-// scrollback lines that can never be rejoined, since a committed line is never
-// revised.
+// time, holding back the tail of a delta until its newline: committed lines
+// are never revised or rejoined.
 func (r *Interactive) commitReasoning(text string) {
 	r.mu.Lock()
 	r.reasonBuf += text
@@ -495,15 +438,15 @@ func (r *Interactive) commitReasonLines(header bool, lines []string) {
 		out = append(out, "", r.style.Dim("thinking"))
 	}
 	for _, l := range lines {
-		// Indented and dimmed rather than prefixed with a glyph: this is model
-		// output, and a gutter character would land in any selection of it.
+		// Indented and dimmed rather than given a glyph: a gutter would land
+		// in any selection of model output.
 		out = append(out, "  "+r.style.Dim(strings.TrimRight(l, " \t")))
 	}
 	r.screen.CommitBlock(out...)
 }
 
-// commitToolCall shows what the model actually asked for, which the one-line
-// summary at the end of the call necessarily leaves out.
+// commitToolCall shows the arguments, which the call's one-line summary at the
+// end leaves out.
 func (r *Interactive) commitToolCall(e agent.Event) {
 	out := []string{"", r.style.Dim("tool") + "  " + e.ToolName}
 	for _, l := range argLines(e.ToolArgs) {
@@ -513,8 +456,8 @@ func (r *Interactive) commitToolCall(e agent.Event) {
 }
 
 // argLines renders a tool's arguments for display, indented if they are JSON
-// and verbatim if they are not -- arguments that failed to parse are exactly
-// the ones worth seeing unaltered.
+// and verbatim if not: arguments that failed to parse are the ones worth seeing
+// unaltered.
 func argLines(args []byte) []string {
 	if len(args) == 0 {
 		return nil
@@ -540,8 +483,8 @@ func (r *Interactive) commitToolResult(e agent.Event) {
 	if res.IsError {
 		glyph = r.style.Error("●")
 	}
-	// The glyph sits on ai-code's own status line, never on model content or code,
-	// so a selection of the output never picks up a gutter.
+	// The glyph sits on ai-code's own line, never on model content or code, so
+	// a selection of the output never picks up a gutter.
 	r.screen.Commit(glyph + " " + display)
 
 	r.mu.Lock()
@@ -550,8 +493,7 @@ func (r *Interactive) commitToolResult(e agent.Event) {
 
 	switch {
 	case verbose:
-		// No cap. The tool has already bounded its own output, and a second
-		// trim here would make /verbose a claim the renderer does not keep.
+		// No cap: the tool has already bounded its own output.
 		for _, line := range contentLines(res.Content) {
 			r.screen.Commit("  " + r.style.Dim(line))
 		}
@@ -578,13 +520,6 @@ func firstLines(s string, n int) []string {
 	return lines
 }
 
-// SetSteering reports what the user has typed during the turn.
-//
-// While active it takes the bottom line of the transient zone, in place of the
-// status line. That is the whole interaction: the status line is what ai-code has
-// to say and the prompt is what the user has to say, they occupy the same row,
-// and the one that is showing is the one that currently matters. Clearing the
-// line gives the row back.
 // SetQueued reports how many steering messages are waiting to be folded in.
 func (r *Interactive) SetQueued(n int) {
 	r.mu.Lock()
@@ -594,14 +529,8 @@ func (r *Interactive) SetQueued(n int) {
 	r.redraw()
 }
 
-// SetBusy marks a turn as running.
-//
-// The status line used to be driven entirely by EvTurnStart/EvTurnEnd and the
-// tool events, which between them do not cover the whole turn. The gap is
-// everything the agent does between requests, and the longest thing in it is
-// compaction: a full summarisation call, minutes of it on a local model, with
-// no event of its own. Through all of that the spinner stopped and the
-// elapsed counter froze, which is exactly what a hung session looks like.
+// SetBusy marks a turn as running. It covers the gap between requests, where
+// no event marks progress: compaction above all, which can take minutes.
 func (r *Interactive) SetBusy(v bool) {
 	r.mu.Lock()
 	r.busy = v
@@ -613,13 +542,8 @@ func (r *Interactive) SetBusy(v bool) {
 	r.redraw()
 }
 
-// SetNotice puts one line of progress in the transient zone, where it is
-// replaced by the next one rather than committed to the scrollback.
-//
-// For work that is worth watching and not worth keeping: a model swap
-// reports several times a second and leaves one summary behind, where
-// committing each update would scroll a screen of history for an event with
-// a one-line outcome.
+// SetNotice puts one line of progress in the transient zone, replaced by the
+// next rather than committed: worth watching, not worth keeping.
 func (r *Interactive) SetNotice(text string) {
 	r.mu.Lock()
 	r.notice = text
@@ -628,6 +552,9 @@ func (r *Interactive) SetNotice(text string) {
 	r.redraw()
 }
 
+// SetSteering reports the line being typed during the turn. While active it
+// takes the bottom line in place of the status line; clearing it gives the row
+// back.
 func (r *Interactive) SetSteering(display string, cursorCol int, active bool) {
 	r.mu.Lock()
 	r.steerText, r.steerCol, r.steerActive = display, cursorCol, active
@@ -636,15 +563,9 @@ func (r *Interactive) SetSteering(display string, cursorCol int, active bool) {
 	r.redraw()
 }
 
-// boundPreview limits how tall the streaming line is allowed to make the
-// transient zone.
-//
-// The zone is erased by walking the cursor back up over it, so a zone taller
-// than the screen is one that cannot be erased: the top of it has already
-// scrolled beyond the cursor's reach, and what the erase would clear instead is
-// committed output. Half the screen leaves room for the status line and for
-// enough context above to read. Past that the tail is shown, because the tail
-// is the part still arriving.
+// boundPreview caps the streaming line at half the screen. The transient zone
+// is erased by walking the cursor back up over it, so a taller zone cannot be
+// erased; past the cap the tail is shown, since that is what is still arriving.
 func boundPreview(lines []string, height int) []string {
 	limit := max(height/2, 1)
 	if len(lines) <= limit {
@@ -691,9 +612,8 @@ func (r *Interactive) redraw() {
 	r.screen.SetTransientCursor(steerCol, lines...)
 }
 
-// steerLocked lays out the steering prompt, scrolling the text horizontally so
-// the cursor stays on screen. Scrolling rather than wrapping, because a
-// transient line that wraps is one the erase can no longer clean up.
+// steerLocked lays out the steering prompt, scrolling horizontally so the
+// cursor stays on screen; a wrapped transient line cannot be erased cleanly.
 func (r *Interactive) steerLocked(width int) (string, int) {
 	markW := visibleWidth(r.steerMark)
 	avail := max(width-markW, 8)
@@ -701,11 +621,9 @@ func (r *Interactive) steerLocked(width int) (string, int) {
 	rs := []rune(r.steerText)
 	cur := min(max(r.steerCol, 0), len(rs))
 
-	// Walk left from the cursor until the window is full, then fill whatever
-	// room is left to the right. Anchoring on the cursor rather than on either
-	// end is what keeps it visible in both directions: a long line typed
-	// straight through scrolls with the cursor at the margin, and moving back
-	// into the middle of it scrolls the other way.
+	// Walk left from the cursor until the window is full, then fill what is
+	// left to the right. Anchoring on the cursor keeps it visible in both
+	// directions, whether the line scrolls at the margin or back in the middle.
 	start, before := cur, 0
 	for start > 0 {
 		w := runeWidth(rs[start-1])
@@ -727,14 +645,9 @@ func (r *Interactive) steerLocked(width int) (string, int) {
 	return r.style.Bold(r.steerMark) + string(rs[start:end]), markW + before
 }
 
-// marquee renders a growing text as a single line that scrolls, showing the
-// newest end of it.
-//
-// All whitespace is folded here, not just newlines: the transient zone
-// guarantees one physical row per line, and a stray tab or carriage return
-// breaks the row count that the next erase depends on. Folding before the
-// width arithmetic also keeps it honest, since the tail is then chosen from
-// text that is one column per character.
+// marquee renders growing text as one scrolling line showing its newest end.
+// All whitespace is folded first: the transient zone guarantees one physical
+// row per line, and a stray tab or carriage return breaks the erase count.
 func marquee(s string, width int) string {
 	if width <= 0 {
 		return ""
@@ -752,8 +665,8 @@ func marquee(s string, width int) string {
 	return string(rs[i:])
 }
 
-// collapseSpace folds every run of whitespace into a single space and drops the
-// control characters that would otherwise move the cursor.
+// collapseSpace folds runs of whitespace into one space and drops the control
+// characters that would otherwise move the cursor.
 func collapseSpace(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
@@ -775,16 +688,9 @@ func collapseSpace(s string) string {
 	return b.String()
 }
 
-// countTokenLocked records the arrival of one streamed delta. Caller holds the
-// mutex.
-//
-// One delta is one token, measured rather than assumed: the cassettes in
-// internal/provider/testdata match at 120/120 and 709/712. So the live rate
-// costs nothing and needs no per-model tokenizer.
-//
-// A tool call's scaffolding is counted by the server but never streamed, so a
-// turn ending in one undercounts by roughly 20 tokens. This drives the rate
-// readout only; the context total comes from the server's usage report.
+// countTokenLocked records the arrival of one streamed delta; the caller holds
+// the mutex. One delta is one token, so the live rate needs no tokenizer; a
+// turn ending in a tool call undercounts by roughly 20.
 func (r *Interactive) countTokenLocked() {
 	if r.firstTokenAt.IsZero() {
 		r.firstTokenAt = time.Now()
@@ -826,9 +732,8 @@ func (r *Interactive) statusLocked() string {
 
 	var parts []string
 
-	// While the thinking marquee is on screen it is itself the waiting
-	// indicator; a spinner beside it is redundant noise. The spinner returns
-	// as soon as text starts streaming or a tool runs.
+	// The thinking marquee is itself the waiting indicator; the spinner
+	// returns once text streams or a tool runs.
 	if r.reasoning == "" {
 		sp := spinner[r.spinnerIndex%len(spinner)]
 		if r.activeTool != "" {
@@ -849,9 +754,8 @@ func (r *Interactive) statusLocked() string {
 		parts = append(parts, fmt.Sprintf("%d steering %s queued", r.steerQueued, word))
 	}
 	if r.ctxState.Window > 0 {
-		// The tilde is the difference between a figure the backend reported
-		// and one derived from character counts. Both are useful; showing
-		// them identically is not.
+		// ~ marks a figure derived from character counts rather than reported
+		// by the backend.
 		mark := ""
 		if !r.ctxState.Anchored {
 			mark = "~"
@@ -866,12 +770,10 @@ func (r *Interactive) statusLocked() string {
 
 	switch {
 	case r.activeTool != "":
-		// No tokens are being generated while a tool runs, so there is no rate
-		// to report. Showing the last one would be a number that is true of the
-		// past and false of the present.
+		// No tokens are generated while a tool runs, so there is no rate to
+		// report.
 	case r.streaming && r.firstTokenAt.IsZero():
-		// Prompt processing. On a large context this is most of the wait, and a
-		// bare spinner gives no clue which of the two phases you are in.
+		// Prompt processing, which on a large context is most of the wait.
 		parts = append(parts, "prefill")
 	default:
 		if rate, ok := r.rateLocked(); ok {
@@ -893,11 +795,8 @@ func compactNum(n int) string {
 	}
 }
 
-// workerReportLabel picks the label out of a folded worker report.
-//
-// It reads the tag that internal/agent writes around a report. A steer that
-// is not one is left alone, so an unrecognised shape degrades to showing the
-// text rather than to showing nothing.
+// workerReportLabel reads the tag internal/agent writes around a folded worker
+// report; an unrecognised shape degrades to showing the text.
 func workerReportLabel(text string) (string, bool) {
 	if !strings.HasPrefix(text, "<worker-report") {
 		return "", false

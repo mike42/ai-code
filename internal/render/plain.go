@@ -10,19 +10,16 @@ import (
 	"ai-code/internal/agent"
 )
 
-// Plain renders to a non-terminal destination: a pipe, a file, a CI log.
-//
-// It is not a degraded mode bolted on afterwards. Non-interactive output is how
-// ai-code gets tested, scripted and run in CI, so it is a first-class consumer of
-// the same event stream. Nothing here moves a cursor or emits an escape
-// sequence.
+// Plain renders to a non-terminal destination: a pipe, a file, a CI log. It is
+// a first-class consumer of the same event stream, not a degraded mode; nothing
+// here moves a cursor or emits an escape sequence.
 type Plain struct {
 	mu      sync.Mutex
 	w       io.Writer
 	verbose bool
 	atStart bool
 	// inReason tracks whether the thinking channel is mid-block, so its header
-	// is written once rather than once per delta.
+	// is written once.
 	inReason bool
 }
 

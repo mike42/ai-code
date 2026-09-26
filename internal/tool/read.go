@@ -69,8 +69,7 @@ func (t *ReadTool) Run(ctx context.Context, st *State, raw json.RawMessage) Resu
 			"`file`, `xxd | head` or `strings`.", rel(st, path), humanBytes(len(content)))
 	}
 
-	// Stamp the full file, not the excerpt: the stamp records what is on disk
-	// so a later edit can tell whether the file changed underneath.
+	// Stamp the full file, not the excerpt, so a later edit can detect changes underneath.
 	st.SetStamp(stampFile(path, content))
 
 	if len(content) == 0 {
@@ -125,9 +124,8 @@ func (t *ReadTool) Run(ctx context.Context, st *State, raw json.RawMessage) Resu
 	return Result{Content: out, Display: display, Files: []FileStamp{stampFile(path, content)}}
 }
 
-// suggestNeighbours turns "no such file" into something actionable by naming
-// similar files in the same directory. A typo or a wrong extension is the usual
-// cause and the model can fix it immediately if it can see the alternatives.
+// suggestNeighbours names similar files in the same directory; a typo or a
+// wrong extension is the usual cause and the model can fix it immediately.
 func suggestNeighbours(path string) string {
 	dir, base := splitPath(path)
 	entries, err := os.ReadDir(dir)

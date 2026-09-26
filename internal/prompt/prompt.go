@@ -1,14 +1,7 @@
-// Package prompt assembles the system prompt.
-//
-// One constraint shapes everything here: the result must be byte-identical
-// across every request in a session. Providers cache on an exact prefix match,
-// and a single unstable byte early in the prompt -- a clock, a re-sorted map, a
-// spinner frame that leaked in -- turns every request into a cache miss. The
-// cost shows up on a bill or as latency, never as an error, so it is checked by
-// a test rather than noticed.
-//
-// Everything genuinely dynamic (the current time, what a tool just returned)
-// belongs in the conversation, not here.
+// Package prompt assembles the system prompt. It must be byte-identical across
+// every request in a session: providers cache on an exact prefix match, and one
+// unstable byte turns every later request into a cache miss that shows up as
+// latency or cost, never as an error.
 package prompt
 
 import (
@@ -33,13 +26,12 @@ type Env struct {
 
 type Options struct {
 	Env Env
-	// ModePrompt is the steering text for the active mode. Modes shape how the
-	// model works; they never remove tools.
+	// ModePrompt is the steering text for the active mode; modes shape how the
+	// model works, they never remove tools.
 	ModePrompt string
 	// Agents holds discovered AGENTS.md content, outermost first.
 	Agents []AgentsFile
-	// ToolNames is used only for the summary line, in the order the tools are
-	// advertised.
+	// ToolNames is used only for the summary line, in the advertised order.
 	ToolNames []string
 }
 
@@ -112,10 +104,8 @@ func Build(o Options) string {
 			"Where two files conflict, the more deeply nested one wins.\n")
 		for _, a := range o.Agents {
 			if a.Path == "" {
-				// A file that exists outside anything the tools can reach --
-				// a user-level one, when the tools run in a container. Its
-				// instructions still apply; there is simply no path to give
-				// that would mean anything to the model.
+				// No path to give: a user-level file outside anything the
+				// tools can reach.
 				fmt.Fprintf(&b, "\n<agents-file>\n%s\n</agents-file>\n",
 					strings.TrimSpace(a.Content))
 				continue
@@ -147,12 +137,8 @@ func (e Env) describe() string {
 	return b.String()
 }
 
-// DetectEnv gathers environment facts once, at session start.
-//
-// Deliberately called once rather than per turn. The branch can change during a
-// session, but re-reading it would rewrite the cached prefix on every request,
-// and the model will see any branch change in the output of the git commands it
-// runs anyway.
+// DetectEnv gathers environment facts once, at session start; re-reading the
+// branch would rewrite the cached prefix on every request.
 func DetectEnv(cwd string) Env {
 	e := Env{
 		Cwd:   cwd,
@@ -203,11 +189,8 @@ type AgentsFile struct {
 // .ai-code copy is for projects that keep tool files out of the root.
 var DefaultAgentsNames = []string{"AGENTS.md", ".ai-code/AGENTS.md"}
 
-// MaxAgentsBytes caps the total instruction budget.
-//
-// Without a cap these files silently consume the context window: they sit in
-// every request, and a project that accumulates a 40k-token AGENTS.md would
-// halve the usable window on a 65k model without anyone noticing.
+// MaxAgentsBytes caps the instruction budget, which otherwise silently consumes
+// every request's window.
 const MaxAgentsBytes = 32 * 1024
 
 // DiscoverAgents finds instruction files from the git root down to the working
@@ -236,7 +219,6 @@ func DiscoverAgents(cwd, gitRoot string) []AgentsFile {
 		}
 		d = parent
 	}
-	// Reverse so the outermost directory comes first.
 	for i := len(chain) - 1; i >= 0; i-- {
 		dirs = append(dirs, chain[i])
 	}
@@ -268,8 +250,7 @@ func DiscoverAgents(cwd, gitRoot string) []AgentsFile {
 			}
 			total += len(data)
 			out = append(out, AgentsFile{Path: path, Content: string(data)})
-			// Only the first matching name per directory, so a project with both
-			// AGENTS.md and .ai-code/AGENTS.md does not send both.
+			// Only the first matching name per directory is sent.
 			break
 		}
 	}

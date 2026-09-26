@@ -52,9 +52,7 @@ func (t *WriteTool) Run(ctx context.Context, st *State, raw json.RawMessage) Res
 		if readErr != nil {
 			return Errorf("could not read the existing %s to check for changes: %v", rel(st, path), readErr)
 		}
-		// Overwriting destroys everything not in `content`. Requiring a prior
-		// read is what stops a whole-file write silently discarding parts of a
-		// file the model never looked at.
+		// Overwriting destroys everything not in content; a prior read stops discarding unseen parts.
 		if r := checkStale(st, path, existing); r != nil {
 			return *r
 		}
@@ -88,8 +86,6 @@ func (t *WriteTool) Run(ctx context.Context, st *State, raw json.RawMessage) Res
 		Files:   []FileStamp{stamp},
 	}
 }
-
-// ---------------------------------------------------------------------------
 
 //go:embed ls.txt
 var lsDescription string

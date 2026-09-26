@@ -60,11 +60,8 @@ func TestDevcontainerExecutorEndToEnd(t *testing.T) {
 	t.Logf("result: %q", res.Content)
 }
 
-// A dead container used to be invisible: start() treated a non-nil cmd as a
-// live one, so every later tool call wrote to the same closed pipe and
-// reported "broken pipe" with nothing to act on. These cover the two halves of
-// that -- saying what actually happened, and letting the next call recover.
-
+// A dead container must report the engine's own output rather than only a pipe
+// error, and the next call must be able to start fresh.
 func TestFailureReportsExitStatusAndEngineOutput(t *testing.T) {
 	e := &DevcontainerExecutor{}
 	cmd := exec.Command("sh", "-c", "exit 3")
@@ -77,8 +74,8 @@ func TestFailureReportsExitStatusAndEngineOutput(t *testing.T) {
 
 	msg := e.failure("write", errors.New("write |1: broken pipe"))
 
-	// The engine's own words are the diagnosis; the bare pipe error sends
-	// people looking at the wrong component.
+	// The engine's message is the diagnosis; the bare pipe error points at
+	// the wrong component.
 	if !strings.Contains(msg, "statfs /nonexistent") {
 		t.Errorf("the engine's output was dropped from the report: %q", msg)
 	}
@@ -92,7 +89,7 @@ func TestFailureReportsExitStatusAndEngineOutput(t *testing.T) {
 
 func TestFailureReapsTheContainerProcess(t *testing.T) {
 	e := &DevcontainerExecutor{}
-	// A process that would outlive the session if nothing waited on it.
+	// A process that would outlive the session if nothing reaped it.
 	cmd := exec.Command("sleep", "300")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -125,30 +122,23 @@ func TestTeardownLetsTheNextCallStartFresh(t *testing.T) {
 
 	e.teardown()
 
-	// start() returns early whenever either of these is set, so a leftover
-	// value here is what made the failure permanent.
+	// start() returns early whenever any of these is set, so teardown must
+	// clear them all.
 	if e.cmd != nil || e.init != nil || e.enc != nil || e.dec != nil {
 		t.Errorf("teardown left state behind: cmd=%v init=%v enc=%v dec=%v",
 			e.cmd != nil, e.init != nil, e.enc != nil, e.dec != nil)
 	}
 }
 
-// Starting a container happens behind the user's first tool call, and it used
-// to happen in complete silence.
-//
-// Engine detection, an image build or pull, then the container itself is
-// minutes of work with nothing on screen, so `bash` looked like it had hung.
-// Naming each phase as it is reached is the whole fix: a note once the wait
-// is over answers the question too late to be worth asking.
+// Engine detection, build or pull, then the container is minutes of work, so
+// each phase is named as it starts.
 func TestDevcontainerStartupNamesItsPhases(t *testing.T) {
 	var notes []tool.Phase
 	e := NewDevcontainerExecutor(nil, nil, t.TempDir(), t.TempDir(), "ai-code")
 	e.SetProgress(func(p tool.Phase) { notes = append(notes, p) })
 
-	// A configuration that never loaded: startup fails before any container
-	// work begins. Nothing happened, so nothing may be claimed -- a phase
-	// report that fires regardless of what ran is just a different lie about
-	// where the time went.
+	// Configuration that never loaded means no container work began, so no
+	// phases may be reported.
 	if _, err := e.Execute(context.Background(), tool.Request{Name: "bash"}); err != nil {
 		t.Fatalf("Execute returned a transport error: %v", err)
 	}
@@ -156,7 +146,6 @@ func TestDevcontainerStartupNamesItsPhases(t *testing.T) {
 		t.Errorf("phases announced for a startup that never began: %v", notes)
 	}
 
-	// And the wiring itself reaches the caller.
 	e.report("devcontainer: starting a container from %s.", "example-image")
 	if len(notes) != 1 || !strings.Contains(notes[0].Note, "example-image") {
 		t.Fatalf("progress notes = %v, want the phase that was reported", notes)
@@ -165,19 +154,14 @@ func TestDevcontainerStartupNamesItsPhases(t *testing.T) {
 		t.Error("a phase in the middle of a start was marked as the end of it")
 	}
 
-	// The last one is the only one worth keeping, and says so.
 	e.done("devcontainer: ready in %s.", "2m14s")
 	if len(notes) != 2 || !notes[1].Done {
 		t.Errorf("the end of the wait was not marked: %v", notes)
 	}
 }
 
-// The task tool wraps the executor, and a wrapper that does not pass progress
-// through is a wrapper that silently switches it off.
-//
-// This is exactly what happened: main.go asks the executor whether it reports
-// progress, by which point the executor is the task wrapper. It did not, so a
-// user watched a container rebuild for five minutes behind a bare spinner.
+// The task tool wraps the executor, and main.go asks the wrapped value whether
+// it reports progress, so the wrapper must pass SetProgress through.
 func TestProgressSurvivesTheTaskWrapper(t *testing.T) {
 	var notes []tool.Phase
 	inner := NewDevcontainerExecutor(nil, nil, t.TempDir(), t.TempDir(), "ai-code")
@@ -195,10 +179,8 @@ func TestProgressSurvivesTheTaskWrapper(t *testing.T) {
 	}
 }
 
-// The first thing anyone watching a long tool call wants to know is whether
-// the clock they can see is running. It is not: the command's timeout is
-// applied by the bash tool inside the container, so it cannot start until the
-// container does.
+// The command's timeout is applied by the bash tool inside the container, so
+// it cannot run while the container is still starting.
 func TestStartupSaysTheTimeoutIsNotRunning(t *testing.T) {
 	var notes []tool.Phase
 	e := NewDevcontainerExecutor(nil, nil, t.TempDir(), t.TempDir(), "ai-code")
@@ -211,7 +193,6 @@ func TestStartupSaysTheTimeoutIsNotRunning(t *testing.T) {
 	}
 }
 
-// A session with nowhere to show progress must not panic on the nil callback.
 func TestDevcontainerProgressIsOptional(t *testing.T) {
 	var _ tool.ProgressReporter = (*DevcontainerExecutor)(nil)
 

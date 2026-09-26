@@ -34,13 +34,8 @@ func countRows(s string, width int) int {
 	return rows
 }
 
-// The bug: a transient line was truncated by rune count and its control
-// characters were passed through untouched. A thinking trace quoting code
-// carries tabs, and CJK or emoji are two columns each, so the "79 rune" line
-// the renderer believed it had drawn landed well past the right margin and
-// wrapped. eraseTransient then walked up one row, cleared the bottom half of a
-// two-row line, and left the top half in the scrollback -- a stray fragment of
-// thinking wedged between the lines of streamed code.
+// Truncating by rune count does not bound columns: tabs and wide runes overflow
+// the margin and wrap, so eraseTransient must clear exactly what was drawn.
 func TestTransientLineNeverOccupiesMoreThanOneRow(t *testing.T) {
 	cases := []struct {
 		name string
@@ -78,8 +73,8 @@ func TestTransientLineNeverOccupiesMoreThanOneRow(t *testing.T) {
 	}
 }
 
-// The erase must clear exactly what was drawn. If the count and the reality
-// disagree the leftover lands in the scrollback permanently.
+// The erase must clear exactly what was drawn, or the leftover stays in the
+// scrollback.
 func TestTransientIsFullyErasedBeforeACommit(t *testing.T) {
 	var buf bytes.Buffer
 	s := NewScreen(&buf, "never")
@@ -130,10 +125,8 @@ func TestRuneWidth(t *testing.T) {
 	}
 }
 
-// The marquee has to show the newest text. Keeping a fixed 200-character window
-// and letting the screen truncate it showed the *oldest* 80 of those 200 on a
-// standard terminal, so the line appeared to lag several seconds behind the
-// model and then jump.
+// The marquee must show the newest text, so it keeps a tail: the screen would
+// truncate a fixed window from the front.
 func TestThinkingMarqueeShowsTheTail(t *testing.T) {
 	text := strings.Repeat("old ", 100) + "the newest thought"
 
@@ -163,8 +156,8 @@ func TestMarqueeCountsWideRunesAsTwoColumns(t *testing.T) {
 	}
 }
 
-// Reasoning is trimmed to a tail as it streams. Trimming by byte offset splits
-// a multi-byte rune, and the orphan reaches the terminal.
+// Trimming reasoning by byte offset can split a multi-byte rune, so the tail
+// is trimmed on rune boundaries.
 func TestReasoningTrimIsRuneSafe(t *testing.T) {
 	r := &Interactive{reasonMode: "collapsed", style: Style{}}
 	for range 200 {

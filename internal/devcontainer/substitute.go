@@ -13,8 +13,8 @@ type Vars struct {
 	// LocalWorkspaceFolder is the host directory being mounted.
 	LocalWorkspaceFolder string
 	// ContainerWorkspaceFolder is the resolved workspaceFolder inside the
-	// container. It is itself substituted first, since a file may write
-	// workspaceFolder in terms of the local one.
+	// container; it is substituted first because a file may write it in terms
+	// of the local one.
 	ContainerWorkspaceFolder string
 	// ID is the value of ${devcontainerId}: stable for a given project so a
 	// named volume or label survives across sessions.
@@ -26,10 +26,8 @@ type Vars struct {
 }
 
 // Substitute expands the variable references a devcontainer.json may contain.
-//
-// ${containerEnv:...} is deliberately left as written: it can only be resolved
-// by asking a container that does not exist yet, and silently expanding it to
-// an empty string would turn a configuration error into a mysterious one.
+// ${containerEnv:...} is left as written: it cannot be resolved before the
+// container exists, and an empty expansion would hide the configuration error.
 func Substitute(s string, v Vars) string {
 	if !strings.Contains(s, "${") {
 		return s
@@ -58,11 +56,7 @@ func expand(ref string, v Vars, whole string) string {
 	switch name {
 	case "localWorkspaceFolder":
 		if v.ContainerSide {
-			// A host path in an environment variable the container reads
-			// names nothing that exists there, so a config using it this way
-			// is already broken -- and it hands a sandboxed agent the
-			// directory layout and username of the machine hosting it. The
-			// container's own workspace folder is what the author meant.
+			// A host path read inside the container names nothing there and discloses the host's layout.
 			return v.ContainerWorkspaceFolder
 		}
 		return v.LocalWorkspaceFolder
@@ -85,8 +79,7 @@ func expand(ref string, v Vars, whole string) string {
 		if hasDef {
 			return def
 		}
-		// An unset variable with no default expands to nothing, which is what
-		// the reference implementation does.
+		// An unset variable with no default expands to nothing, as the reference implementation does.
 		return ""
 	case "containerEnv":
 		// Unresolvable before the container exists. Left verbatim.
@@ -97,9 +90,8 @@ func expand(ref string, v Vars, whole string) string {
 }
 
 // SubstituteAll expands variables throughout a configuration, in place.
-//
 // workspaceFolder is resolved first because ${containerWorkspaceFolder}
-// elsewhere in the file means whatever workspaceFolder ended up being.
+// elsewhere means whatever it ended up being.
 func (c *Config) SubstituteAll(localWorkspaceFolder, id string) {
 	v := Vars{LocalWorkspaceFolder: localWorkspaceFolder, ID: id}
 
@@ -124,9 +116,7 @@ func (c *Config) SubstituteAll(localWorkspaceFolder, id string) {
 	for i, a := range c.RunArgs {
 		c.RunArgs[i] = Substitute(a, v)
 	}
-	// Read inside the container, so host paths are rewritten rather than
-	// passed through. Recorded, because silently meaning something other than
-	// what the file says is worse than the leak it prevents.
+	// Host paths read inside the container are rewritten, and the rewrite is recorded.
 	inside := v
 	inside.ContainerSide = true
 	c.envRewrites = nil

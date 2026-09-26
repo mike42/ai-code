@@ -11,15 +11,8 @@ import (
 	"ai-code/internal/session"
 )
 
-// cmdCompact makes room in the context, at a natural break rather than at the
-// moment the window happens to fill.
-//
-// The same path the agent takes automatically when the session reaches the
-// reserve -- pruning first, then summarising if that was not enough -- so a
-// session compacted by hand and one compacted automatically end up in the
-// same shape. A summary taken when a piece of work is finished is a better
-// checkpoint than one taken mid-edit, which is the whole reason to run it
-// yourself.
+// cmdCompact runs the automatic compaction path -- prune, then summarise --
+// at a break chosen by hand rather than when the window happens to fill.
 func (a *App) cmdCompact(ctx context.Context, args string) error {
 	style := render.NewStyle(a.screen.Color())
 
@@ -29,27 +22,18 @@ func (a *App) cmdCompact(ctx context.Context, args string) error {
 
 	before := a.contextState().Projected
 
-	// Free tool output first. It costs no model call, and on a session heavy
-	// with reads and greps it is most of the saving -- so the user sees the
-	// number move before the summarisation they are waiting on has started.
+	// Free tool output first: it costs no model call and is most of the saving.
 	cleared := a.agent.ClearOldOutput()
 
-	// Said before the wait, not after it, and only when there is going to be
-	// one: deciding it is not worth compacting costs no model call.
+	// Said only when there will be a wait: deciding not to compact is free.
 	if a.agent.CompactionWorthwhile(a.cfg.Agent.CompactKeepRecentTokens) {
 		a.out("", style.Dim("Summarising the older messages…"))
 	}
 
-	// Keep the tail verbatim: it is what the model is in the middle of, and
-	// paraphrasing it loses the detail still in play. Budgeted in tokens, and
-	// with the same budget the automatic path uses.
+	// The tail stays verbatim, under the automatic path's token budget.
 	res, err := a.agent.Compact(ctx, a.cfg.Agent.CompactKeepRecentTokens)
 	if errors.Is(err, agent.ErrNothingToFree) {
-		// The session is smaller than the recent messages a compaction would
-		// keep anyway, so it would add a summary in front of everything and
-		// leave a bigger request than it started with. The user asked for a
-		// summary at a natural break, though, and that part still stands:
-		// save one without changing what gets sent, ready for a smaller model.
+		// Nothing to free: save a summary without changing what gets sent.
 		res, err = a.agent.Summarise(ctx, a.agent.SummaryCap())
 	}
 	if err != nil {
@@ -59,10 +43,8 @@ func (a *App) cmdCompact(ctx context.Context, args string) error {
 	res.Cleared, res.ClearedTokens = cleared.Results, cleared.Tokens
 
 	if a.sess != nil {
-		// Nothing was replaced, so nothing is re-recorded: the transcript in
-		// the file is already whole and stays that way. What is appended is
-		// the boundary the next request starts from, so a resumed session
-		// assembles from the same place this one does.
+		// Appended is the boundary the next request starts from, so a resume
+		// assembles the same way.
 		_ = a.sess.Append(session.Entry{
 			Type:              session.EntryCheckpoint,
 			Summary:           res.Summary,
@@ -74,11 +56,7 @@ func (a *App) cmdCompact(ctx context.Context, args string) error {
 		a.recordedSummary = res.Summary
 	}
 
-	// Both figures are the same quantity measured the same way: what the next
-	// request would have cost, and what it will cost now. Reporting a
-	// provider-anchored "before" against an estimated "after" is how a
-	// compaction came to announce a saving that was really the gap between
-	// two rulers.
+	// Both figures are the same quantity measured the same way.
 	saved := max(res.TokensBefore-res.TokensAfter, 0)
 	if !res.Rewrote {
 		a.out(

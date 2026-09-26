@@ -15,8 +15,7 @@ func plainEvents(p *Plain) {
 	p.Emit(agent.Event{Kind: agent.EvText, Text: "done\n"})
 }
 
-// -v and /verbose have to mean the same thing in both renderers, or the flag
-// and the command are two features wearing one name.
+// -v and /verbose must mean the same thing in both renderers.
 func TestPlainVerboseShowsThinkingAndArguments(t *testing.T) {
 	var buf bytes.Buffer
 	plainEvents(NewPlain(&buf, true))

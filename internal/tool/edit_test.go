@@ -73,7 +73,7 @@ func TestEditAppliesExactMatch(t *testing.T) {
 
 func TestEditRefusesWithoutAPriorRead(t *testing.T) {
 	st, path := fixture(t, "main.go", sample)
-	// Deliberately no read.
+	// No read.
 	res := (&EditTool{}).Run(context.Background(), st, mustJSON(t, editArgs{
 		Path: path, OldString: "func main() {", NewString: "func main() { // hi",
 	}))
@@ -93,7 +93,7 @@ func TestEditRefusesWhenFileChangedUnderneath(t *testing.T) {
 	st, path := fixture(t, "main.go", sample)
 	readFirst(t, st, path)
 
-	// Something else rewrites the file: a formatter, a build step, the user.
+	// Something else rewrites the file: a formatter or a build step.
 	if err := os.WriteFile(path, []byte(sample+"\n// appended by something else\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}

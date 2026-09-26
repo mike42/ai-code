@@ -9,15 +9,8 @@ import (
 	"ai-code/internal/provider"
 )
 
-// The invariants from the compaction design, one test each, against a mock
-// backend that counts tokens its own way rather than the way ai-code
-// estimates them. That difference is the whole point: every accounting bug
-// this replaced was two measures of one quantity disagreeing, and a fake that
-// counts exactly as the agent does cannot show it.
-
-// denseTokenizer counts the serialised request at a fixed density, the way a
-// byte-pair tokenizer does on code and paths. Nothing in the agent measures
-// anything this way, so agreement has to be earned by calibration.
+// denseTokenizer counts a serialised request the way a byte-pair tokenizer
+// does on code and paths.
 func denseTokenizer(charsPerToken float64) func(provider.Request) int {
 	return func(req provider.Request) int {
 		b, _ := json.Marshal(struct {
@@ -28,8 +21,8 @@ func denseTokenizer(charsPerToken float64) func(provider.Request) int {
 	}
 }
 
-// toolChatter builds a session of the shape that actually fills a window:
-// a user message, then rounds of tool calls with bulky results.
+// toolChatter builds a session of the shape that fills a window: a user
+// message, then rounds of bulky tool results.
 func toolChatter(a *Agent, rounds int, out string) {
 	a.messages = append(a.messages, provider.Message{
 		Role: provider.RoleUser, Content: "find every caller of commitLocked"})
@@ -57,13 +50,6 @@ func bigSession(t *testing.T, client *scriptedClient, rounds int) *Agent {
 	return a
 }
 
-// I1. One ruler. The tail a compaction keeps must be within the budget it was
-// cut against, measured the way everything else measures.
-//
-// This is the reported bug: a 61,440-token budget landing at ~85,000 because
-// the cut used a fixed four characters a token while the display used the
-// calibrated ratio. The two differed by about a third on a coding session,
-// and nothing in the system noticed.
 func TestKeptTailIsWithinTheBudgetItWasCutAgainst(t *testing.T) {
 	client := &scriptedClient{
 		tokenizer: denseTokenizer(2.9),
@@ -83,15 +69,13 @@ func TestKeptTailIsWithinTheBudgetItWasCutAgainst(t *testing.T) {
 	if cut == 0 {
 		t.Fatal("the cut kept everything, so this proves nothing")
 	}
-	// One message of slack: the walk stops at a turn boundary, so the last
-	// turn admitted may take it slightly over.
+	// One message of slack: the walk stops at a turn boundary.
 	if kept > budget {
 		t.Errorf("the cut kept %d tokens against a %d-token budget (%.0f%% over)",
 			kept, budget, float64(kept-budget)/float64(budget)*100)
 	}
 }
 
-// I3. Appending never lowers the figure; reclaiming never raises it.
 func TestProjectionIsMonotoneUnderAppendAndFallsOnReclaim(t *testing.T) {
 	client := &scriptedClient{
 		tokenizer: denseTokenizer(3.1),
@@ -121,13 +105,6 @@ func TestProjectionIsMonotoneUnderAppendAndFallsOnReclaim(t *testing.T) {
 	}
 }
 
-// The reported bug, end to end: compact, then send a prompt, and the figure
-// must not jump back to what it was before the compaction.
-//
-// It did, three ways at once -- a global ground-truth field that survived the
-// compaction, a renderer cache the compaction never updated, and a prompt
-// marker that asked the agent directly. The figure went 218k, then 93k, then
-// 218k again on the next prompt, then settled at 99.2k.
 func TestTheFigureDoesNotJumpBackAfterCompaction(t *testing.T) {
 	client := &scriptedClient{
 		tokenizer: denseTokenizer(3.0),
@@ -141,8 +118,7 @@ func TestTheFigureDoesNotJumpBackAfterCompaction(t *testing.T) {
 	a := bigSession(t, client, 45)
 	a.sink = sink
 
-	// A real turn first, so the session is anchored to a reported figure --
-	// which is the state the bug needed.
+	// A real turn first, so the session is anchored to a reported figure.
 	if err := a.Run(context.Background(), "carry on"); err != nil {
 		t.Fatal(err)
 	}
@@ -169,9 +145,8 @@ func TestTheFigureDoesNotJumpBackAfterCompaction(t *testing.T) {
 			res.TokensAfter, afterCompact.Projected)
 	}
 
-	// Now the next prompt. Every figure published from here must stay near
-	// the post-compaction one; the bug was a jump straight back to the
-	// pre-compaction number.
+	// Every figure published after the next prompt must stay near the
+	// post-compaction one.
 	if err := a.Run(context.Background(), "where are we"); err != nil {
 		t.Fatal(err)
 	}
@@ -183,8 +158,8 @@ func TestTheFigureDoesNotJumpBackAfterCompaction(t *testing.T) {
 	}
 }
 
-// I4. One producer. Every change to what the next request carries publishes a
-// figure, so no consumer can be holding one the agent has moved on from.
+// Every change to the next request publishes a figure, so no consumer holds a
+// stale one.
 func TestEveryChangePublishesAFigure(t *testing.T) {
 	client := &scriptedClient{tokenizer: denseTokenizer(3.0), turns: []scriptedTurn{
 		{calls: []provider.ToolCall{{ID: "c1", Name: "probe", Args: `{}`}}},
@@ -217,8 +192,6 @@ func TestEveryChangePublishesAFigure(t *testing.T) {
 	}
 }
 
-// I5. Nothing is removed. Compaction moves a boundary; pruning empties a
-// tool result and says so. Neither shortens the transcript.
 func TestReclaimingRemovesNoMessages(t *testing.T) {
 	client := &scriptedClient{tokenizer: denseTokenizer(3.0),
 		turns: []scriptedTurn{{text: "## Goal\nx\n\n## Next Steps\n1. y"}}}
@@ -244,7 +217,6 @@ func TestReclaimingRemovesNoMessages(t *testing.T) {
 	}
 }
 
-// Pruning is idempotent, and it never touches the exchange in progress.
 func TestPruningIsIdempotentAndSparesTheRecentTurns(t *testing.T) {
 	client := &scriptedClient{tokenizer: denseTokenizer(3.0)}
 	a := bigSession(t, client, 30)
@@ -258,7 +230,6 @@ func TestPruningIsIdempotentAndSparesTheRecentTurns(t *testing.T) {
 			second.Results)
 	}
 
-	// Walk back over the last two turns: none of them may have been emptied.
 	turns := 0
 	for i := len(a.messages) - 1; i >= 0 && turns < recentTurnsKept; i-- {
 		if a.messages[i].Role == provider.RoleUser {
@@ -271,8 +242,8 @@ func TestPruningIsIdempotentAndSparesTheRecentTurns(t *testing.T) {
 	}
 }
 
-// Pruning happens before summarising, so a session whose weight is tool
-// output makes room without a model call at all.
+// Pruning runs before summarising, so a tool-heavy session makes room without
+// a model call.
 func TestToolHeavySessionMakesRoomWithoutAModelCall(t *testing.T) {
 	client := &scriptedClient{tokenizer: denseTokenizer(3.0),
 		turns: []scriptedTurn{{text: "carrying on"}}}
@@ -298,10 +269,7 @@ func TestToolHeavySessionMakesRoomWithoutAModelCall(t *testing.T) {
 	}
 }
 
-// I7. A makeRoom either gets under the line or says which message it could
-// not shed. It must never report success having freed nothing, which is the
-// wedge: a session that then spends the rest of its life sending a request it
-// has already been told is too big.
+// makeRoom must never report success having freed nothing.
 func TestASingleOversizedMessageFailsByName(t *testing.T) {
 	client := &scriptedClient{tokenizer: denseTokenizer(3.0),
 		turns: []scriptedTurn{{text: "## Goal\nx\n\n## Next Steps\n1. y"}, {text: "hello"}}}
@@ -311,11 +279,8 @@ func TestASingleOversizedMessageFailsByName(t *testing.T) {
 	a.opts.ContextLimit = 32768
 	a.opts.AutoCompact = true
 
-	// A pasted file larger than the whole budget, as the newest turn. Pruning
-	// does not touch user messages, a checkpoint cannot summarise a turn the
-	// model has not answered yet, and escalation will not drop the newest
-	// turn -- so nothing the session can do to itself helps, and the only
-	// useful thing left is to say which message it is.
+	// A pasted file larger than the whole budget, as the newest turn; no
+	// reclaim step can shed it, so the error must name it.
 	a.messages = []provider.Message{
 		{Role: provider.RoleUser, Content: "have a look at this"},
 		{Role: provider.RoleAssistant, Content: "will do"},
@@ -333,10 +298,6 @@ func TestASingleOversizedMessageFailsByName(t *testing.T) {
 	t.Logf("%v", err)
 }
 
-// Whatever a makeRoom does, if it reports success the next request fits. The
-// wedge was a makeRoom returning nil having freed nothing, after which every
-// request for the rest of the session was one the backend had already
-// refused.
 func TestASuccessfulReclaimAlwaysLeavesARequestThatFits(t *testing.T) {
 	for _, rounds := range []int{20, 60, 150, 300} {
 		client := &scriptedClient{tokenizer: denseTokenizer(3.0), turns: []scriptedTurn{
@@ -359,10 +320,6 @@ func TestASuccessfulReclaimAlwaysLeavesARequestThatFits(t *testing.T) {
 	}
 }
 
-// I9. Summarising the same session repeatedly costs about the same each time.
-// It used to grow linearly, because every compaction re-serialised the
-// transcript from message zero -- measured at 30k, 61k and 92k tokens for the
-// first three compactions of one run.
 func TestRepeatedCompactionDoesNotGrowTheSummarisationRequest(t *testing.T) {
 	client := &scriptedClient{tokenizer: denseTokenizer(3.0), turns: []scriptedTurn{
 		{text: "## Goal\nA\n\n## Next Steps\n1. a"},
@@ -395,8 +352,8 @@ func TestRepeatedCompactionDoesNotGrowTheSummarisationRequest(t *testing.T) {
 	}
 }
 
-// A backend that refuses the request for length despite the guard clearing it
-// must be recovered from once, not surfaced as a dead end.
+// A backend may refuse for length after the guard passes; recover once, not a
+// dead end.
 func TestABackendRefusalIsRecoveredFromOnce(t *testing.T) {
 	client := &scriptedClient{
 		tokenizer: denseTokenizer(3.0),
@@ -408,9 +365,8 @@ func TestABackendRefusalIsRecoveredFromOnce(t *testing.T) {
 	sink := &collectSink{}
 	a := bigSession(t, client, 40)
 	a.sink = sink
-	// The window the model advertises is generous; what it will actually
-	// accept is a third less. Exactly the case the guard cannot see, because
-	// the guard can only believe what the backend said about itself.
+	// The advertised window is a third larger than what the backend accepts;
+	// the guard cannot see that.
 	client.refuseOver = a.RequestTokens() * 2 / 3
 
 	if err := a.Run(context.Background(), "carry on"); err != nil {
@@ -430,8 +386,7 @@ func TestABackendRefusalIsRecoveredFromOnce(t *testing.T) {
 	}
 }
 
-// After a compaction the next request must land well clear of the window, or
-// the session is back at the line within a turn or two.
+// Otherwise the session is back at the window's edge within a turn or two.
 func TestCompactionLandsWellClearOfTheWindow(t *testing.T) {
 	client := &scriptedClient{tokenizer: denseTokenizer(2.9),
 		turns: []scriptedTurn{{text: "## Goal\nx\n\n## Next Steps\n1. y"}}}
@@ -458,17 +413,6 @@ func lastContext(t *testing.T, s *collectSink) ContextState {
 	return all[len(all)-1]
 }
 
-// The whole reported session, end to end, against a backend that tokenises
-// its own way.
-//
-// A 262k window filled to the point the user saw, then the sequence they ran:
-// /compact, then a prompt, then a turn. Every figure published along the way
-// is checked against the one the backend actually reports, and the landing
-// point is checked against the budget it was supposed to land on.
-//
-// The numbers from the report, for comparison: compaction landed at 93k of
-// 262k against a 61,440-token tail budget, the next prompt showed 218.1k, and
-// it settled at 99.2k two turns later.
 func TestTheReportedSessionEndToEnd(t *testing.T) {
 	const ratio = 2.9 // dense, the way a coding transcript really tokenises
 	client := &scriptedClient{
@@ -488,7 +432,7 @@ func TestTheReportedSessionEndToEnd(t *testing.T) {
 	toolChatter(a, 88, strings.Repeat(
 		"internal/render/screen.go:142: func (s *Screen) commitLocked(b []byte) error\n", 90))
 
-	// One real turn, so the session is anchored the way the reported one was.
+	// One real turn, so the session is anchored to a reported figure.
 	if err := a.Run(context.Background(), "carry on"); err != nil {
 		t.Fatal(err)
 	}
@@ -496,7 +440,6 @@ func TestTheReportedSessionEndToEnd(t *testing.T) {
 	t.Logf("filled:     %6d of %d (%d%%), anchored=%v",
 		filled.Projected, filled.Window, filled.Percent(), filled.Anchored)
 
-	// /compact.
 	res, err := a.Compact(context.Background(), 0)
 	if err != nil {
 		t.Fatal(err)
@@ -506,8 +449,6 @@ func TestTheReportedSessionEndToEnd(t *testing.T) {
 		res.TokensBefore, res.TokensAfter, landed.Percent(),
 		res.MessagesBefore, res.MessagesAfter)
 
-	// The next prompt, and a turn after it. This is where the reported
-	// session jumped back to its pre-compaction figure.
 	since := len(sink.contexts())
 	if err := a.Run(context.Background(), "please explain where you are up to"); err != nil {
 		t.Fatal(err)
@@ -522,7 +463,6 @@ func TestTheReportedSessionEndToEnd(t *testing.T) {
 	}
 	t.Logf("peak published after the compaction: %d", peak)
 
-	// 1. It landed where the budget says it should.
 	if landed.Projected > a.Usable()/2 {
 		t.Errorf("landed at %d, over half the %d-token budget", landed.Projected, a.Usable())
 	}
@@ -532,14 +472,11 @@ func TestTheReportedSessionEndToEnd(t *testing.T) {
 			tail, a.keepRecentTokens())
 	}
 
-	// 2. Nothing published afterwards goes back near where it was.
 	if peak >= filled.Projected {
 		t.Errorf("a figure of %d was published after compaction landed at %d, "+
 			"back at the pre-compaction %d", peak, landed.Projected, filled.Projected)
 	}
 
-	// 3. And the figure is honest: what the backend counted for the last
-	// request it actually served, against what was displayed at that moment.
 	reqs := client.reqs
 	lastReq := reqs[len(reqs)-1]
 	actual := client.requestTokens(lastReq)

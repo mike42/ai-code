@@ -1,15 +1,8 @@
 // Package config loads ai-code's layered TOML configuration.
 //
-// Layers, lowest precedence first:
-//
-//	built-in defaults
-//	$XDG_CONFIG_HOME/ai-code/config.toml   (or ~/.config/ai-code/config.toml)
-//	./.ai-code/config.toml                 (project, walking up to the repo root)
-//	AI_CODE_* environment variables
-//	command-line flags                  (applied by the caller)
-//
-// Later layers override earlier ones key by key: a project file that sets only
-// `default_model` does not discard the user's provider definitions.
+// Lowest precedence first: built-in defaults, user config.toml under
+// $XDG_CONFIG_HOME/ai-code, project .ai-code/config.toml, AI_CODE_* variables,
+// CLI flags. Later layers override earlier ones key by key.
 package config
 
 import (
@@ -56,14 +49,11 @@ type UI struct {
 }
 
 type Agent struct {
-	// MaxIterations caps the turns one task may take. Zero -- the default --
-	// is unlimited; loop_guard and auto_compact bound the runaway cases. Set
-	// it only where a turn count is itself what you want to limit, such as a
-	// metered provider.
+	// MaxIterations caps the turns one task may take. Zero is unlimited;
+	// loop_guard and auto_compact bound the runaway cases.
 	MaxIterations int `toml:"max_iterations"`
-	// MaxTokens is a ceiling on one response. Zero -- the default -- lets the
-	// per-turn budget derived from the window stand on its own. Set it only
-	// where a fixed ceiling is what you want, such as a metered provider.
+	// MaxTokens is a ceiling on one response. Zero lets the per-turn budget
+	// derived from the window stand on its own.
 	MaxTokens   int      `toml:"max_tokens"`
 	Temperature *float64 `toml:"temperature"`
 	TopP        *float64 `toml:"top_p"`
@@ -80,53 +70,29 @@ type Agent struct {
 	// reserve, instead of stopping and asking. Default true.
 	AutoCompact *bool `toml:"auto_compact"`
 	// CompactReserveTokens is the room kept free at the top of the context
-	// window. It is the only reason ai-code ever stops a response: generation runs
-	// until the model is done or until the window is this close to full, and
-	// then the session is compacted rather than truncated.
-	//
-	// It has to hold one full response plus the summarisation call that
-	// compaction itself makes, or compaction would have no room to run at the
-	// moment it is needed.
-	//
-	// Zero -- the default -- derives it from the detected window. Set it only
-	// to override the formula for every model at once.
+	// window: one full response plus the summarisation call that compaction
+	// makes. Zero derives it from the detected window.
 	CompactReserveTokens int `toml:"compact_reserve_tokens"`
-	// CompactKeepRecentTokens is how much of the tail survives compaction
-	// verbatim. Recent turns are what the model is in the middle of, and a
-	// paraphrase loses the detail still in play.
-	//
-	// Zero -- the default -- derives it from the detected window, as a share
-	// of the request budget, so the same config behaves sensibly on a 32k
-	// model and a 262k one. Setting it also caps one tool result at half the
-	// value. Set it only to override the formula for every model at once.
+	// CompactKeepRecentTokens is how much of the tail compaction keeps verbatim;
+	// recent turns are what the model is in the middle of. Zero derives it from
+	// the detected window and caps one tool result at half the value.
 	CompactKeepRecentTokens int `toml:"compact_keep_recent_tokens"`
 
 	// AutoCheckpoint summarises the session on its own while the prompt sits
-	// idle, so a later model swap, a narrower window or a restart has a
-	// summary ready instead of stopping to make one. Default true.
-	//
-	// A switch rather than a sentinel value of AutoCheckpointIdleDelay, whose
-	// zero has its own meaning. False schedules nothing and sends nothing.
+	// idle, so a later swap or restart has a summary ready. Default true.
 	AutoCheckpoint *bool `toml:"auto_checkpoint"`
 	// AutoCheckpointIdleDelay is how long the prompt must sit untouched before
-	// that summary is written. It is abandoned the moment a key is pressed,
-	// and zero means write it as soon as the prompt appears.
-	//
-	// The default is DefaultAutoCheckpointIdleDelay. Lower it if the server
-	// has lemonade's auto_evict enabled: the checkpoint wants to land while
-	// the KV cache is still warm, and downsize_idle_timeout (60s by default)
-	// is when the server drops it. The two numbers look unrelated and are not.
+	// the summary is written; zero writes it at once. Lower it when the server
+	// has lemonade's auto_evict enabled, which drops the warm KV cache.
 	AutoCheckpointIdleDelay Duration `toml:"auto_checkpoint_idle_delay"`
 
-	// Thinking is the level to start a session at, one of EffortLadder:
-	// none, minimal, low, medium, high, xhigh, max. Empty sends no field and
-	// leaves the server's default alone. /think changes it mid-session.
+	// Thinking is the level to start a session at, one of EffortLadder; empty
+	// sends no field and leaves the server's default alone. /think changes it.
 	Thinking string `toml:"thinking"`
 }
 
-// DefaultAutoCheckpointIdleDelay is long enough to sit out the pauses within
-// a working session and short enough to catch someone walking away. Nothing
-// depends on the exact number.
+// DefaultAutoCheckpointIdleDelay sits out the pauses within a session but still
+// catches someone walking away.
 const DefaultAutoCheckpointIdleDelay = 120 * time.Second
 
 type Tools struct {
@@ -138,10 +104,8 @@ type Tools struct {
 
 type BashTool struct {
 	Timeout Duration `toml:"timeout"`
-	// MaxOutputBytes bounds one command's output. Zero -- the default --
-	// derives it from the detected window, so a result can never be a large
-	// share of the room the session has to think in. Set it only to override
-	// the formula for every model at once.
+	// MaxOutputBytes bounds one command's output; zero derives it from the
+	// detected window.
 	MaxOutputBytes int    `toml:"max_output_bytes"`
 	Shell          string `toml:"shell"`
 }
@@ -153,7 +117,7 @@ type ReadTool struct {
 
 type GrepTool struct {
 	// Backend: "auto" uses ripgrep when on PATH, else the built-in walker;
-	// "go" forces the built-in; "ripgrep" requires rg and errors without it.
+	// "go" forces built-in; "ripgrep" requires rg and errors without it.
 	Backend    string `toml:"backend"`
 	MaxResults int    `toml:"max_results"`
 }
@@ -165,10 +129,8 @@ type Provider struct {
 	Class        string            `toml:"class"`
 	DefaultModel string            `toml:"default_model"`
 	Headers      map[string]string `toml:"headers"`
-	// Timeout bounds establishing the connection only -- DNS, TCP and TLS. It
-	// deliberately does not bound generation: a large local model can stream a
-	// single answer for a very long time and cutting it off is never the
-	// behaviour anyone wanted.
+	// Timeout bounds establishing the connection only -- DNS, TCP and TLS --
+	// never generation, which a large local model may stream for a long time.
 	Timeout Duration `toml:"timeout"`
 
 	TLSInsecure bool   `toml:"tls_insecure"`
@@ -182,10 +144,8 @@ type Provider struct {
 	PropagateModelSwap *bool `toml:"propagate_model_swap"`
 }
 
-// Mode is prompt steering and nothing else. Every tool remains available in
-// every mode: gathering information legitimately involves running commands, and
-// a mode that blocks writes just makes the model narrate what it would have
-// done. Modes shape intent, they do not police it.
+// Mode is prompt steering and nothing else: every tool remains available in
+// every mode, because gathering information legitimately involves commands.
 type Mode struct {
 	Description string `toml:"description"`
 	Prompt      string `toml:"prompt"`
@@ -213,8 +173,8 @@ func (d Duration) MarshalText() ([]byte, error) { return []byte(d.String()), nil
 
 func boolPtr(b bool) *bool { return &b }
 
-// Defaults returns the built-in configuration. ai-code is usable with no config
-// file at all except for a provider definition, which cannot be guessed.
+// Defaults returns the built-in configuration; only a provider definition has
+// no default and cannot be guessed.
 func Defaults() Config {
 	return Config{
 		DefaultMode: "build",
@@ -230,7 +190,7 @@ func Defaults() Config {
 			MaxTokens:     0, // no cap: the server decides. See Agent.MaxTokens.
 			AutoCompact:   boolPtr(true),
 			// Both zero: derived from the detected window. See
-			// agent.BudgetFor. A number here overrides the formula globally.
+			// agent.BudgetFor, which a number here overrides.
 			CompactReserveTokens:    0,
 			CompactKeepRecentTokens: 0,
 			AutoCheckpoint:          boolPtr(true),
@@ -312,16 +272,11 @@ func UserConfigPath() string {
 	return filepath.Join(home, ".config", "ai-code", "config.toml")
 }
 
-// noCloudMarker is the name of the file whose presence marks a directory tree
-// as off-limits to cloud providers. It is deliberately checked as a file in
-// the working directory and every parent up to the filesystem root, so a
-// single .nocloud at the top of a repository, a home directory, or a
-// container's root guards every project beneath it.
+// noCloudMarker marks a directory tree off-limits to cloud providers. Checked
+// in the working directory and every parent up to the filesystem root.
 const noCloudMarker = ".nocloud"
 
-// NoCloud reports whether a .nocloud file is present in dir or any of its
-// parents. When it is true, the session must restrict itself to on-premises
-// providers.
+// NoCloud reports whether a .nocloud file is present in dir or any parent.
 func NoCloud(dir string) bool {
 	if dir == "" {
 		return false
@@ -356,8 +311,7 @@ func candidatePaths(projectDir string) []string {
 
 // overlayFile merges one file over cfg. BurntSushi/toml assigns only the keys
 // present in the document, so absent keys retain the lower layer's value --
-// except for maps, where a whole entry would be replaced. Provider and Mode are
-// therefore merged field by field.
+// except maps, where Provider and Mode are merged field by field.
 func overlayFile(cfg *Config, path string) error {
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -468,8 +422,8 @@ func mergeModes(base, overlay map[string]Mode) map[string]Mode {
 	return out
 }
 
-// overlayEnv applies AI_CODE_* overrides. Kept deliberately small: environment
-// configuration is for the handful of things CI and scripts need to change.
+// overlayEnv applies AI_CODE_* overrides to the handful of settings CI and
+// scripts need.
 func overlayEnv(cfg *Config) error {
 	if v := os.Getenv("AI_CODE_PROVIDER"); v != "" {
 		cfg.DefaultProvider = v
@@ -539,7 +493,7 @@ func (c *Config) Validate() error {
 }
 
 // ResolveAPIKey expands the "env:NAME" indirection so keys need not sit in a
-// config file. A literal value is returned unchanged.
+// config file.
 func (p Provider) ResolveAPIKey() (string, error) {
 	if name, ok := strings.CutPrefix(p.APIKey, "env:"); ok {
 		v := os.Getenv(name)
@@ -561,9 +515,8 @@ func (c *Config) ProviderNames() []string {
 	return names
 }
 
-// OnPremisesOnly returns a copy of the config restricted to providers whose
-// class is on-premises. Used when a .nocloud file marks the tree as off-limits
-// to cloud providers.
+// OnPremisesOnly copies the config, keeping only providers whose class is
+// on-premises; used when a .nocloud file marks the tree off-limits to cloud.
 func (c *Config) OnPremisesOnly() *Config {
 	out := *c
 	out.Provider = map[string]Provider{}

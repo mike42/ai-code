@@ -126,12 +126,6 @@ func TestDevcontainerPathSearchesParents(t *testing.T) {
 	}
 }
 
-// The bug this exists for: /restart re-execs with an explicit
-// --runtime devcontainer, and the explicit path returned the parsed flag
-// without ever reading the image out of devcontainer.json. A devcontainer
-// therefore worked on first launch and every restarted session ran the
-// container engine with an empty image name, which it rejected with a message
-// about repository references that named nothing the user had done.
 func TestExplicitDevcontainerFlagStillResolvesTheImage(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, ".devcontainer"), 0o755); err != nil {
@@ -175,8 +169,7 @@ func TestDockerfileConfigIsABuildNotAMissingImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	// There is no image to name, and "?" used to be returned here -- just as
-	// invalid an image name as the empty string while looking deliberate.
+	// There is no image to name; "?" would be a valid-looking but wrong one.
 	if rt.Image != "" {
 		t.Errorf("Image = %q, want empty: this configuration names no image", rt.Image)
 	}

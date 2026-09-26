@@ -9,19 +9,8 @@ import (
 )
 
 // rawInput switches the terminal to character-at-a-time input without touching
-// output processing, and returns a function that puts it back.
-//
-// Not term.MakeRaw, which also clears OPOST: the renderer streams the reply
-// through this same terminal, and without the "\n" to CRLF translation its
-// output descends the screen in a staircase.
-//
-// Only the input side changes, so Ctrl-C arrives as byte 3 rather than SIGINT
-// and the caller must handle it -- which is the point, since steering
-// distinguishes "cancel the turn" from "clear what I have typed".
-//
-// VMIN/VTIME make the read time out rather than block, so reading can stop
-// when the turn ends. A blocked read holds the next prompt's first keystroke
-// hostage until a second one releases it.
+// output processing, and returns a restore function. Not term.MakeRaw, which
+// clears OPOST too and leaves output in a staircase; VMIN/VTIME time reads out.
 func rawInput(fd int) (restore func(), err error) {
 	old, err := unix.IoctlGetTermios(fd, ioctlGetTermios)
 	if err != nil {
@@ -42,11 +31,8 @@ func rawInput(fd int) (restore func(), err error) {
 }
 
 // readInput reads whatever is available, returning 0 at the VTIME timeout.
-//
-// unix.Read rather than os.File.Read, because os.File reports a zero-length
-// read of a file as io.EOF -- and under VMIN=0 a zero-length read is the
-// ordinary case, once every tenth of a second. Going through os.File would
-// make every idle tick indistinguishable from the user pressing Ctrl-D.
+// unix.Read rather than os.File.Read: os.File reports a zero-length read as
+// io.EOF, and under VMIN=0 that is the ordinary case once per tenth of a second.
 func readInput(fd int, buf []byte) (int, error) {
 	for {
 		n, err := unix.Read(fd, buf)

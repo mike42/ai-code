@@ -1,11 +1,6 @@
 // Package runtime decides where ai-code's tools run: in the host process, in a
-// devcontainer, or on a remote machine over SSH.
-//
-// The decision is made once, at startup, and is fixed for the session. It is
-// also a *safety* decision, not a convenience one. Running tools without a
-// sandbox is an explicit, named choice; it is never the default and never a
-// fallback. If the user has not said where tools should run and no devcontainer
-// is configured, startup fails rather than silently running on the host.
+// devcontainer, or on a remote machine over SSH. The decision is fixed for the
+// session, and running tools without a sandbox is explicit, never a fallback.
 package runtime
 
 import (
@@ -34,25 +29,22 @@ const (
 type Runtime struct {
 	Kind Kind
 
-	// Devcontainer image name, when Kind is KindDevcontainer and the
-	// configuration names one. A configuration that builds from a Dockerfile
-	// leaves this empty and carries the build inputs in Config instead.
+	// Image is the devcontainer image, when Kind is KindDevcontainer and the
+	// configuration names one; a Dockerfile build leaves this empty and carries
+	// the build inputs in Config instead.
 	Image string
 
 	// Config is the parsed devcontainer.json, when Kind is KindDevcontainer.
 	Config *devcontainer.Config
 
 	// ConfigErr is set when a devcontainer.json was found but could not be
-	// parsed. Resolve does not fail on it: the runtime decision is still
-	// "devcontainer", and the error belongs where the container is started,
-	// with the rest of the engine diagnostics.
+	// parsed; Resolve still returns the runtime and the error surfaces later.
 	ConfigErr error
 
 	// SSH destination ("user@host:port"), when Kind is KindSSH.
 	Remote string
 
-	// Explicit records whether the user chose this on the command line, as
-	// opposed to it being the safe auto-detected default.
+	// Explicit records whether this runtime was chosen on the command line.
 	Explicit bool
 }
 
@@ -74,11 +66,7 @@ func (r *Runtime) Describe() string {
 	}
 }
 
-// ShortLabel is a compact banner label that omits the image name. The banner
-// already names the provider, model and context; a fully-qualified container
-// image (e.g. mcr.microsoft.com/devcontainers/python:3.12) makes the runtime
-// line as long as the rest combined without saying much. The sandbox kind is
-// the signal that matters.
+// ShortLabel is a compact banner label: the sandbox kind is the signal.
 func (r *Runtime) ShortLabel() string {
 	switch r.Kind {
 	case KindDevcontainer:
@@ -109,10 +97,8 @@ func (r *Runtime) flagValue() string {
 // recording in a session transcript.
 func (r *Runtime) FlagValue() string { return r.flagValue() }
 
-// ErrNoRuntime is returned when the user gave no --runtime flag and no
-// devcontainer could be found. It is deliberately an error rather than a
-// fallback to the host: accidentally running unsandboxed is the one failure
-// this feature exists to prevent.
+// ErrNoRuntime is returned when no --runtime flag was given and no devcontainer
+// was found; startup fails rather than falling back to the host.
 type ErrNoRuntime struct{}
 
 func (e ErrNoRuntime) Error() string {
@@ -126,8 +112,8 @@ Refusing to run tools without knowing where. Choose one explicitly:
 `
 }
 
-// ErrNoDevcontainer is returned when the user explicitly asked for a
-// devcontainer but the project does not define one.
+// ErrNoDevcontainer is returned when --runtime devcontainer was requested but
+// the project does not define one.
 type ErrNoDevcontainer struct{}
 
 func (e ErrNoDevcontainer) Error() string {
@@ -163,8 +149,7 @@ func ParseFlag(value string) (*Runtime, error) {
 }
 
 // DevcontainerPath returns the path to a devcontainer configuration file in dir
-// or any of its parents, or "" if none exists. It is a cheap filesystem probe,
-// so it is safe on the startup path.
+// or any of its parents, or "" if none exists.
 func DevcontainerPath(dir string) string {
 	if dir == "" {
 		return ""
@@ -191,12 +176,8 @@ func DevcontainerPath(dir string) string {
 	return ""
 }
 
-// Resolve decides where tools run, from the CLI flag and the filesystem.
-//
-// Only two fast, local operations happen here: parsing the flag and probing for
-// a devcontainer file. Nothing that could be slow -- container engine detection,
-// starting a container, an SSH connection -- is attempted. Those are deferred to
-// the first tool call, so the user reaches a prompt immediately.
+// Resolve decides where tools run from the CLI flag and the filesystem, without
+// touching the container engine: that is deferred to the first tool call.
 func Resolve(flag string, cwd string) (*Runtime, error) {
 	partial, err := ParseFlag(flag)
 	if err != nil {
@@ -212,11 +193,8 @@ func Resolve(flag string, cwd string) (*Runtime, error) {
 			if !hasDC {
 				return nil, ErrNoDevcontainer{}
 			}
-			// The configuration has to be read here too, not only on the
-			// implicit path below. /restart re-execs with an explicit
-			// --runtime devcontainer, so skipping it meant a devcontainer
-			// worked on first launch and every restarted session ran the
-			// container engine with an empty image name.
+			// The configuration is read on the explicit path too: /restart
+			// re-execs with --runtime devcontainer.
 			loadInto(partial, dcPath)
 			return partial, nil
 		case KindSSH:
@@ -225,8 +203,8 @@ func Resolve(flag string, cwd string) (*Runtime, error) {
 		return partial, nil
 	}
 
-	// No flag given. The only acceptable implicit decision is the safe one:
-	// a configured devcontainer. Anything else demands an explicit choice.
+	// No flag given: the only acceptable implicit decision is the safe one, a
+	// configured devcontainer.
 	if hasDC {
 		rt := &Runtime{Kind: KindDevcontainer}
 		loadInto(rt, dcPath)
@@ -235,12 +213,9 @@ func Resolve(flag string, cwd string) (*Runtime, error) {
 	return nil, ErrNoRuntime{}
 }
 
-// loadInto parses the devcontainer configuration onto a runtime.
-//
-// A parse failure is recorded rather than returned. Startup has already decided
-// that tools run in a container; refusing to start at all because the file has
-// a stray comma would deny the user the session in which they would fix it, and
-// the error is reported the moment the container is needed.
+// loadInto parses the devcontainer configuration onto a runtime, recording a
+// parse failure rather than failing startup; it surfaces when the container is
+// needed.
 func loadInto(rt *Runtime, dcPath string) {
 	cfg, err := devcontainer.Load(dcPath)
 	if err != nil {

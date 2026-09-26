@@ -37,8 +37,7 @@ func feed(md *Markdown, text string, chunk int) {
 }
 
 func TestCommittedOutputHasNoTrailingWhitespace(t *testing.T) {
-	// The pi complaint, mechanically enforced: selecting output must not pick
-	// up trailing spaces.
+	// Selecting output must not pick up trailing spaces.
 	c, md := newCapture(true, "auto")
 	feed(md, "Some prose with trailing spaces   \n\n```go\nfunc x() {   \n}\n```\nmore   \n", 5)
 	md.Flush()
@@ -51,8 +50,7 @@ func TestCommittedOutputHasNoTrailingWhitespace(t *testing.T) {
 }
 
 func TestCommittedContentHasNoLeftGutter(t *testing.T) {
-	// The other half of the pi complaint: code must be selectable at its real
-	// indentation, with nothing prepended.
+	// Code must be selectable at its real indentation, with nothing prepended.
 	c, md := newCapture(false, "none")
 	feed(md, "```go\nfunc main() {\n\tprintln(\"hi\")\n}\n```\n", 4)
 	md.Flush()
@@ -97,9 +95,8 @@ func TestCodeIsSyntaxHighlightedLineByLine(t *testing.T) {
 }
 
 func TestNothingIsCommittedUntilItsNewlineArrives(t *testing.T) {
-	// The core guarantee. A line stays revisable in the transient zone until
-	// its final form is known, so the scrollback never contains text that
-	// would have needed restyling.
+	// A line stays revisable in the transient zone until its final form is
+	// known, so the scrollback never holds text that needed restyling.
 	c, md := newCapture(true, "auto")
 
 	md.Write("```go\nfunc ")
@@ -151,8 +148,8 @@ func TestPreviewHoldsBackADelimiterStillBeingTyped(t *testing.T) {
 }
 
 func TestPreviewDoesNotShiftWhenTheLineLands(t *testing.T) {
-	// The whole point: what is previewed is what gets committed, so the text
-	// does not move when the newline arrives.
+	// What is previewed is what gets committed, so the text does not move
+	// when the newline arrives.
 	c, md := newCaptureWidth(true, "auto", 40)
 	const line = "A sentence with **bold** and `code` in it that is long enough to wrap once.\n"
 
@@ -472,15 +469,9 @@ func TestPreviewIsBoundedByTerminalHeight(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Tables
-//
-// Models emit cells of wildly different widths, so the columns never line up
-// on their own. Alignment needs the whole table before it can measure it,
-// which is the one place this renderer buffers instead of committing a line as
-// soon as it is complete -- so most of what follows is about making sure the
-// buffer always empties again.
-// ---------------------------------------------------------------------------
+// Models emit cells of wildly different widths, so columns only line up once
+// the whole table is measured. That is the one place this renderer buffers rows
+// instead of committing line by line, so the buffer must always empty.
 
 // renderTableAt feeds a source in small chunks, so a table that only looks
 // right when it arrives whole is caught.
@@ -496,9 +487,7 @@ func renderTableAt(t *testing.T, width int, color bool, src string) []string {
 	return out
 }
 
-// isBoxed reports whether every line of a rendered table is the same width on
-// screen. That is the whole claim alignment makes, and it is the one property
-// a change of border style cannot quietly break.
+// isBoxed reports whether every line of a rendered table is the same width.
 func isBoxed(lines []string) (int, bool) {
 	if len(lines) == 0 {
 		return 0, false
@@ -535,10 +524,9 @@ func TestTableColumnsAreAligned(t *testing.T) {
 }
 
 func TestTableAlignmentMarkersAreHonoured(t *testing.T) {
-	// The width comes from the content, not from how many dashes the model
-	// happened to type in the delimiter row. The drawn border carries no
-	// colons, so the padding is the only thing left saying which way a column
-	// is set -- which makes this the test that it is applied at all.
+	// Width comes from the content, not from how many dashes the model typed
+	// in the delimiter row. The drawn border carries no colons, so padding is
+	// the only thing marking which way a column is set.
 	got := renderTableAt(t, 80, false, "| Left | Middle | Right |\n|:-|:-:|-:|\n| a | b | c |\n")
 
 	want := []string{
@@ -556,9 +544,8 @@ func TestTableAlignmentMarkersAreHonoured(t *testing.T) {
 }
 
 func TestTableAtTheEndOfTheStreamIsFlushed(t *testing.T) {
-	// Nothing arrives after the last row, so only Flush can release it. A
-	// buffered table that is never flushed is output the model produced and
-	// the user never sees -- far worse than a misaligned one.
+	// Nothing arrives after the last row, so only Flush can release it: a
+	// table never flushed is model output that never appears.
 	got := renderTableAt(t, 80, false, "| a | bb |\n|---|----|\n| 1 | 2 |")
 	if _, ok := isBoxed(got); !ok || len(got) == 0 {
 		t.Fatalf("table at end of stream was not flushed as a block: %q", got)
@@ -655,8 +642,8 @@ func TestTableIsCommittedExactlyOnce(t *testing.T) {
 }
 
 func TestRowsAreNotCommittedWhileTheTableIsStillArriving(t *testing.T) {
-	// The buffer is the point: a row committed early cannot be widened when a
-	// later row turns out to be longer.
+	// A row committed early cannot be widened when a later row turns out
+	// longer, so the buffer holds it.
 	c, md := newCaptureWidth(false, "none", 80)
 	feed(md, "| a | bb |\n|---|----|\n| 1 | 2 |\n", 7)
 	if len(c.committed) != 0 {

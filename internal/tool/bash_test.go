@@ -38,8 +38,7 @@ func TestBashRunsAndCapturesBothStreams(t *testing.T) {
 }
 
 func TestBashWorkingDirectoryPersistsAcrossCalls(t *testing.T) {
-	// The whole point of recovering shell state after each call: `cd` appears
-	// to persist even though every call is a fresh process.
+	// `cd` appears to persist even though every call is a fresh process.
 	root := t.TempDir()
 	sub := filepath.Join(root, "nested")
 	if err := os.Mkdir(sub, 0o755); err != nil {
@@ -122,9 +121,8 @@ func TestBashTimesOutAndSaysSo(t *testing.T) {
 	}
 }
 
-// The failure this guards: killing the shell's PID leaves its children running.
-// A cancelled `make -j8` that orphans eight compilers keeps holding file
-// handles and CPU while the user believes they stopped it.
+// Killing the shell's PID leaves its children running, so cancellation kills
+// the process group.
 func TestCancellationKillsTheWholeProcessGroup(t *testing.T) {
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "child.pid")
@@ -166,9 +164,8 @@ func TestCancellationKillsTheWholeProcessGroup(t *testing.T) {
 		if !strings.Contains(res.Content, "Interrupted") {
 			t.Errorf("message should say it was interrupted: %s", res.Content)
 		}
-		// Being honest that state may have changed matters: a killed command
-		// may have written half a file, and "cancelled" alone reads as "nothing
-		// happened".
+		// A killed command may have written half a file, so "cancelled" alone
+		// must not read as "nothing happened".
 		if !strings.Contains(res.Content, "already changed is still changed") {
 			t.Errorf("message should be honest about partial effects: %s", res.Content)
 		}
@@ -180,7 +177,6 @@ func TestCancellationKillsTheWholeProcessGroup(t *testing.T) {
 		t.Fatal("the command did not return after cancellation")
 	}
 
-	// The grandchild must be gone.
 	gone := false
 	for range 100 {
 		if err := syscall.Kill(childPID, 0); err != nil {
@@ -258,14 +254,6 @@ func TestBashMalformedArgs(t *testing.T) {
 	}
 }
 
-// A command that times out must not put more into the context than one that
-// finishes.
-//
-// It used to put eight times more. The timed-out and interrupted paths
-// returned before Truncate was reached, and the only thing left bounding them
-// was the in-memory buffer -- which is deliberately sized at several times the
-// reporting budget precisely so that Truncate has both ends to choose
-// between. A timeout is the case most likely to have filled it.
 func TestTimedOutCommandIsTruncatedLikeAnyOther(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX shell syntax")
@@ -286,8 +274,8 @@ func TestTimedOutCommandIsTruncatedLikeAnyOther(t *testing.T) {
 	if !strings.Contains(timedOut.Content, "Timed out") {
 		t.Fatalf("the command did not time out, so this proves nothing: %.120s", timedOut.Content)
 	}
-	// Generous headroom for the surrounding prose, but nowhere near the 8x
-	// buffer the bug let through.
+	// Generous headroom for the surrounding prose, well under the buffer that
+	// bounds the result.
 	if max := budget * 2; len(timedOut.Content) > max {
 		t.Errorf("timed-out result is %d bytes, want under %d (clean exit was %d)",
 			len(timedOut.Content), max, len(clean.Content))

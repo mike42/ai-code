@@ -1,10 +1,7 @@
 // Package agent implements the loop: send messages, run the tools the model
 // asks for, repeat until it stops asking.
 //
-// The loop never writes to a terminal. It emits a typed event stream, and
-// renderers consume it. That separation exists so the same loop drives an
-// interactive terminal, a plain pipe, a JSON stream for scripting, and tests --
-// and so that the tests can assert on what happened without parsing ANSI.
+// The loop never writes to a terminal; it emits a typed event stream.
 package agent
 
 import (
@@ -23,16 +20,12 @@ const (
 	EvToolStart EventKind = "tool_start"
 	EvToolEnd   EventKind = "tool_end"
 	EvTurnEnd   EventKind = "turn_end"
-	// EvSteer reports that a message the user typed during the turn has been
-	// folded into the conversation.
+	// EvSteer reports a message typed during the turn folded into the conversation.
 	EvSteer EventKind = "steer"
 	// EvCompacted reports that the session was summarised to free context.
 	EvCompacted EventKind = "compacted"
-	// EvContext carries the context figure. It is emitted after every change
-	// to what the next request will carry, and it is the only way that figure
-	// reaches a consumer: nothing outside the agent computes one. Two caches
-	// of the same number, one of them updated on three event kinds out of
-	// twelve, is how /compact came to leave a stale occupancy on screen.
+	// EvContext carries the context figure and is its only route to a consumer:
+	// nothing outside the agent computes one.
 	EvContext EventKind = "context"
 	EvUsage   EventKind = "usage"
 	EvNotice  EventKind = "notice"
@@ -47,9 +40,8 @@ const (
 	LevelWarn Level = "warn"
 )
 
-// Event is one thing that happened. It is a struct rather than an interface so
-// that the JSON renderer is a single json.Encoder call and the wire format
-// stays obvious.
+// Event is one thing that happened. A struct rather than an interface so the
+// JSON renderer is a single json.Encoder call.
 type Event struct {
 	Kind EventKind `json:"kind"`
 	Turn int       `json:"turn,omitempty"`
@@ -68,21 +60,16 @@ type Event struct {
 	Usage      *provider.Usage     `json:"usage,omitempty"`
 	StopReason provider.StopReason `json:"stop_reason,omitempty"`
 
-	// Context reports window occupancy after a turn, for the status line.
+	// Context reports the context figure at the moment of the event.
 	Context *ContextState `json:"context,omitempty"`
 
 	// Compaction is set on EvCompacted, and carries what the compaction did.
 	Compaction *CompactResult `json:"compaction,omitempty"`
 }
 
-// ContextState is what the next request will occupy, against the window it
-// has to fit in.
-//
-// Projected is the quantity defined in accounting.go: never measured, always
-// derived from the newest reported prefill that still describes this request's
-// prefix. Anchored says whether such a report existed. An estimate is a fine
-// thing to show; an estimate indistinguishable from a measurement is not, so
-// the flag is rendered rather than kept for diagnostics.
+// ContextState is the next request's occupancy against the window. Projected
+// is derived from the newest reported prefill that still describes this
+// request's prefix; Anchored says whether such a report existed.
 type ContextState struct {
 	Projected int  `json:"projected"`
 	Window    int  `json:"window"`
@@ -107,8 +94,7 @@ type SinkFunc func(Event)
 
 func (f SinkFunc) Emit(e Event) { f(e) }
 
-// MultiSink fans out to several sinks, so a session transcript and a terminal
-// renderer can consume the same stream.
+// MultiSink fans out to several sinks.
 type MultiSink []Sink
 
 func (m MultiSink) Emit(e Event) {

@@ -9,17 +9,9 @@ import (
 	"sort"
 )
 
-// ImageTag is the local tag for the image built from this configuration.
-//
-// It is derived from the build inputs that change what the image *is* -- the
-// Dockerfile's contents, the build arguments, the target stage -- so two
-// projects never collide and an edited Dockerfile produces a different tag.
-//
-// It deliberately does not hash the build context's contents. Walking a large
-// context on every launch to decide whether to skip a build the engine would
-// have answered from its own layer cache in the same time is the wrong trade;
-// the build is run unconditionally and the engine's cache makes the no-change
-// case cheap.
+// ImageTag is the local tag for the image built from this configuration: a
+// hash of the Dockerfile's contents, the build arguments, the target stage and
+// the context path. Context contents are not hashed; the engine cache covers them.
 func (c *Config) ImageTag() (string, error) {
 	df := c.DockerfilePath()
 	if df == "" {
@@ -76,9 +68,7 @@ func HaveImage(engine, tag string) bool {
 
 // RunArgv assembles the engine arguments that start a container for this
 // configuration, short of the image name and the command to run in it.
-//
-// binaryMount is the host path of the ai-code binary and the container path to
-// mount it at; the daemon inside the container is that binary.
+// hostBinary is mounted at containerBinary and is the daemon inside.
 func (c *Config) RunArgv(localWorkspaceFolder, workdir, hostBinary, containerBinary string) []string {
 	argv := []string{"run", "--rm", "-i"}
 
@@ -86,9 +76,7 @@ func (c *Config) RunArgv(localWorkspaceFolder, workdir, hostBinary, containerBin
 	for _, m := range c.Mounts {
 		argv = append(argv, "--mount", m.String())
 	}
-	// The binary is a separate read-only bind: its host path does not exist
-	// inside the container, and nothing in there should be able to rewrite the
-	// thing it is executing.
+	// Read-only bind: the host path does not exist inside, and nothing there can rewrite it.
 	argv = append(argv, "-v", hostBinary+":"+containerBinary+":ro")
 
 	argv = append(argv, "-w", workdir)
@@ -96,16 +84,11 @@ func (c *Config) RunArgv(localWorkspaceFolder, workdir, hostBinary, containerBin
 	if c.ContainerUser != "" {
 		argv = append(argv, "--user", c.ContainerUser)
 	} else if c.RemoteUser != "" {
-		// Without lifecycle commands there is no stage that runs as a different
-		// user from the tools, so remoteUser and containerUser collapse to the
-		// same thing: who the agent's commands run as. Honouring remoteUser
-		// here is what keeps files written into the bind mount owned by the
-		// user who launched ai-code.
+		// No lifecycle stage runs as another account; bind-mount files stay owned by the launcher.
 		argv = append(argv, "--user", c.RemoteUser)
 	}
 
-	// Sorted, so the command line is stable between launches and a diff of
-	// two failures is about what changed rather than about map ordering.
+	// Sorted, so the command line is stable between launches.
 	for _, kv := range sortedEnv(c.ContainerEnv) {
 		argv = append(argv, "-e", kv)
 	}
@@ -129,9 +112,7 @@ func (c *Config) RunArgv(localWorkspaceFolder, workdir, hostBinary, containerBin
 	// runArgs last, so a project can override anything decided above.
 	argv = append(argv, c.RunArgs...)
 
-	// The image's own ENTRYPOINT must not wrap the daemon: an image that sets
-	// one would otherwise receive "/ai-code-bin --executor-daemon ..." as
-	// arguments to something else entirely.
+	// The image's own ENTRYPOINT must not wrap the daemon.
 	argv = append(argv, "--entrypoint", containerBinary)
 	return argv
 }

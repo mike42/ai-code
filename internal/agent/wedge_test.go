@@ -8,16 +8,7 @@ import (
 	"ai-code/internal/provider"
 )
 
-// A response cut off part-way through a tool call produces a call with no id --
-// the id arrives in the first delta, and there was no first delta. Validate
-// rejects it, and Repair only synthesises results for calls that *have* an id,
-// so nothing could ever fix it. The conversation became permanently unsendable:
-// every later turn failed instantly on the same message, and the session was
-// dead until it was restarted.
-//
-// Repair has one job, and it is total: whatever it is handed, the result must
-// pass Validate. Anything less means some state exists that the session cannot
-// get out of.
+// Repair must be total: whatever it is handed, the result must pass Validate.
 func TestRepairAlwaysProducesASendableConversation(t *testing.T) {
 	cases := []struct {
 		name string
@@ -94,8 +85,6 @@ func TestRepairAlwaysProducesASendableConversation(t *testing.T) {
 	}
 }
 
-// The end-to-end shape of the bug: one truncated tool call, and every turn
-// afterwards fails before it reaches the model.
 func TestATruncatedToolCallDoesNotWedgeTheSession(t *testing.T) {
 	client := &scriptedClient{turns: []scriptedTurn{
 		// Cut off mid-call: no id, partial arguments.
@@ -123,9 +112,8 @@ func TestATruncatedToolCallDoesNotWedgeTheSession(t *testing.T) {
 	}
 }
 
-// The session already on disk when this bug bit still contains the bad message.
-// Resuming it has to recover, not fail the same way it did before -- otherwise
-// the fix only helps sessions started after it.
+// A session already on disk can contain the bad message; resuming it must
+// recover.
 func TestResumingAWedgedSessionRecovers(t *testing.T) {
 	client := &scriptedClient{turns: []scriptedTurn{{text: "back in business"}}}
 	sink := &collectSink{}

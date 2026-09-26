@@ -93,9 +93,8 @@ func attached(t *testing.T, client provider.Client, turns ...scriptedTurn) (*Age
 	return a, tasks
 }
 
-// The rule is absolute and predates any of this: the model cannot reach a
-// cloud provider through a sub-agent. Absent from the schema, not refused
-// when called -- a refusal is still a decision the model got to make.
+// A sub-agent must not reach a cloud provider: the task tool is absent from
+// the schema on cloud, not merely refused when called.
 func TestTaskToolIsAbsentOnACloudProvider(t *testing.T) {
 	onprem, _ := attached(t, &scriptedClient{})
 	if !hasTool(onprem.exec.Definitions(), "task") {
@@ -122,8 +121,8 @@ func TestTaskToolRefusesToRunOnCloudEvenIfNamed(t *testing.T) {
 	}
 }
 
-// A worker that could spawn workers would need a depth counter. It is given
-// the executor from underneath instead, so the tool is simply not there.
+// A worker gets the executor from underneath, so the task tool is absent and
+// workers cannot recurse.
 func TestAWorkerCannotSpawnAWorker(t *testing.T) {
 	a, _ := attached(t, &scriptedClient{})
 	child, err := a.Spawn(Child{System: WorkerSystemPrompt})
@@ -136,8 +135,7 @@ func TestAWorkerCannotSpawnAWorker(t *testing.T) {
 	}
 }
 
-// The sandbox is the boundary, not the tool list. A practical investigation
-// may clone a repo or run a build, and that is fine.
+// The sandbox is the boundary, not the tool list: a worker may write.
 func TestAWorkerCanWrite(t *testing.T) {
 	a, _ := attached(t, &scriptedClient{})
 	child, err := a.Spawn(Child{System: WorkerSystemPrompt})
@@ -162,8 +160,8 @@ func TestConsultChildHasNoToolsAtAll(t *testing.T) {
 	}
 }
 
-// A child shares the parent's client and model and has no way to choose
-// otherwise. There is no field for it, and this pins that there never is one.
+// A child shares the parent's client and model; no field lets it choose
+// otherwise.
 func TestAChildRunsOnTheParentsModel(t *testing.T) {
 	a, _ := attached(t, &scriptedClient{})
 	a.SetModel("some-other-model", 65536, 0)
@@ -190,11 +188,8 @@ func TestAChildStartsWithNoConversation(t *testing.T) {
 	}
 }
 
-// The tool returns before the worker has done anything, and the report
-// arrives afterwards through the queue a message typed mid-turn uses.
-//
-// This is the whole point of the thing: a turn that waited for its worker
-// would hold the session for as long as the worker took.
+// The tool returns before the worker has done anything; the report arrives
+// afterwards through the steering queue.
 func TestTheWorkerReportArrivesAfterTheTurn(t *testing.T) {
 	client := &scriptedClient{
 		turns: []scriptedTurn{
@@ -268,9 +263,8 @@ func TestAFailedWorkerStillReports(t *testing.T) {
 	}
 }
 
-// A worker outlives the turn that asked for it. The tool call's context ends
-// with the turn, so a worker bound to it would be killed at exactly the
-// moment backgrounding was supposed to start paying.
+// A worker outlives the turn that asked for it: the tool call's context ends
+// with the turn.
 func TestAWorkerOutlivesTheTurnThatStartedIt(t *testing.T) {
 	release := make(chan struct{})
 	client := &scriptedClient{
@@ -297,9 +291,8 @@ func TestAWorkerOutlivesTheTurnThatStartedIt(t *testing.T) {
 	}
 }
 
-// A worker thinks as hard as the session that sent it, unless the call says
-// otherwise. No hidden default, and nothing here decides for the caller how
-// much reasoning their question deserves.
+// No hidden default: a worker inherits the session's thinking level unless the
+// call says otherwise.
 func TestAWorkerInheritsTheSessionThinkingLevel(t *testing.T) {
 	for _, level := range []provider.Effort{
 		provider.EffortUnset, provider.EffortNone, provider.EffortMedium, provider.EffortHigh,
@@ -328,8 +321,7 @@ func TestAWorkerInheritsTheSessionThinkingLevel(t *testing.T) {
 	}
 }
 
-// The caller knows whether its sub-question is a search or a puzzle, so it
-// gets to say -- in both directions.
+// The caller decides the worker's thinking level, in both directions.
 func TestAWorkerHonoursAnExplicitThinkingLevel(t *testing.T) {
 	cases := []struct {
 		asked string
@@ -346,7 +338,7 @@ func TestAWorkerHonoursAnExplicitThinkingLevel(t *testing.T) {
 			{text: "ok", stop: provider.StopEnd},
 		}}
 		a, tasks := attached(t, client)
-		// Deliberately different from what the call asks for.
+		// Set above what the call asks for, so an override is visible.
 		a.SetEffort(provider.EffortHigh)
 
 		if err := a.Run(context.Background(), "go"); err != nil {
@@ -365,8 +357,6 @@ func TestAWorkerHonoursAnExplicitThinkingLevel(t *testing.T) {
 	}
 }
 
-// A level the model invents comes back as a tool result it can act on, not as
-// a silent fallback that does something else.
 func TestAnUnknownThinkingLevelIsAnErrorResult(t *testing.T) {
 	a, tasks := attached(t, &scriptedClient{})
 	res, err := tasks.Execute(context.Background(), tool.Request{
@@ -391,14 +381,7 @@ func hasTool(defs []tool.Definition, name string) bool {
 	return false
 }
 
-// ---------------------------------------------------------------------------
-// concurrency
-// ---------------------------------------------------------------------------
-
-// Nothing here holds a worker back. How many sub-agents the machine can stand
-// is the user's call, made when they ask for them; a harness that second-
-// guesses it with a slot count of its own leaves workers sitting at zero turns
-// while the server is idle.
+// No slot count: a harness-imposed limit leaves workers sitting idle.
 func TestEveryWorkerStartsAtOnce(t *testing.T) {
 	const workers = 5
 
@@ -439,10 +422,6 @@ func TestEveryWorkerStartsAtOnce(t *testing.T) {
 	tasks.Pool().Wait()
 }
 
-// ---------------------------------------------------------------------------
-// stuck detection
-// ---------------------------------------------------------------------------
-
 func TestStuckSuggestsAfterTheSameErrorRepeats(t *testing.T) {
 	var w stuckWatch
 	for i := range stuckAfterTurns {
@@ -462,8 +441,7 @@ func TestStuckSuggestsAfterTheSameErrorRepeats(t *testing.T) {
 	}
 }
 
-// Reading widely without changing anything is what investigation looks like,
-// and a long run of tool calls is not evidence of anything.
+// A long run of successful tool calls is investigation, not being stuck.
 func TestReadingWithoutWritingIsNeverStuck(t *testing.T) {
 	var w stuckWatch
 	for range 200 {
@@ -489,8 +467,7 @@ func TestAnErrorThatStopsRecurringIsNotStuck(t *testing.T) {
 	}
 }
 
-// Different failures are progress of a kind; only the same wall repeating is
-// the signal.
+// Different failures are progress; only the same wall repeating is the signal.
 func TestDifferentErrorsDoNotCountAsRepeats(t *testing.T) {
 	var w stuckWatch
 	for i := range stuckAfterTurns + 2 {
@@ -515,13 +492,8 @@ func TestErrorsAreComparedIgnoringNumbers(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// stopping a run from outside
-// ---------------------------------------------------------------------------
-
-// A long agentic run has to be reachable between iterations. Waiting for it
-// to finish means waiting for the model to decide it is done, which can be
-// an hour of tool calls away.
+// A long run must be reachable between iterations, not only when the model
+// decides it is done.
 func TestARunCanBeStoppedAtTheTurnBoundary(t *testing.T) {
 	client := &scriptedClient{turns: []scriptedTurn{
 		{calls: []provider.ToolCall{{ID: "t1", Name: "read", Args: "{}"}}},
@@ -548,7 +520,6 @@ func TestARunCanBeStoppedAtTheTurnBoundary(t *testing.T) {
 	}
 }
 
-// Stopping has to leave a conversation the next prompt can continue from.
 func TestAStoppedRunLeavesAWellFormedConversation(t *testing.T) {
 	client := &scriptedClient{turns: []scriptedTurn{
 		{calls: []provider.ToolCall{{ID: "t1", Name: "read", Args: "{}"}}},
@@ -564,7 +535,6 @@ func TestAStoppedRunLeavesAWellFormedConversation(t *testing.T) {
 		t.Fatalf("a stopped run left an unsendable conversation: %v", err)
 	}
 
-	// And the next prompt picks up where it left off.
 	a.SetTurnBoundary(nil)
 	if err := a.Run(context.Background(), "carry on"); err != nil {
 		t.Fatal(err)
@@ -574,7 +544,6 @@ func TestAStoppedRunLeavesAWellFormedConversation(t *testing.T) {
 	}
 }
 
-// Nothing is consulted when nothing installed a check.
 func TestNoBoundaryCheckMeansNoChange(t *testing.T) {
 	client := &scriptedClient{turns: []scriptedTurn{
 		{calls: []provider.ToolCall{{ID: "t1", Name: "read", Args: "{}"}}},
@@ -590,12 +559,8 @@ func TestNoBoundaryCheckMeansNoChange(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// worker shells
-// ---------------------------------------------------------------------------
-
-// closableExecutor stands in for an executor whose fork is a live process --
-// a devcontainer daemon, a second ssh connection -- rather than a struct.
+// closableExecutor stands in for an executor whose fork is a live process, not
+// a struct.
 type closableExecutor struct {
 	tool.Executor
 	forks  []*closableExecutor
@@ -628,10 +593,8 @@ func (c *closableExecutor) isClosed() bool {
 	return c.closed
 }
 
-// A worker's shell is forked for it and held by nothing else, so the worker
-// closes it on the way out. Left open, each finished worker keeps a process
-// alive for the rest of the session, and a session that runs enough of them
-// runs out of processes.
+// A worker closes the shell forked for it; left open, each finished worker
+// keeps a process alive.
 func TestAFinishedWorkerClosesItsShell(t *testing.T) {
 	inner, _ := mixedExecutor(t)
 	host := &closableExecutor{Executor: inner}

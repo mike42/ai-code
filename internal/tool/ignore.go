@@ -19,14 +19,7 @@ type ignoreRule struct {
 }
 
 // ignoreSet implements enough of gitignore to keep a code search out of
-// node_modules, build output and vendored trees.
-//
-// It is a subset, not a reimplementation of git's matcher: anchoring, directory
-// suffixes, negation, basename patterns and `**` are handled; the rarer corners
-// are not. Shelling out to `git check-ignore` would be exact but costs a
-// process per path, and reimplementing the whole thing is a project of its own.
-// Being slightly over-inclusive in a search is a much cheaper error than being
-// slow.
+// node_modules and vendored trees. A subset, erring toward over-inclusion.
 type ignoreSet struct {
 	rules []ignoreRule
 }
@@ -117,15 +110,12 @@ func (r ignoreRule) matches(relPath string) bool {
 	return false
 }
 
-// matchAnyDepth matches a basename-style pattern against any path segment, and
-// against any directory prefix so that ignoring `build` also ignores
-// `build/x/y.go`.
+// matchAnyDepth matches a basename-style pattern against any path segment; a
+// match on any ancestor ignores everything beneath it.
 func matchAnyDepth(pattern, relPath string) bool {
 	segments := strings.Split(relPath, "/")
 	for i, seg := range segments {
 		if ok, _ := path.Match(pattern, seg); ok {
-			// A match on a non-final segment means an ancestor directory is
-			// ignored, which ignores everything under it.
 			_ = i
 			return true
 		}
@@ -139,11 +129,8 @@ type walkOptions struct {
 	respectGit bool
 	includeAll bool // include dotfiles
 	maxFiles   int
-	// namedHidden are dot-prefixed names the caller asked for by name, such
-	// as the ".devcontainer" in a `**/.devcontainer/**` glob. Hidden files
-	// are skipped by default because nobody means them by `*.go`, but a
-	// pattern that spells one out has said what it means, and answering "no
-	// matches" to it is a lie about the filesystem.
+	// namedHidden are dot-prefixed names the caller asked for by name; a
+	// pattern that spells one out has said what it means.
 	namedHidden map[string]bool
 }
 
@@ -152,16 +139,14 @@ func (o walkOptions) hiddenSkipped(name string) bool {
 	return !o.includeAll && strings.HasPrefix(name, ".") && !o.namedHidden[name]
 }
 
-// alwaysSkip are directories no code search should ever descend into, whether
-// or not a .gitignore mentions them. .git in particular contains packed objects
-// that will happily match any regex.
+// alwaysSkip are directories no code search should descend into, gitignored or
+// not. .git holds packed objects that match almost any regex.
 var alwaysSkip = map[string]bool{
 	".git": true, ".hg": true, ".svn": true, ".jj": true,
 }
 
-// walkFiles visits every file under root that survives the ignore rules,
-// calling fn for each. It loads .gitignore files as it descends, so a nested
-// ignore file applies to its own subtree.
+// walkFiles calls fn for every file under root that survives the ignore rules,
+// loading nested .gitignore files as it descends.
 func walkFiles(opts walkOptions, fn func(absPath, relPath string) error) error {
 	ig := &ignoreSet{}
 	if opts.respectGit {
@@ -224,13 +209,8 @@ func walkFiles(opts walkOptions, fn func(absPath, relPath string) error) error {
 }
 
 // DirIgnorer returns a test for whether one entry of dir is ignored, for
-// callers that read a single directory instead of walking the tree.
-//
-// Tab completion is that caller: walking a large repository on a keystroke is
-// not an option, but offering a path that grep and glob will never look at is
-// worse than offering nothing. The ignore files of root and of every directory
-// between root and dir are loaded, which is the subset of walkFiles' behaviour
-// that a single directory can observe.
+// callers that read a single directory instead of walking the tree. It loads
+// the ignore files from root down to dir.
 func DirIgnorer(root, dir string) func(name string, isDir bool) bool {
 	never := func(string, bool) bool { return false }
 

@@ -16,8 +16,8 @@ import (
 //go:embed bash.txt
 var bashDescription string
 
-// Sentinels the wrapper script prints after the user's command so ai-code can
-// recover the shell's final state. Chosen to be implausible in real output.
+// Sentinels the wrapper script prints after the command so ai-code can recover
+// the shell's final state; chosen to be implausible in real output.
 const (
 	stateMarker = "__ai_code_state_a37f91c4__"
 	envMarker   = "__ai_code_env_a37f91c4__"
@@ -32,9 +32,9 @@ type BashTool struct {
 func (t *BashTool) Name() string        { return "bash" }
 func (t *BashTool) Description() string { return bashDescription }
 
-// ReadOnly is false unconditionally. Deciding whether a command mutates
+// ReadOnly is false unconditionally: deciding whether a command mutates
 // anything would mean parsing shell grammar, and getting it wrong means
-// concurrent writes to the same file. Shell commands are always serialised.
+// concurrent writes to the same file.
 func (t *BashTool) ReadOnly() bool { return false }
 
 func (t *BashTool) Schema() json.RawMessage {
@@ -85,8 +85,7 @@ func (t *BashTool) Run(ctx context.Context, st *State, raw json.RawMessage) Resu
 	cmd.Env = buildEnv(st)
 	setProcessGroup(cmd)
 
-	// A command that reads stdin gets EOF rather than blocking forever on a
-	// terminal that is not there.
+	// A command that reads stdin gets EOF rather than blocking on a terminal that is not there.
 	devNull, err := os.Open(os.DevNull)
 	if err == nil {
 		cmd.Stdin = devNull
@@ -113,8 +112,7 @@ func (t *BashTool) Run(ctx context.Context, st *State, raw json.RawMessage) Resu
 	select {
 	case waitErr = <-done:
 	case <-runCtx.Done():
-		// SIGTERM first so the command can clean up, then SIGKILL. Both go to
-		// the whole process group.
+		// SIGTERM first so the command can clean up, then SIGKILL; both go to the whole process group.
 		killProcessGroup(cmd, true)
 		select {
 		case waitErr = <-done:
@@ -136,12 +134,7 @@ func (t *BashTool) Run(ctx context.Context, st *State, raw json.RawMessage) Resu
 
 	exitCode := cmd.ProcessState.ExitCode()
 
-	// Every path out of here reports output, so every path has to be bounded.
-	// The buffer deliberately holds several times the reporting budget so that
-	// Truncate has both ends to choose between, which means an early return
-	// that skips Truncate does not return a slightly large result -- it
-	// returns the entire buffer, eight times the budget. A command that timed
-	// out is the likeliest of all to have produced that much.
+	// Truncate runs on every reporting path: an early return would dump the whole buffer.
 	truncated, wasTruncated := Truncate(trim(output), t.MaxOutputBytes)
 	if buf.overflowed {
 		wasTruncated = true
@@ -188,10 +181,7 @@ func (t *BashTool) Run(ctx context.Context, st *State, raw json.RawMessage) Resu
 		b.WriteString(truncationNote)
 	}
 
-	// The "$" marks the line as shell activity. Without it a description like
-	// "Read main.go" is indistinguishable from the read tool's own line, and a
-	// later "has not been read" error looks like a bug rather than the
-	// consequence of having catted the file.
+	// The "$" marks the line as shell activity, distinct from the read tool's line.
 	display := "$ " + oneLine(a.Command)
 	if a.Description != "" {
 		display = "$ " + a.Description
@@ -220,13 +210,8 @@ func defaultShell() string {
 }
 
 // wrapCommand appends a state epilogue so ai-code can recover the working
-// directory and environment the command left behind.
-//
-// This is what makes `cd` appear to persist across calls without holding a
-// long-lived shell open. A persistent shell would give higher fidelity, but one
-// hung command poisons every later call in the session, and it cannot be moved
-// to a remote executor. Recovering the state after each call trades a little
-// fidelity for a failure mode that stays contained.
+// directory and environment the command left behind: that is what makes `cd`
+// appear to persist, without a long-lived shell to poison on a hang.
 func wrapCommand(user string) string {
 	return user + "\n" +
 		"__ai_code_rc=$?\n" +
@@ -246,8 +231,7 @@ type shellState struct {
 func splitState(out string) (string, shellState) {
 	idx := strings.LastIndex(out, stateMarker)
 	if idx < 0 {
-		// The command exited the shell directly, or was killed before the
-		// epilogue ran. Output is still valid; state is simply unknown.
+		// The command exited the shell or was killed before the epilogue ran; state is unknown.
 		return out, shellState{}
 	}
 	body := out[:idx]
@@ -269,8 +253,7 @@ func splitState(out string) (string, shellState) {
 }
 
 // applyEnvDelta records variables the command exported or changed, so they are
-// visible to the next call. Variables ai-code itself sets are excluded, as are the
-// ones every process inherits and nobody means to propagate.
+// visible to the next call. Volatile process-local variables are excluded.
 func applyEnvDelta(st *State, after map[string]string) {
 	if len(after) == 0 {
 		return
@@ -291,8 +274,8 @@ func applyEnvDelta(st *State, after map[string]string) {
 	}
 }
 
-// volatileEnv lists variables that differ between any two processes and would
-// otherwise be recorded as changes on every single call.
+// volatileEnv are variables that differ between any two processes and would
+// otherwise read as changes on every call.
 var volatileEnv = map[string]bool{
 	"_": true, "PWD": true, "OLDPWD": true, "SHLVL": true,
 	"__ai_code_rc": true, "RANDOM": true, "SECONDS": true,
@@ -301,9 +284,7 @@ var volatileEnv = map[string]bool{
 func buildEnv(st *State) []string {
 	env := os.Environ()
 
-	// Non-interactive defaults. Without these, a pager waits for a keypress
-	// nobody will press, and git blocks on a credential prompt with no
-	// terminal to type into -- both of which look identical to a hang.
+	// Non-interactive defaults: without them a pager or credential prompt hangs.
 	env = append(env,
 		"PAGER=cat",
 		"GIT_PAGER=cat",
@@ -321,9 +302,8 @@ func buildEnv(st *State) []string {
 	return env
 }
 
-// truncationNote tells the model it is looking at an excerpt. Without it a
-// clipped result reads as the whole answer, and the model concludes the thing
-// it was looking for is not there.
+// truncationNote tells the model it is looking at an excerpt; without it a
+// clipped result reads as the whole answer.
 const truncationNote = "\n(output was truncated; rerun with a narrower command, a grep, or `| tail` if you need more)"
 
 func trim(s string) string { return strings.TrimRight(s, "\n \t") }
@@ -336,11 +316,9 @@ func oneLine(cmd string) string {
 	return cmd
 }
 
-// ---------------------------------------------------------------------------
-
-// boundedBuffer keeps the head and tail of a stream without ever holding more
-// than a bounded amount in memory. A runaway command producing gigabytes of
-// progress-bar output must not take the harness down with it.
+// boundedBuffer keeps the head and tail of a stream in bounded memory: a
+// runaway command producing gigabytes of progress output must not take the
+// harness down.
 type boundedBuffer struct {
 	mu         sync.Mutex
 	head       []byte
@@ -353,8 +331,7 @@ func newBoundedBuffer(limit int) *boundedBuffer {
 	if limit <= 0 {
 		limit = 60000
 	}
-	// Hold several times the reporting budget so Truncate still has material to
-	// work with, but never unbounded.
+	// Hold several times the reporting budget so Truncate still has both ends to choose between.
 	return &boundedBuffer{limit: limit * 8}
 }
 
@@ -362,8 +339,7 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// io.Copy treats a short count as an error, so the return value must always
-	// be the length of the original slice regardless of how much was retained.
+	// io.Copy treats a short count as an error: the return value is always len(p).
 	n := len(p)
 
 	headCap := b.limit / 2

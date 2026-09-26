@@ -7,13 +7,8 @@ import (
 	"time"
 )
 
-// Worker is one investigation running beside the session.
-//
-// It outlives the turn that started it. The turn's context governs the tool
-// call that asked for a worker, and that call returns the moment the worker is
-// registered; binding the worker to it would kill the worker as soon as the
-// turn ended, which is the thing this exists to avoid. The context a worker
-// runs under comes from the session instead.
+// Worker is one investigation running beside the session. It outlives the turn
+// that started it: the session's context governs it, not the turn's.
 type Worker struct {
 	ID    int
 	Label string
@@ -52,13 +47,9 @@ func (w *Worker) Turns() int {
 	return w.turns
 }
 
-// Sink is where the worker's own events go.
-//
-// It writes nothing. The renderer's transient zone has one owner, and a worker
-// streaming its text into the parent's scrollback would interleave with the
-// turn the user is reading -- three of them at once would be unreadable even
-// if it were safe. What a worker produces reaches the screen twice: as a
-// status line while it runs, and as its report when it finishes.
+// Sink is where the worker's own events go. It writes nothing: the renderer's
+// transient zone has one owner, and a worker's output reaches the screen as a
+// status line and as its report.
 func (w *Worker) Sink() Sink {
 	return SinkFunc(func(e Event) {
 		if e.Kind != EvTurnStart {
@@ -83,9 +74,6 @@ type Report struct {
 }
 
 // Workers is every background worker belonging to one session.
-//
-// The zero value is not usable: a worker's lifetime is the session's, so the
-// pool has to be told what that is.
 type Workers struct {
 	base context.Context
 
@@ -93,11 +81,9 @@ type Workers struct {
 	next    int
 	running map[int]*Worker
 
-	// OnReport receives each finished worker. It is called from the worker's
-	// own goroutine, once, and never with the pool locked.
+	// OnReport receives each finished worker, once, without the pool locked.
 	OnReport func(Report)
-	// OnChange is called whenever the set of running workers changes, so a
-	// status line can be redrawn without polling.
+	// OnChange reports whenever the set of running workers changes.
 	OnChange func()
 }
 
@@ -105,10 +91,7 @@ func NewWorkers(base context.Context) *Workers {
 	return &Workers{base: base, running: map[int]*Worker{}}
 }
 
-// Start registers a worker and runs fn in its own goroutine.
-//
-// fn is handed the context the worker lives under and the worker itself, and
-// returns what to report. Start does not wait for any of it.
+// Start registers a worker and runs fn in its own goroutine, without waiting.
 func (p *Workers) Start(label string, fn func(context.Context, *Worker) Report) *Worker {
 	ctx, cancel := context.WithCancel(p.base)
 
@@ -162,18 +145,14 @@ func (p *Workers) Active() []WorkerStatus {
 	return out
 }
 
-// Busy is how many workers are running, for a caller that only needs to know
-// whether any are.
+// Busy is how many workers are running.
 func (p *Workers) Busy() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.running)
 }
 
-// Wait blocks until every worker running now has finished.
-//
-// It does not stop anything starting afterwards, because nothing here can
-// prevent that: the model may be mid-turn and about to ask for another.
+// Wait blocks until every worker running now has finished; later ones are not stopped.
 func (p *Workers) Wait() {
 	p.mu.Lock()
 	ws := make([]*Worker, 0, len(p.running))
@@ -187,11 +166,8 @@ func (p *Workers) Wait() {
 	}
 }
 
-// Cancel stops every running worker and waits for each to report.
-//
-// Waiting matters: a cancelled worker still delivers a report saying it was
-// cancelled, and a caller that is tearing the session down needs that to have
-// happened before it stops listening.
+// Cancel stops every running worker and waits for each to report, so a
+// cancelled worker has delivered its report before the caller stops listening.
 func (p *Workers) Cancel() {
 	p.mu.Lock()
 	ws := make([]*Worker, 0, len(p.running))

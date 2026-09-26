@@ -1,21 +1,6 @@
 // Command steerprobe drives the renderer and the steering prompt under a real
-// terminal. Test-only; not part of the shipped CLI.
-//
-// It exists because the two things steering depends on cannot be reached from a
-// unit test. Whether the terminal is left able to translate "\n" -- steering
-// changes the input side of the termios and must not touch the output side --
-// and whether a transient line stays on one row are both properties of a real
-// tty, not of the bytes the renderer produces.
-//
-// Drive it through a pty and replay the escapes:
-//
-//	( sleep 1; printf 'stop, check the tests'; sleep 1; printf '\r'; sleep 5 ) |
-//	    script -q -c "COLUMNS=80 steerprobe" /dev/null
-//
-// What to look for: the committed code is flush left with no stray fragments of
-// the thinking trace between its lines, the thinking line stays on one row while
-// carrying tabs and wide characters, and the bottom line alternates between the
-// status line and the "> " prompt as the buffer fills and empties.
+// terminal, checking that OPOST survives and that a transient line stays on one
+// row. Test-only; not part of the shipped CLI.
 package main
 
 import (
@@ -47,13 +32,13 @@ func main() {
 	}
 
 	r.Emit(agent.Event{Kind: agent.EvTurnStart})
-	// Reasoning full of exactly what used to break the transient zone.
+	// Reasoning carrying tabs, wide characters and carriage returns.
 	for range 90 {
 		r.Emit(agent.Event{Kind: agent.EvReasoning,
 			Text: "\tso I should check whether 日本語 handling is right\n\t\treturn nil\r"})
 		time.Sleep(30 * time.Millisecond)
 	}
-	// Then some code, which is where the stray newlines showed up.
+	// Then some code, which is where stray newlines appear.
 	for _, chunk := range []string{
 		"Here is the fix.\n\n```go\n",
 		"func main() {\n\tprintln(\"hello\")\n",

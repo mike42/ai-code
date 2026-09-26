@@ -9,12 +9,8 @@ import (
 	"ai-code/internal/render"
 )
 
-// cmdThink shows or changes how hard the model thinks.
-//
-// On a local setup this is the only capability knob that is cheap. Swapping
-// model costs tens of seconds to minutes of loading; moving the resident
-// model between "answer now" and "think hard" costs nothing and takes effect
-// on the next turn.
+// cmdThink shows or changes how hard the model thinks. Unlike a model swap it
+// costs no load time, and it takes effect on the next turn.
 func (a *App) cmdThink(ctx context.Context, args string) error {
 	style := render.NewStyle(a.screen.Color())
 

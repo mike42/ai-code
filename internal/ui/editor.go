@@ -1,14 +1,9 @@
 // Package ui is the interactive input layer: a line editor, the escape to a
 // real text editor, and the slash commands.
 //
-// Two rules govern everything here:
-//
-//   - Mouse reporting is never enabled. Enabling it is what makes a terminal
-//     stop letting you select text with the mouse, and no feature is worth
-//     that. Bracketed paste IS enabled: it fixes multi-line paste without
-//     touching selection.
-//   - The alternate screen is never used, so scrollback survives and the
-//     terminal's own search works on the whole session.
+// Mouse reporting stays off, so text selection keeps working; bracketed paste is
+// on. The alternate screen is never used, so scrollback survives and the
+// terminal's own search covers the whole session.
 package ui
 
 import (
@@ -31,7 +26,7 @@ import (
 )
 
 var (
-	// ErrInterrupt is returned when the user presses Ctrl-C at the prompt.
+	// ErrInterrupt is returned when Ctrl-C is pressed at the prompt.
 	ErrInterrupt = errors.New("interrupted")
 	// ErrEOF is returned on Ctrl-D at an empty prompt.
 	ErrEOF = errors.New("end of input")
@@ -48,18 +43,15 @@ type Editor struct {
 
 	history    []string
 	historyPos int
-	// Completions supplies Tab candidates for the line up to the cursor. It
-	// returns the byte offset in that line where the candidates begin -- the
-	// editor replaces from there to the cursor and leaves the rest of the line
-	// alone -- and the candidates themselves, which are words rather than
-	// whole lines.
+	// Completions supplies Tab candidates for the line up to the cursor: the
+	// byte offset where they begin, and the candidates, which are words rather
+	// than whole lines. The editor replaces from there to the cursor.
 	Completions func(line string) (start int, candidates []string)
 	// EditorCommand overrides $VISUAL and $EDITOR.
 	EditorCommand string
-	// OnActivity is called once per ReadLine, on the first key pressed. It
-	// marks the person returning to the keyboard, which happens well before
-	// they submit a line, and is what background work started against an
-	// apparently abandoned prompt is cancelled from.
+	// OnActivity is called once per ReadLine, on the first key pressed; the
+	// mark of a person returning to the keyboard, which background work against
+	// an abandoned prompt is cancelled from.
 	OnActivity func()
 
 	buf    []rune
@@ -67,25 +59,22 @@ type Editor struct {
 	saved  string
 
 	// preload is text the next ReadLine starts with. Steering hands over here:
-	// a turn can end while a sentence is half typed, and those characters
-	// belong in the prompt that replaces the steering line, not in the bin.
+	// a half-typed sentence belongs in the prompt that replaces the steering
+	// line, not in the bin.
 	preload string
 
 	// kill holds the most recently killed text so Ctrl-Y can put it back, the
-	// way it does in bash. One slot rather than a ring: nobody outside Emacs
-	// reaches for the rotate binding.
+	// way bash does. One slot rather than a ring.
 	kill string
 
-	// State for the incremental redraw. lastVisible is the text currently on
-	// screen and lastCursor the column the cursor is actually in, so redraw can
-	// work out the smallest edit that gets from there to the desired line.
+	// State for the incremental redraw. lastVisible, lastCursor, lastWidth and
+	// lastPrompt describe what is on screen, so redraw can compute the smallest
+	// edit from it.
 	painted    bool
 	lastPrompt string
-	// live is a prompt supplied from outside the read loop -- by a worker
-	// finishing, or another window swapping the model. ReadLine captured its
-	// prompt before any of that happened and repaints with it on every
-	// keystroke, so without this the next character typed puts the stale one
-	// back and it is the stale one that gets committed.
+	// live is a prompt supplied from outside the read loop, by a worker
+	// finishing or another window swapping the model; without it the next
+	// keystroke repaints ReadLine's stale prompt and commits that.
 	live        string
 	lastVisible []rune
 	lastCursor  int
@@ -95,15 +84,14 @@ type Editor struct {
 	header      string
 	headerDrawn bool
 
-	// paintMu serialises painting. The read loop paints after each key, and
-	// Refresh paints from whichever goroutine noticed that the prompt is now
-	// wrong; two writers interleaving escape sequences corrupts the line.
+	// paintMu serialises painting: the read loop paints after each key, and
+	// Refresh paints from whichever goroutine noticed the prompt is wrong;
+	// interleaved escape sequences corrupt the line.
 	paintMu sync.Mutex
 
-	// piped is created once and reused. A fresh bufio.Reader per call would
+	// piped is created once and reused: a fresh bufio.Reader per call would
 	// read ahead into its buffer and then discard it, silently swallowing every
-	// line after the first -- which breaks `printf 'a\nb\n' | ai-code` and every
-	// scripted session built on it.
+	// line after the first.
 	piped *bufio.Reader
 }
 
@@ -130,16 +118,12 @@ func (e *Editor) Preload(text string) { e.preload = text }
 
 func (e *Editor) isTTY() bool { return term.IsTerminal(int(e.in.Fd())) }
 
-// IsTTY reports whether ReadLine will edit a line or merely read one. Callers
-// that arrange something around the prompt need to know which, because the
-// piped path has no prompt, no keys and no cursor.
+// IsTTY reports whether ReadLine will edit a line or merely read one, which
+// callers arranging something around the prompt need to know.
 func (e *Editor) IsTTY() bool { return e.isTTY() }
 
-// ReadLine reads one submission.
-//
-// Without a terminal it falls back to plain line reading, which is what makes
-// `echo "do the thing" | ai-code` works and is how the non-interactive tests drive
-// the program.
+// ReadLine reads one submission; without a terminal it falls back to plain line
+// reading, which is how piped input drives the program.
 func (e *Editor) ReadLine(prompt string) (string, error) {
 	if !e.isTTY() {
 		return e.readPiped()
@@ -177,8 +161,8 @@ func (e *Editor) ReadLine(prompt string) (string, error) {
 		if !active {
 			active = true
 			if e.OnActivity != nil {
-				// Before the key is acted on, so the abort is already under way
-				// while the character is still being drawn.
+				// Before the key is acted on, so the abort starts while the
+				// character is drawn.
 				e.OnActivity()
 			}
 		}
@@ -230,9 +214,9 @@ func (e *Editor) ReadLine(prompt string) (string, error) {
 			e.historyNext()
 		case 18: // Ctrl-R
 			if e.reverseSearch(reader, prompt) {
-				// The search prompt is on the line, not the normal marker, so
-				// the finalising repaint is what puts the recalled command into
-				// the scrollback looking like something that was typed.
+				// The search prompt is on the line, so the finalising repaint
+				// is what puts the recalled command into the scrollback
+				// looking typed.
 				e.finalise(prompt, string(e.buf))
 				return string(e.buf), nil
 			}
@@ -285,13 +269,9 @@ func (e *Editor) readPiped() (string, error) {
 	return strings.TrimRight(line, "\r\n"), nil
 }
 
-// handleEscape consumes one escape sequence and applies it.
-//
-// The whole sequence must be consumed even when ai-code does nothing with it.
-// Reading a fixed two bytes -- the tempting shortcut -- leaves the tail of any
-// parameterised sequence in the reader, where it is read back as ordinary
-// keystrokes: press Ctrl-Left in gnome-terminal and ";5D" appears in your
-// prompt.
+// handleEscape consumes one escape sequence and applies it. The whole sequence
+// must be consumed even when it is ignored: reading a fixed two bytes leaves the
+// tail in the reader, where it is read back as keystrokes.
 func (e *Editor) handleEscape(r *bufio.Reader) {
 	b1, _, err := r.ReadRune()
 	if err != nil {
@@ -338,7 +318,7 @@ func (e *Editor) handleCSI(r *bufio.Reader) {
 
 	p := string(params)
 	// A modifier arrives as a second parameter: "1;5D" is Ctrl-Left, "1;3D"
-	// Alt-Left. Both are word motions here.
+	// Alt-Left; both are word motions here.
 	mod := 0
 	if i := strings.IndexByte(p, ';'); i >= 0 {
 		mod, _ = strconv.Atoi(p[i+1:])
@@ -392,18 +372,14 @@ func (e *Editor) cursorKey(final rune, mod int) {
 }
 
 // isWordMod reports whether a CSI modifier means Ctrl or Alt, the two that turn
-// an arrow key into a word motion. The encoding is 1 + a bitmask of
-// shift(1)/alt(2)/ctrl(4).
+// an arrow key into a word motion. The encoding is 1 + shift(1)/alt(2)/ctrl(4).
 func isWordMod(mod int) bool {
 	m := mod - 1
 	return m > 0 && m&(2|4) != 0
 }
 
-// readPaste consumes a bracketed-paste payload verbatim.
-//
-// Reading it as a block rather than as keystrokes is what stops a pasted
-// multi-line snippet from submitting on its first newline -- the classic way a
-// harness mangles pasted code.
+// readPaste consumes a bracketed-paste payload verbatim, so a pasted multi-line
+// snippet does not submit on its first newline.
 func (e *Editor) readPaste(r *bufio.Reader) {
 	const end = "\x1b[201~"
 	var b strings.Builder
@@ -424,11 +400,9 @@ func (e *Editor) readPaste(r *bufio.Reader) {
 	e.insertRunes(sanitisePaste(text))
 }
 
-// sanitisePaste drops control characters from pasted text. Pasting terminal
-// output is common, and an escape sequence landing in the buffer would be sent
-// straight back to the terminal by redraw, corrupting the line -- and would
-// then be sent to the model as noise. Tabs become spaces; newlines survive,
-// because a pasted multi-line snippet is the whole point of bracketed paste.
+// sanitisePaste drops control characters from pasted text: an escape sequence
+// would be sent straight back to the terminal by redraw, corrupting the line,
+// and then to the model as noise. Tabs become spaces; newlines survive.
 func sanitisePaste(s string) []rune {
 	rs := []rune(s)
 	out := make([]rune, 0, len(rs))
@@ -451,8 +425,8 @@ func sanitisePaste(s string) []rune {
 	return out
 }
 
-// skipEscape returns the index of the last rune of the escape sequence starting
-// at i, so the caller's loop increment lands just past it.
+// skipEscape returns the index of the last rune of the sequence starting at i,
+// so the caller's loop increment lands just past it.
 func skipEscape(rs []rune, i int) int {
 	if i+1 >= len(rs) {
 		return len(rs)
@@ -482,9 +456,8 @@ func skipEscape(rs []rune, i int) int {
 
 func (e *Editor) insert(r rune) { e.insertRunes([]rune{r}) }
 
-// insertRunes splices text in at the cursor. The tail is copied out first
-// because the append that writes the new text would otherwise overwrite the
-// very runes still to be appended after it.
+// insertRunes splices text in at the cursor; the tail is copied out first,
+// since the append would overwrite the runes still to be appended after it.
 func (e *Editor) insertRunes(rs []rune) {
 	if len(rs) == 0 {
 		return
@@ -525,8 +498,8 @@ func (e *Editor) deleteForward() {
 }
 
 // deleteWord is Ctrl-W: kill back to the previous whitespace. bash uses
-// whitespace here and word characters for Alt-Backspace, and the difference is
-// load-bearing -- Ctrl-W on a path should take the whole path, not one segment.
+// whitespace here and word characters for Alt-Backspace, and the difference
+// matters: Ctrl-W on a path takes the whole path, not one segment.
 func (e *Editor) deleteWord() {
 	i := e.cursor
 	for i > 0 && e.buf[i-1] == ' ' {
@@ -542,9 +515,9 @@ func isWordRune(r rune) bool {
 	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
 }
 
-// wordStart and wordEnd match Alt-B and Alt-F: skip any run of non-word
-// characters, then move over the word itself. They are free functions so the
-// steering prompt gets the same motions from the same code.
+// wordStart and wordEnd match Alt-B and Alt-F: skip non-word characters, then
+// move over the word. Free functions so the steering prompt gets the same
+// motions from the same code.
 func wordStart(buf []rune, i int) int {
 	for i > 0 && !isWordRune(buf[i-1]) {
 		i--
@@ -634,11 +607,9 @@ func (e *Editor) complete() {
 	e.listMatches(matches)
 }
 
-// replaceWord swaps the runes in [at,cursor) for text.
-//
-// Only that span is touched: a prompt is prose, not a shell command line, and
-// completing a path halfway through a sentence must not eat the rest of the
-// sentence.
+// replaceWord swaps the runes in [at,cursor) for text. Only that span is
+// touched: a prompt is prose, and completing a path mid-sentence must not eat
+// the rest of the sentence.
 func (e *Editor) replaceWord(at int, text string) {
 	tail := append([]rune(nil), e.buf[e.cursor:]...)
 	e.buf = append(e.buf[:at], []rune(text)...)
@@ -646,15 +617,12 @@ func (e *Editor) replaceWord(at int, text string) {
 	e.buf = append(e.buf, tail...)
 }
 
-// maxListed caps an ambiguous-match listing. A directory of a thousand files
+// maxListed caps an ambiguous-match listing; a directory of a thousand files
 // would otherwise scroll the session away on one keystroke.
 const maxListed = 60
 
-// listMatches prints the candidates above the prompt, in columns.
-//
-// Space-joining them onto one line was readable for a dozen command names and
-// useless for thirty model ids, where the list is the feature: it is what you
-// read to decide which suffix you meant.
+// listMatches prints the candidates above the prompt, in columns: reading the
+// list is how a suffix is chosen when there are dozens of them.
 func (e *Editor) listMatches(matches []string) {
 	width := 80
 	if w, _, err := term.GetSize(int(e.out.Fd())); err == nil && w > 0 {
@@ -716,19 +684,9 @@ func longestCommonPrefix(ss []string) string {
 	return p
 }
 
-// redraw repaints the prompt line, writing only what actually changed.
-//
-// The whole update is assembled into one buffer and issued as a single write,
-// holding only the difference from what is on screen: erase-and-reprint
-// flickers, and every separate write is another chance for the terminal to
-// draw a half-finished line.
-//
-// Text wider than the terminal scrolls horizontally rather than wrapping.
-// Wrapping would make the cursor arithmetic depend on the terminal's own
-// line-wrap behaviour, which differs between terminals.
 // Refresh repaints the line with a new prompt, for a caller that has learned
-// something the prompt should say. Safe from another goroutine, and a no-op
-// before anything has been painted.
+// something the prompt should say. Safe from another goroutine; a no-op before
+// anything has been painted.
 func (e *Editor) Refresh(prompt string) {
 	if !e.isTTY() {
 		return
@@ -742,15 +700,9 @@ func (e *Editor) Refresh(prompt string) {
 	e.paint(prompt)
 }
 
-// SetHeader puts one replaceable line directly above the prompt.
-//
-// It is neither transient nor committed until it has to be. While the prompt
-// is up the line is rewritten in place, so a model that changes three times
-// leaves one line rather than three, and a model that changes and changes
-// back leaves a blank. The moment a prompt is submitted the line stops being
-// rewritten and becomes ordinary scrollback, sitting above the exchange it
-// describes -- which is the only place the answer to "which model produced
-// this" can usefully live.
+// SetHeader puts one replaceable line directly above the prompt. While the
+// prompt is up it is rewritten in place, so a model that changes leaves one
+// line; on submit it becomes scrollback, above the exchange it describes.
 func (e *Editor) SetHeader(text, prompt string) {
 	if !e.isTTY() {
 		return
@@ -763,9 +715,9 @@ func (e *Editor) SetHeader(text, prompt string) {
 
 	var b strings.Builder
 	if e.headerDrawn {
-		// Back up over the prompt line onto the header and overwrite it. The
+		// Back up over the prompt line onto the header and overwrite it; the
 		// line cannot be removed once drawn, so returning to the original
-		// model blanks it rather than closing the gap.
+		// model blanks it.
 		b.WriteString("\r\x1b[2K\x1b[1A")
 	}
 	b.WriteString("\r\x1b[2K")
@@ -779,22 +731,17 @@ func (e *Editor) SetHeader(text, prompt string) {
 	e.paint(prompt)
 }
 
-// ForgetHeader stops the line above from being rewritten, because it now
-// belongs to the exchange below it.
+// ForgetHeader stops the line above from being rewritten; it now belongs to the
+// exchange below it.
 func (e *Editor) ForgetHeader() {
 	e.paintMu.Lock()
 	defer e.paintMu.Unlock()
 	e.header, e.headerDrawn = "", false
 }
 
-// EmitAbove puts lines into the scrollback above the prompt and repaints it,
-// with whatever was typed intact.
-//
-// Anything else written from another goroutine lands in the middle of the
-// line being typed, because the prompt is drawn here rather than through the
-// renderer's transient zone. This is the only way for something happening
-// elsewhere -- another window loading a different model -- to leave a record
-// a person can scroll back to.
+// EmitAbove puts lines into the scrollback above the prompt and repaints it
+// with whatever was typed intact; anything else written from another goroutine
+// lands in the middle of the line being typed.
 func (e *Editor) EmitAbove(prompt string, lines ...string) {
 	if !e.isTTY() || len(lines) == 0 {
 		return
@@ -816,6 +763,9 @@ func (e *Editor) EmitAbove(prompt string, lines ...string) {
 	e.paint(prompt)
 }
 
+// redraw repaints the prompt line as a single write, carrying only the
+// difference from what is on screen. Text wider than the terminal scrolls
+// horizontally rather than wrapping, whose behaviour varies by terminal.
 func (e *Editor) redraw(prompt string) {
 	e.paintMu.Lock()
 	defer e.paintMu.Unlock()
@@ -854,9 +804,8 @@ func (e *Editor) paint(prompt string) {
 
 	var b strings.Builder
 	if !e.painted || prompt != e.lastPrompt || width != e.lastWidth {
-		// Nothing reliable is known about the line, so repaint it whole. Note
-		// the erase comes *after* the text, not before: the line is never
-		// momentarily blank.
+		// Nothing reliable is known about the line, so repaint it whole; the
+		// erase comes after the text, so the line is never momentarily blank.
 		b.WriteString("\r")
 		b.WriteString(prompt)
 		b.WriteString(string(visible))
@@ -887,10 +836,9 @@ func (e *Editor) paint(prompt string) {
 	e.lastCursor = cursorScreen
 }
 
-// summarise replaces multi-line content with a one-line stand-in. Multi-line
-// content is not edited inline -- Ctrl-G edits it properly -- and the line it
-// is drawn on has to stay one physical row, because everything below depends
-// on a counted number of rows to erase.
+// summarise replaces multi-line content with a one-line stand-in: it is not
+// edited inline (Ctrl-G edits it properly), and the line has to stay one
+// physical row, since the erase depends on a counted row count.
 func summarise(s string) string {
 	i := strings.IndexByte(s, '\n')
 	if i < 0 {
@@ -903,21 +851,13 @@ func summarise(s string) string {
 	return fmt.Sprintf("%s… [%d lines, Ctrl-G to edit]", first, strings.Count(s, "\n")+1)
 }
 
-// finalise leaves the completed input on the line before moving off it.
-//
-// redraw only ever shows a horizontally scrolled window into the buffer, so
-// without this the scrollback would keep that window -- a long prompt reduced
-// to its last seventy characters, starting mid-word.
-//
-// Wrapping is safe here and nowhere else: the line is never drawn on again, so
-// there is no cursor arithmetic left to get wrong, and letting the terminal
-// wrap it is what makes it reflow on a resize.
+// finalise leaves the completed input on the line before moving off it: redraw
+// only shows a scrolled window into the buffer, and without this the scrollback
+// would keep its tail. Wrapping is safe here, since the line is never redrawn.
 func (e *Editor) finalise(prompt, text string) {
-	// The prompt ReadLine was called with, unless something repainted a newer
-	// one underneath it. A marker that changed while the line was being typed
-	// -- workers finishing, the context figure moving -- would otherwise be
-	// committed to the scrollback saying what was true when the prompt first
-	// appeared rather than when it was submitted.
+	// Prefer a prompt repainted while the line was being typed: otherwise the
+	// marker committed to the scrollback says what was true when it first
+	// appeared, not when it was submitted.
 	if e.live != "" {
 		prompt = e.live
 	}
@@ -925,9 +865,8 @@ func (e *Editor) finalise(prompt, text string) {
 	b.WriteString("\r")
 	b.WriteString(prompt)
 	b.WriteString(render.BoundLine(summarise(text)))
-	// After the text, never before it: an erase first would blank the line the
-	// user is looking at. It clears the tail of the last row, which is where
-	// the scrolled window's leftovers are once shorter text replaces longer.
+	// The erase comes after the text: first would blank the visible line. It
+	// clears the tail of the last row left by the scrolled window.
 	b.WriteString("\x1b[K")
 	b.WriteString("\r\n")
 	_, _ = io.WriteString(e.out, b.String())
@@ -935,14 +874,13 @@ func (e *Editor) finalise(prompt, text string) {
 }
 
 // invalidate declares that something other than redraw has written to the
-// terminal, so the next redraw must repaint the line rather than diff against a
-// picture that is no longer there.
+// terminal, so the next redraw repaints rather than diffing against a stale
+// picture.
 func (e *Editor) invalidate() { e.painted = false }
 
-// moveTo emits the shortest cursor movement between two columns. Absolute
-// positioning (CSI G) would be one sequence too, but relative movement composes
-// with whatever else is on the line, which matters when the prompt is not the
-// only thing the terminal is showing.
+// moveTo emits the shortest cursor movement between two columns. Relative
+// movement composes with whatever else is on the line, unlike absolute
+// positioning.
 func moveTo(b *strings.Builder, from, to int) {
 	switch {
 	case to > from:
@@ -966,8 +904,8 @@ func commonPrefix(a, b []rune) int {
 func (e *Editor) LaunchEditor(initial string) (string, error) { return e.launchEditor(initial) }
 
 // launchEditor opens $VISUAL or $EDITOR on the current buffer, the way git does
-// for a commit message. This is the intended path for anything longer than a
-// sentence: a terminal line editor is the wrong tool for writing a real prompt.
+// for a commit message; it is the intended path for anything longer than a
+// sentence.
 func (e *Editor) launchEditor(initial string) (string, error) {
 	editor := e.EditorCommand
 	if editor == "" {
@@ -1000,8 +938,8 @@ func (e *Editor) launchEditor(initial string) (string, error) {
 	}
 	tmp.Close()
 
-	// The editor takes over the terminal completely; ai-code must not be holding
-	// raw mode or drawing anything while it runs.
+	// The editor takes over the terminal; ai-code must not hold raw mode or
+	// draw while it runs.
 	fields := strings.Fields(editor)
 	cmd := exec.Command(fields[0], append(fields[1:], path)...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
@@ -1039,10 +977,9 @@ func firstAvailable(names ...string) string {
 	return ""
 }
 
-// reverseSearch is bash's Ctrl-R: type to walk backwards through history
-// looking for a substring. Ctrl-R again steps to the next match further back,
-// Enter submits the match, Escape or an arrow key keeps it in the buffer for
-// further editing, and Ctrl-C puts back whatever was being typed before.
+// reverseSearch is bash's Ctrl-R: type to walk backwards through history for a
+// substring. Ctrl-R again steps further back, Enter submits the match, Escape or
+// an arrow key keeps it for editing, and Ctrl-C restores the typed line.
 func (e *Editor) reverseSearch(r *bufio.Reader, prompt string) (submit bool) {
 	origBuf := append([]rune(nil), e.buf...)
 	origCursor := e.cursor
@@ -1052,8 +989,8 @@ func (e *Editor) reverseSearch(r *bufio.Reader, prompt string) (submit bool) {
 	found := -1
 
 	// search walks backwards from the given index, leaving found and from
-	// untouched if there is no further match -- so holding Ctrl-R past the last
-	// hit stays put rather than snapping back to the start.
+	// untouched if there is no further match, so holding Ctrl-R past the last
+	// hit stays put.
 	search := func(start int) {
 		q := strings.ToLower(string(query))
 		for i := start - 1; i >= 0; i-- {
@@ -1102,10 +1039,9 @@ func (e *Editor) reverseSearch(r *bufio.Reader, prompt string) (submit bool) {
 			return false
 
 		case 27:
-			// Escape leaves the search. It may also be the start of an arrow
-			// key, which in bash both exits and moves -- so hand the rest of
-			// the sequence to the normal parser rather than leaving it to be
-			// read back as literal keystrokes.
+			// Escape leaves the search, and may also start an arrow key, which
+			// in bash both exits and moves: hand the rest of the sequence to
+			// the normal parser rather than reading it back as literal keys.
 			if r.Buffered() > 0 {
 				e.handleEscape(r)
 			}

@@ -241,7 +241,7 @@ func TestTheOpenRouterCatalogueIsReadAnonymously(t *testing.T) {
 }
 
 // Withholding the key from the catalogue must not withhold it from the one
-// call that is actually the user's account being spent.
+// call that spends the account.
 func TestInferenceStillSendsTheKeyOnOpenRouter(t *testing.T) {
 	var seen string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

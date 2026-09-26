@@ -17,7 +17,6 @@ import (
 	"ai-code/internal/tool"
 )
 
-// buildClient constructs a provider client from configuration.
 func buildClient(name string, p config.Provider) (provider.Client, error) {
 	key, err := p.ResolveAPIKey()
 	if err != nil {
@@ -49,9 +48,8 @@ func buildClient(name string, p config.Provider) (provider.Client, error) {
 	case "lemonade":
 		return provider.NewLemonade(opts)
 	case "openrouter":
-		// Without this the reasoning controls go out in the llama.cpp spelling,
-		// which OpenRouter neither honours nor rejects: thinking levels would
-		// appear to work and do nothing.
+		// The llama.cpp reasoning spelling OpenRouter silently ignores: without
+		// this, thinking levels would appear to work and do nothing.
 		opts.Dialect = provider.DialectOpenRouter
 		return provider.NewOpenAI(opts)
 	default:
@@ -59,12 +57,9 @@ func buildClient(name string, p config.Provider) (provider.Client, error) {
 	}
 }
 
-// buildTools assembles the tool set. The order here does not matter -- the
-// executor sorts by name so the advertised list is deterministic and the
-// provider's prompt cache is not invalidated by map iteration.
-// window is the detected context window, and 0 when it is not known yet --
-// the tool caps derived from it then fall back to the fixed defaults, which
-// is what every caller that builds tools outside a session gets.
+// buildTools assembles the tool set. The executor sorts by name, so the
+// advertised list is deterministic and the provider's prompt cache is not
+// invalidated by map iteration. window is the detected context window, or 0.
 func buildTools(cfg *config.Config, cwd string, window int) (*tool.LocalExecutor, *tool.State) {
 	st := tool.NewState(cwd)
 	maxOutput := cfg.Tools.Bash.MaxOutputBytes
@@ -85,17 +80,6 @@ func buildTools(cfg *config.Config, cwd string, window int) (*tool.LocalExecutor
 		&tool.LsTool{},
 	), st
 }
-
-// ---------------------------------------------------------------------------
-// Model metadata cache
-//
-// Startup must not wait on the network. A console app that takes a second to
-// show a prompt is doing something wrong, and asking a model server for its
-// catalogue is exactly the kind of thing that turns into that second. Metadata
-// is therefore cached on disk and refreshed in the background; the first run
-// against a new provider is the only one that ever waits, and even then only
-// when a model has to be chosen.
-// ---------------------------------------------------------------------------
 
 const modelCacheTTL = 6 * time.Hour
 
@@ -152,7 +136,6 @@ func saveModelCache(providerName string, models []provider.ModelInfo) {
 	_ = os.WriteFile(path, raw, 0o600)
 }
 
-// fetchModels returns the provider's catalogue, using the cache when fresh.
 func fetchModels(ctx context.Context, c provider.Client, allowCache bool) ([]provider.ModelInfo, error) {
 	if allowCache {
 		if cached, fresh := loadModelCache(c.Name()); fresh && len(cached.Models) > 0 {
@@ -161,8 +144,8 @@ func fetchModels(ctx context.Context, c provider.Client, allowCache bool) ([]pro
 	}
 	models, err := c.Models(ctx)
 	if err != nil {
-		// Stale cache beats no information: a momentarily unreachable server
-		// should not stop work from starting.
+		// Stale cache beats no information: an unreachable server should not
+		// stop work from starting.
 		if cached, _ := loadModelCache(c.Name()); cached != nil && len(cached.Models) > 0 {
 			return cached.Models, nil
 		}
@@ -172,8 +155,7 @@ func fetchModels(ctx context.Context, c provider.Client, allowCache bool) ([]pro
 	return models, nil
 }
 
-// resolveModel decides which model to use, in descending order of how much the
-// choice reflects an actual intent:
+// resolveModel decides which model to use, in order:
 //
 //  1. --model on the command line
 //  2. default_model for the provider
@@ -183,8 +165,8 @@ func resolveModel(ctx context.Context, c provider.Client, requested, configured 
 	models, err := fetchModels(ctx, c, true)
 	if err != nil {
 		if requested != "" || configured != "" {
-			// A named model still works without a catalogue; the context window
-			// is simply unknown until the first response reports usage.
+			// A named model still works without a catalogue; the window stays
+			// unknown until a response reports usage.
 			name := requested
 			if name == "" {
 				name = configured
@@ -276,13 +258,9 @@ func compactInt(n int) string {
 	}
 }
 
-// windowIsDivided reports whether a single request really gets less than the
-// server's whole KV allocation.
-//
-// `Parallel > 1` used to stand in for this and is no longer sufficient: with a
-// unified KV cache several slots share one pool and each may still reach the
-// full ctx_size. Advising someone to reduce --parallel in that configuration
-// sends them to change a setting that would not move the number.
+// windowIsDivided reports whether a single request gets less than the server's
+// whole KV allocation. Parallel > 1 is not sufficient: with a unified KV cache
+// several slots share one pool and each may still reach the full ctx_size.
 func windowIsDivided(m provider.ModelInfo) bool {
 	return m.CtxSize > 0 && m.ContextWindow > 0 && m.ContextWindow < m.CtxSize
 }
@@ -294,10 +272,8 @@ func slotsAreContended(m provider.ModelInfo) bool {
 }
 
 // slotSummary states how the backend carved up its KV cache, or "" when it did
-// not carve it up at all.
-//
-// The slot count is a decision already made on the server, for reasons not
-// visible from here, so this reports it and suggests nothing.
+// not. The count is the server's decision, so this reports it and suggests
+// nothing.
 func slotSummary(m provider.ModelInfo) string {
 	switch {
 	case windowIsDivided(m):
@@ -308,15 +284,13 @@ func slotSummary(m provider.ModelInfo) string {
 	return ""
 }
 
-// contextLimitFor decides the window to plan against.
 func contextLimitFor(m provider.ModelInfo, override int) (int, string) {
 	if override > 0 {
 		return override, "configured override"
 	}
 	if m.ContextWindow > 0 {
 		if windowIsDivided(m) {
-			// Worth stating plainly: this is the number people get wrong, and
-			// the difference is a factor of the slot count.
+			// The number people misread: one request gets a fraction of it.
 			return m.ContextWindow, fmt.Sprintf(
 				"%s allocation split across %d slots", compactInt(m.CtxSize), m.Parallel)
 		}

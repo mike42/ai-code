@@ -116,20 +116,10 @@ func writeFilePreservingMode(path string, content []byte) error {
 	return os.WriteFile(path, content, mode)
 }
 
-// ---------------------------------------------------------------------------
-// Failure diagnosis
-//
-// These messages are the whole game. The model cannot see the file; when an
-// edit fails, this text is the only information it gets about why. A bare "not
-// found" produces a retry of the identical wrong string. Naming the actual
-// difference produces a correct retry on the next attempt.
-// ---------------------------------------------------------------------------
-
 func diagnoseNoMatch(st *State, path, text, old string) Result {
 	name := rel(st, path)
 
-	// By far the most common cause: the text is there, but the indentation
-	// differs -- tabs retyped as spaces, or a different nesting depth.
+	// Most common cause: indentation differs -- tabs retyped as spaces, or wrong nesting depth.
 	if line, actual, ok := findWhitespaceVariant(text, old); ok {
 		return Errorf(
 			"old_string was not found in %s, but a match differing only in whitespace exists at line %d.\n\n"+
@@ -140,8 +130,7 @@ func diagnoseNoMatch(st *State, path, text, old string) Result {
 			"tab", "→", "·")
 	}
 
-	// Next most common: the anchor line exists but the surrounding lines the
-	// model included do not match.
+	// Next most common: the anchor line exists but the surrounding lines differ.
 	if line, ok := findAnchorLine(text, old); ok {
 		return Errorf(
 			"old_string was not found in %s.\n\n"+
@@ -151,8 +140,7 @@ func diagnoseNoMatch(st *State, path, text, old string) Result {
 			name, line, indentBlock(excerpt(text, line, countLinesStr(old)+2)))
 	}
 
-	// Nothing recognisable. Say so plainly and point at the recovery step
-	// rather than leaving the model to guess.
+	// Nothing recognisable; point at the recovery step rather than leave a guess.
 	return Errorf(
 		"old_string was not found in %s, and no near match was located.\n\n"+
 			"You supplied:\n%s\n\n"+
@@ -185,9 +173,8 @@ func diagnoseAmbiguous(st *State, path, text, old string, count int) Result {
 		count, rel(st, path), b.String(), count)
 }
 
-// findWhitespaceVariant looks for the supplied text with leading and trailing
-// whitespace on each line normalised away. Returns the line number and the
-// file's actual text for that region.
+// findWhitespaceVariant looks for the supplied text with per-line whitespace
+// normalised away, returning the line and the file's actual text.
 func findWhitespaceVariant(text, old string) (line int, actual string, ok bool) {
 	textLines := strings.Split(text, "\n")
 	oldLines := strings.Split(strings.TrimSuffix(old, "\n"), "\n")
@@ -216,9 +203,8 @@ func findWhitespaceVariant(text, old string) (line int, actual string, ok bool) 
 	return 0, "", false
 }
 
-// findAnchorLine locates the first non-blank line of old_string in the file,
-// when it occurs exactly once. A unique anchor tells the model where it was
-// aiming even though the block as a whole did not match.
+// findAnchorLine locates the first non-blank line of old_string when it occurs
+// exactly once, telling the model where it was aiming.
 func findAnchorLine(text, old string) (int, bool) {
 	var anchor string
 	for _, l := range strings.Split(old, "\n") {
@@ -276,8 +262,7 @@ func excerpt(text string, startLine, n int) string {
 	return strings.TrimSuffix(b.String(), "\n")
 }
 
-// contextAround shows the edited region so the model can confirm the result
-// without spending another read call.
+// contextAround shows the edited region, saving a confirmation read.
 func contextAround(text, needle string) string {
 	idx := strings.Index(text, needle)
 	if idx < 0 {

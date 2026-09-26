@@ -11,9 +11,8 @@ import (
 	"ai-code/internal/provider"
 )
 
-// noNetClient stands in for a provider and fails the test if Tab so much as
-// asks it a question. Completion is a keystroke: it reads the on-disk
-// catalogue or it offers nothing.
+// noNetClient fails the test if completion so much as asks the provider a
+// question: Tab reads the on-disk catalogue or it offers nothing.
 type noNetClient struct {
 	t     *testing.T
 	name  string
@@ -51,8 +50,7 @@ func modelApp(t *testing.T, class provider.Class, noCloud bool, ids ...string) *
 	}
 }
 
-// Slash-command completion is the behaviour that already existed and must not
-// change: candidates carry the leading slash and a trailing space.
+// Command completion: candidates carry the leading slash and a trailing space.
 func TestCommandCompletionUnchanged(t *testing.T) {
 	a := &App{}
 
@@ -77,8 +75,8 @@ func TestCommandCompletionUnchanged(t *testing.T) {
 }
 
 // Model ids differ at the end -- quantisation, size, a :variant -- so the
-// common prefix is what a first Tab can safely insert, and the list is what
-// the second one has to show.
+// common prefix is what a first Tab inserts and the list is what the second
+// shows.
 func TestModelCompletionStopsAtTheSuffixDivergence(t *testing.T) {
 	a := modelApp(t, provider.ClassOnPrem, false,
 		"qwen3-coder-30b:free", "qwen3-coder-30b:nitro", "qwen3-coder-7b", "llama-3-8b")
@@ -114,8 +112,8 @@ func TestModelCompletionListsEverythingForABareCommand(t *testing.T) {
 	}
 }
 
-// A cold cache completes nothing and says nothing. The alternative -- fetching
-// the catalogue on Tab -- is a keystroke that sometimes takes a second.
+// Fetching the catalogue on Tab would make a keystroke take a second, so a
+// cold cache completes nothing.
 func TestModelCompletionIsSilentOnAColdCache(t *testing.T) {
 	a := modelApp(t, provider.ClassOnPrem, false)
 	if _, got := a.complete("/model q"); got != nil {
@@ -123,8 +121,8 @@ func TestModelCompletionIsSilentOnAColdCache(t *testing.T) {
 	}
 }
 
-// Under .nocloud a cloud model name must never be offered. Listing one and
-// refusing it afterwards would still put the name on the screen as a choice.
+// Under .nocloud a cloud model must never be offered: listing one is already
+// showing it as a choice.
 func TestNoCloudHidesCloudModelsEntirely(t *testing.T) {
 	a := modelApp(t, provider.ClassCloud, true, "gpt-secret-1", "gpt-secret-2")
 	_, got := a.complete("/model ")
@@ -136,7 +134,7 @@ func TestNoCloudHidesCloudModelsEntirely(t *testing.T) {
 	}
 
 	// The same cache on an on-premises provider still completes, so the test
-	// above is about the marker and not about an empty cache.
+	// above is about the marker, not an empty cache.
 	a.noCloud = false
 	a.client = &noNetClient{t: t, name: "testprov", class: provider.ClassOnPrem}
 	if _, got := a.complete("/model gpt"); len(got) != 2 {
@@ -182,9 +180,8 @@ func TestPathCompletion(t *testing.T) {
 		{"dotfiles need the dot", "no", 0, []string{"notes.md"}},
 		{"dotfiles appear once asked for", ".hid", 0, []string{".hidden"}},
 		{"an empty line lists the working directory", "", 0, []string{"internal/", "notes.md"}},
-		// The decision, pinned: Tab after a trailing space lists too. It is the
-		// same keystroke at the same place in a word, and it may not depend on
-		// whether prose happens to precede it.
+		// Tab after a trailing space lists too: the same keystroke in the same
+		// place in a word may not depend on whether prose precedes it.
 		{"an empty word mid-line lists it too", "please look at ", 15, []string{"internal/", "notes.md"}},
 	}
 	for _, tc := range cases {
@@ -225,8 +222,8 @@ func commonPrefixOf(ss []string) string {
 	return p
 }
 
-// The two near-empty lines must not be confused for one another: a bare prompt
-// is a directory listing, a bare slash is still the command list.
+// A bare prompt is a directory listing, a bare slash is still the command
+// list.
 func TestBareSlashStaysACommandList(t *testing.T) {
 	root := completeTree(t)
 	a := &App{cwd: root, projectRoot: root}
@@ -247,8 +244,8 @@ func TestBareSlashStaysACommandList(t *testing.T) {
 	}
 }
 
-// A directory that cannot be read completes nothing. Tab is a keystroke: the
-// only thing worse than no candidates is an error printed over the prompt.
+// Tab is a keystroke; an error printed over the prompt is worse than no
+// candidates.
 func TestUnreadableDirectoryCompletesNothing(t *testing.T) {
 	root := completeTree(t)
 

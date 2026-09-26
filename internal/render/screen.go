@@ -1,18 +1,9 @@
 // Package render turns the agent's event stream into terminal output.
 //
-// The central constraint: everything that reaches the scrollback buffer is
-// written exactly once and never revised. ai-code does not use the alternate
-// screen, never enables mouse reporting, and never redraws text that has
-// already scrolled. That is what keeps the terminal's own search, selection and
-// copy working, and it is why the renderer is built around committing whole
-// lines rather than around a screen it owns.
-//
-// Two zones exist:
-//
-//	committed  - real scrollback. Written once, styled, never touched again.
-//	transient  - the last few lines: the line currently streaming, and the
-//	             status line. Redrawn freely, and always erased before anything
-//	             is committed, so it never ends up in the scrollback.
+// Committed output is written once and never revised, so the terminal's own
+// search, selection and copy keep working. The transient zone -- the streaming
+// line and the status line -- is redrawn freely and always erased before the
+// next commit.
 package render
 
 import (
@@ -49,11 +40,10 @@ type Screen struct {
 	fd     int
 
 	// transient counts the physical lines currently drawn below the committed
-	// output. Every transient line is truncated to the terminal width so that
-	// this count cannot be thrown off by wrapping.
+	// output. Every transient line is truncated to one row so the count stays
+	// exact.
 	transient int
-	// atLineStart tracks whether the cursor sits in column zero of a fresh
-	// committed line.
+	// atLineStart tracks whether the cursor sits in column zero of a fresh line.
 	atLineStart bool
 }
 
@@ -97,17 +87,16 @@ func (s *Screen) Width() int {
 }
 
 // Height is the number of rows the terminal has. The transient zone is bounded
-// by it: a zone taller than the screen cannot be erased, because the cursor
-// cannot walk back up past rows that have already scrolled away.
+// by it: a taller zone cannot be erased, because the cursor cannot walk back up
+// past rows that have scrolled away.
 func (s *Screen) Height() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.height
 }
 
-// Resize updates the known width. Only the transient zone is affected;
-// committed text is left for the terminal to reflow, which it does natively
-// and which is the entire advantage of not owning the screen.
+// Resize updates the known width. Committed text is left for the terminal to
+// reflow, which is the advantage of not owning the screen.
 func (s *Screen) Resize() {
 	if s.fd < 0 {
 		return
@@ -122,12 +111,9 @@ func (s *Screen) Resize() {
 	}
 }
 
-// Commit writes one finished line to the scrollback.
-//
-// The line is emitted with trailing whitespace stripped and an explicit SGR
-// reset before the newline. Both matter for selection: a coloured trailing
-// space is invisible on screen but lands in the clipboard, and an unterminated
-// colour run bleeds into whatever the user pastes.
+// Commit writes one finished line to the scrollback, with trailing whitespace
+// stripped and an SGR reset before the newline: a coloured trailing space lands
+// in the clipboard, and an open colour run bleeds into a paste.
 func (s *Screen) Commit(line string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -151,8 +137,8 @@ func (s *Screen) commitLocked(line string) {
 	line = strings.TrimRight(line, " \t")
 	s.w.WriteString(line)
 	// Close any run the line left open, so styling never bleeds past the
-	// newline. Already-closed lines get nothing appended, which keeps the
-	// committed bytes minimal and the golden tests meaningful.
+	// newline; closed lines get nothing appended, which keeps the committed
+	// bytes minimal.
 	if s.color && HasOpenSGR(line) {
 		s.w.WriteString(sgrReset)
 	}
@@ -161,16 +147,14 @@ func (s *Screen) commitLocked(line string) {
 }
 
 // SetTransient replaces the transient zone. Lines are flattened to a single
-// physical row each and truncated to the terminal width, so the wrap count
-// stays predictable.
+// physical row each and truncated, so the wrap count stays predictable.
 func (s *Screen) SetTransient(lines ...string) {
 	s.setTransient(-1, lines)
 }
 
 // SetTransientCursor is SetTransient with the cursor parked at a given column
-// of the last line rather than after its final character. The steering prompt
-// needs it: without it the cursor sits at the end of the line whatever the user
-// has done with the arrow keys, and editing anywhere but the end is blind.
+// of the last line, which the steering prompt needs: otherwise the cursor sits
+// at the end whatever the arrow keys have done, and editing is blind.
 func (s *Screen) SetTransientCursor(col int, lines ...string) {
 	s.setTransient(col, lines)
 }
@@ -180,8 +164,8 @@ func (s *Screen) setTransient(cursorCol int, lines []string) {
 	defer s.mu.Unlock()
 
 	if !s.isTTY {
-		// Without a terminal there is nowhere to redraw. Transient content is
-		// simply dropped, which is what a pipe or a CI log should receive.
+		// Without a terminal there is nowhere to redraw; transient content is
+		// dropped, which is what a pipe or a CI log should receive.
 		return
 	}
 	s.eraseTransientLocked()
@@ -265,15 +249,9 @@ func (s *Screen) Flush() {
 	s.w.Flush()
 }
 
-// truncateVisible shortens a string to n columns, ignoring ANSI escape
-// sequences when counting and closing any open sequence at the cut.
-//
-// Columns, not runes. A transient line is truncated so that it occupies one
-// physical row, and that guarantee is what lets eraseTransient know how far to
-// move the cursor up. Counting runes breaks it for exactly the text the
-// thinking line carries most often -- CJK, emoji, box drawing -- because those
-// runes are two columns wide, so a "79 rune" line lands in column 100 and
-// wraps.
+// truncateVisible shortens a string to n columns, ignoring ANSI escapes and
+// closing any open sequence at the cut. Columns, not runes: wide runes are two
+// columns, and a line truncated by rune count wraps, which breaks the erase.
 func truncateVisible(s string, n int) string {
 	if n <= 0 {
 		return ""
@@ -333,18 +311,9 @@ func isEscFinal(r rune) bool {
 	return r == 'm' || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z')
 }
 
-// flattenTransient makes a string safe to place in the transient zone.
-//
-// Every transient line must occupy exactly one physical row, because the erase
-// that precedes the next commit walks up a counted number of rows. A newline
-// splits the row in two and the erase then misses the top half, stranding it in
-// the scrollback -- which is how a thinking trace containing code ends up
-// printed permanently, a fragment at a time, between the lines it was meant to
-// be scrolling behind. A tab is worse than a newline here rather than better:
-// it is one rune that renders as up to eight columns, so it defeats the width
-// arithmetic without being visible in the string at all.
-//
-// SGR sequences are kept: they are the styling, and they cost no columns.
+// flattenTransient folds a string onto one physical row, because the erase walks
+// up a counted number of rows; newlines and tabs become spaces. SGR sequences
+// cost no columns and are kept.
 func flattenTransient(s string) string {
 	if strings.IndexFunc(s, isTransientUnsafe) < 0 {
 		return s
@@ -377,21 +346,16 @@ func isTransientUnsafe(r rune) bool {
 	return r != 0x1b && (r < 0x20 || r == 0x7f)
 }
 
-// runeWidth returns the number of columns a rune occupies.
-//
-// This is wcwidth, cut down to what a terminal renderer actually needs:
-// combining marks take no space of their own, the East Asian wide and
-// fullwidth blocks take two, and everything else takes one. It does not try to
-// resolve emoji ZWJ sequences -- no terminal agrees on those anyway -- and it
-// is deliberately conservative, because over-counting truncates a line early
-// while under-counting wraps it, and only one of those corrupts the display.
+// runeWidth returns the number of columns a rune occupies: combining marks take
+// none, East Asian wide and fullwidth blocks take two, everything else one. It
+// does not resolve emoji ZWJ sequences, where terminals disagree anyway.
 func runeWidth(r rune) int {
 	switch {
 	case r == 0:
 		return 0
 	case r < 0x20 || r == 0x7f:
-		// Controls never reach here from the transient path (flattenTransient
-		// removes them) but committed text is measured too.
+		// Controls never reach here from the transient path, but committed
+		// text is measured too.
 		return 0
 	case r < 0x7f:
 		return 1

@@ -18,21 +18,10 @@ import (
 const swapPollInterval = 500 * time.Millisecond
 
 // announceSwap tells the other windows that this one is about to load a
-// different model, and waits for any that need to save themselves first.
-//
-// There is no confirmation. The user typed /model X and their intent is not
-// in doubt; peers report what they are doing, they do not vote. The only
-// decision left is whether to keep waiting, and Ctrl-C on an empty line ends
-// that, as it ends every other wait in this harness.
-//
-// The wait is not modal. Typing during it is queued and runs on the new model
-// once it loads, which is what typing after /model X meant.
+// different model, and waits for any that need to save themselves first. The
+// wait is not modal: typing during it is queued and runs once the model loads.
 func (a *App) announceSwap(parent context.Context, client provider.Client, into provider.ModelInfo, window int) {
-	// The terminal is opened first and closed last, around everything: the
-	// wait for peers and the load itself. Loading is the slow half -- minutes
-	// on a large model -- so opening it only for the wait, as an earlier
-	// version did by letting defers unwind in the wrong order, meant typing
-	// was possible for the fast part and not the slow one.
+	// The terminal is opened first and closed last, around wait and load.
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	stopSteering := a.steerWith(cancel, a.queuePrompt)
@@ -42,27 +31,22 @@ func (a *App) announceSwap(parent context.Context, client provider.Client, into 
 	if a.model.ID != into.ID {
 		a.waitForPeers(ctx, into, window)
 	}
-	// After the wait, and before the announcement is withdrawn: peers stay
-	// out of the way until the weights are actually in place.
+	// After the wait, before the announcement is withdrawn: peers stay out of
+	// the way until the weights are in place.
 	a.loadModel(ctx, client, into)
 }
 
-// waitForPeers holds the swap until every other session on this model has
-// done whatever it needed to before losing it.
+// waitForPeers holds the swap until every peer has saved itself.
 func (a *App) waitForPeers(ctx context.Context, into provider.ModelInfo, window int) {
-	// Publishing the announcement and reading who has to act on it are one
-	// decision. Split them and a session can mark itself working in the gap,
-	// after this has already decided nobody was.
+	// Publishing the announcement and reading who must act are one decision.
 	var (
 		notice *coord.Announcement
 		err    error
 		peers  []coord.Peer
 	)
 	_ = coord.Decide(a.coordDir, func() {
-		// The intent is recorded here, before the weights move. Every other
-		// window then names the incoming model on anything it sends during
-		// the load, which the server queues behind the load rather than
-		// answering by dragging the old model back.
+		// The intent is recorded before the weights move, so other windows
+		// name the incoming model and the server queues their sends behind it.
 		_ = coord.SetIntent(a.coordDir, into.ID)
 		coord.Trace("intent: %s -> %s", a.model.ID, into.ID)
 
@@ -91,9 +75,8 @@ func (a *App) waitForPeers(ctx context.Context, into provider.ModelInfo, window 
 
 		select {
 		case <-ctx.Done():
-			// No clock bounds this wait: a session mid-turn on a slow model
-			// can take minutes, and cutting it off destroys the work the
-			// waiting exists to protect. Ending it is the user's call.
+			// No clock bounds this wait: only Ctrl-C ends it, and cutting it
+			// off can destroy work.
 			a.note(fmt.Sprintf("Loading %s without waiting for %s.",
 				into.ID, listPeers(unfinished)))
 			return
@@ -102,8 +85,7 @@ func (a *App) waitForPeers(ctx context.Context, into provider.ModelInfo, window 
 	}
 }
 
-// describeWaiting is the one line shown while a swap waits, naming each
-// session by directory and what it is doing.
+// describeWaiting is the one line shown while a swap waits.
 func describeWaiting(peers []coord.Peer) string {
 	parts := make([]string, 0, len(peers))
 	for _, p := range peers {
@@ -117,24 +99,19 @@ func describeWaiting(peers []coord.Peer) string {
 }
 
 // status puts one line in the transient zone, replacing whatever was there.
-// Empty clears it. Nothing reaches the scrollback.
 func (a *App) status(text string) {
 	if a.interactive != nil {
 		a.interactive.SetNotice(text)
 	}
 }
 
-// loadModel loads the weights, so that /model X means the model has changed
-// rather than that the next request will change it.
-//
-// Without this the swap is only a note to self: lemonade loads on demand, so
-// the eviction the other windows were just warned about would happen at some
-// unrelated later moment, after the warning had been withdrawn.
+// loadModel loads the weights, so /model X means the model has changed rather
+// than that the next request will. Lemonade loads on demand, which would defer
+// the eviction peers were warned about to an unrelated later moment.
 func (a *App) loadModel(ctx context.Context, client provider.Client, into provider.ModelInfo) {
 	in, ok := client.(provider.Introspector)
 	if !ok {
-		// Nothing to load explicitly: this backend serves whatever is named
-		// on the request itself.
+		// Nothing to load explicitly: the request names the model.
 		return
 	}
 	a.status("loading " + into.ID)
@@ -148,8 +125,7 @@ func (a *App) loadModel(ctx context.Context, client provider.Client, into provid
 	coord.Trace("loaded %s", into.ID)
 }
 
-// listPeers names sessions by directory, which is how a person tells one
-// window from another.
+// listPeers names sessions the way a person tells one window from another.
 func listPeers(peers []coord.Peer) string {
 	names := make([]string, 0, len(peers))
 	for _, p := range peers {
@@ -164,23 +140,9 @@ func listPeers(peers []coord.Peer) string {
 	return strings.Join(names[:len(names)-1], ", ") + " and " + names[len(names)-1]
 }
 
-// prepareForSwap is what a session does when another window announces it is
-// taking the model.
-//
-// Usually nothing. A session whose conversation still fits the incoming
-// window simply continues on the new model, so there is nothing to save and
-// nothing to protect. The one case that needs work is a conversation too big
-// for the new window: without a summary written now, while the old model is
-// still loaded, that session is stranded, because summarising later needs
-// the model that is about to go.
-//
-// Called only where a summary can actually be written: between turns, and at
-// the boundary at the end of one. Never during, because summarising is
-// itself a request and the model is busy with the turn.
-//
-// editor, when non-nil, is the live prompt this is running underneath: its
-// line has to be lifted out of the way before anything is written, or the
-// output lands in the middle of what is being typed.
+// prepareForSwap writes a summary when another window is about to take the
+// model and this conversation will not fit the incoming window. Called only
+// between turns, where a summary can be written.
 func (a *App) prepareForSwap(ctx context.Context, editor *ui.Editor) {
 	say := func(line string) {
 		if editor != nil {
@@ -197,11 +159,8 @@ func (a *App) prepareForSwap(ctx context.Context, editor *ui.Editor) {
 		}
 		return
 	}
-	// Answered on the strength of there being an announcement, not on which
-	// model this session currently thinks it is on. It may already have
-	// adopted the incoming one -- the intent is published before the load --
-	// and a check against the current model would then skip the save for a
-	// conversation that still needs it.
+	// Answered on the announcement alone: this session may already have adopted
+	// the incoming model, so a check against the current one would skip a save.
 	if a.peers.Self().State == coord.StateReady {
 		return
 	}
@@ -225,15 +184,11 @@ func (a *App) prepareForSwap(ctx context.Context, editor *ui.Editor) {
 	say("Summary written before " + a.model.ID + " was unloaded.")
 }
 
-// strandedBy reports whether losing the current model for one with this
-// window would leave the session unable to continue.
-//
-// A summary already in hand counts: assembly falls back to it, so the
-// session is fine even though the raw transcript is too big.
+// strandedBy reports whether losing the current model would leave the session
+// unable to continue. A standby summary counts: assembly falls back to it.
 func (a *App) strandedBy(intoWindow int) bool {
 	if intoWindow <= 0 {
-		// Whether it fits cannot be decided, and saving is the recoverable
-		// mistake of the two.
+		// Whether it fits cannot be decided; saving is the recoverable mistake.
 		return true
 	}
 	if summary, _ := a.agent.Summary(); summary != "" {
@@ -243,23 +198,15 @@ func (a *App) strandedBy(intoWindow int) bool {
 }
 
 // adoptModelChange notices that the loaded model is no longer this session's
-// and carries on with the new one. It reports whether anything changed.
-//
-// It neither waits nor reloads. Reloading is the eviction that starts the
-// swap-per-turn thrash; waiting strands a session behind a decision the user
-// already made in another window. What it changed is said by the prompt,
-// which names the model until that model has answered here -- so the change
-// is visible before a prompt is composed rather than underneath the reply to
-// one.
+// and carries on with the new one, reporting whether anything changed. It
+// neither waits nor reloads: reloading is the eviction that starts the thrash.
 func (a *App) adoptModelChange(ctx context.Context, editor *ui.Editor) bool {
 	in, ok := a.client.(provider.Introspector)
 	if !ok {
 		return false
 	}
 
-	// The health question is short and is allowed to be bounded: a server
-	// that cannot say what is loaded within a few seconds is busy loading
-	// something, which is itself the answer.
+	// Bounded: a server slow to say what is loaded is busy loading.
 	probe, cancel := context.WithTimeout(ctx, checkpointProbeTimeout)
 	h, err := in.Health(probe)
 	cancel()
@@ -272,15 +219,8 @@ func (a *App) adoptModelChange(ctx context.Context, editor *ui.Editor) bool {
 	}
 	coord.Trace("adopt: loaded=%s, this session wants %s", h.ModelLoaded, a.model.ID)
 
-	// The catalogue is not bounded by that budget, and failing to read it is
-	// not a reason to carry on believing a model that is not loaded.
-	//
-	// It used to share the three-second probe with the health call, on a
-	// path that runs precisely while the server is busiest -- mid-load of
-	// somebody else's model. Timing out left the session still naming the
-	// old model, and its next request loaded that model straight back: the
-	// churn, caused by the code meant to prevent it, and silent because the
-	// error was discarded.
+	// The catalogue is not bounded by that budget: a failed read is no reason
+	// to keep naming a model that is not loaded.
 	loaded := provider.ModelInfo{ID: h.ModelLoaded}
 	if models, err := a.client.Models(ctx); err == nil {
 		for _, m := range models {
@@ -296,8 +236,7 @@ func (a *App) adoptModelChange(ctx context.Context, editor *ui.Editor) bool {
 
 	limit, _ := contextLimitFor(loaded, a.cfg.Agent.ContextOverride)
 	if limit <= 0 {
-		// Nothing known about the new model's window. Keep the one in force
-		// rather than dropping to a default that may be wildly wrong.
+		// Window unknown: keep the one in force rather than a bad default.
 		limit = a.agent.Window()
 	}
 	a.model = loaded
@@ -309,14 +248,8 @@ func (a *App) adoptModelChange(ctx context.Context, editor *ui.Editor) bool {
 	return true
 }
 
-// showModelChange shows the difference between what the scrollback says this
-// session is on and what is actually loaded.
-//
-// That one comparison covers every case rather than a list of them. Three
-// changes before a single prompt are one difference, so the line is
-// rewritten in place rather than appended. A change and a change back is no
-// difference, so the line is blanked. A session that has sent nothing still
-// reports, because its banner made a claim that is no longer true.
+// showModelChange shows the difference between the scrollback's model and the
+// loaded one: rewritten in place before a prompt, or blanked when they cancel.
 func (a *App) showModelChange(editor *ui.Editor) {
 	line := a.modelChangeLine()
 
@@ -324,16 +257,14 @@ func (a *App) showModelChange(editor *ui.Editor) {
 		editor.SetHeader(line, a.promptString())
 		return
 	}
-	// No prompt to sit above: this is the guard before a send, so the line
-	// goes straight into the scrollback and becomes what it says.
+	// No prompt to sit above: this guards a send, so the line enters scrollback.
 	if line != "" {
 		a.out(line)
 		a.knownModel = a.model.ID
 	}
 }
 
-// modelChangeLine is the difference between what the scrollback says and
-// what is loaded, or "" when there is none.
+// modelChangeLine reports that difference, or "" when there is none.
 func (a *App) modelChangeLine() string {
 	if a.knownModel == "" || a.model.ID == a.knownModel {
 		return ""
@@ -354,17 +285,11 @@ func describePeers(peers []coord.Peer) string {
 	return fmt.Sprintf("%d other sessions", len(peers))
 }
 
-// stopForSwap is consulted between loop iterations. It reports whether this
-// run should end so another window can have the model.
-//
-// A long agentic run is the case that needs it: waiting for the run to
-// finish means waiting for the model to decide it is done, which may be an
-// hour of tool calls away, and the window that asked for the model is
-// blocked the whole time. Stopping at a boundary leaves a well-formed
-// conversation that the next prompt continues from.
+// stopForSwap is consulted between loop iterations and reports whether this
+// run should end so another window can have the model. Stopping at a boundary
+// leaves a well-formed conversation the next prompt continues from.
 func (a *App) stopForSwap(ctx context.Context) bool {
-	// Commands typed during the turn run here too, in the order they were
-	// typed, alongside the steering the loop has already folded in.
+	// Commands typed during the turn run here too, in the order they were typed.
 	stop := a.runQueuedCommands(ctx)
 
 	notice, ok := coord.PendingSwap(a.coordDir)
@@ -379,39 +304,22 @@ func (a *App) stopForSwap(ctx context.Context) bool {
 	return true
 }
 
-// claimModel is what a session does immediately before sending: under the
-// same lock a swap decides with, take what is loaded and declare itself
-// working on it.
-//
-// The declaration is the point. A swap that reads the session list after
-// this sees a session in flight and waits for it; a swap that got there
-// first has published an announcement this sees, and the send yields to it
-// instead of racing. Either order is correct, and there is no third.
+// claimModel takes what is loaded and declares this session working on it,
+// under the same lock a swap decides with. Either a swap sees this session and
+// waits, or the announcement is seen here and the send yields.
 func (a *App) claimModel(ctx context.Context) {
 	for {
 		yield, waitingFor := false, ""
 		_ = coord.Decide(a.coordDir, func() {
-			// Any announcement at all holds this back, not just one naming
-			// the model this session is on. Between the announcement and the
-			// load there is a window in which the weights have not moved
-			// yet: a request sent into it is answered by loading whatever it
-			// names, right now, which is either the outgoing model coming
-			// back or the incoming one arriving before the sessions using
-			// the old one have saved themselves.
-			//
-			// So the prompt waits, exactly as a run stopped at a turn
-			// boundary waits, and goes out once the model it expects is
-			// there.
+			// Any announcement holds this back: before the load lands, a request
+			// sent now loads whatever it names.
 			if n, ok := coord.PendingSwap(a.coordDir); ok {
 				coord.Trace("claim: holding, pid=%d is loading %s", n.PID, n.Into)
 				yield, waitingFor = true, n.Into
 				return
 			}
 			if !a.adoptIntended(nil) {
-				// Nothing has recorded a load yet, so this session's own
-				// request is about to become one -- lemonade loads whatever
-				// a request names. Saying so now, under the lock, is what
-				// makes the next window's decision correct.
+				// No load recorded yet, so record this session's intent.
 				if _, known := coord.CurrentIntent(a.coordDir); !known {
 					_ = coord.SetIntent(a.coordDir, a.model.ID)
 					coord.Trace("claim: first use, recording %s as the intent", a.model.ID)
@@ -434,8 +342,8 @@ func (a *App) claimModel(ctx context.Context) {
 	}
 }
 
-// awaitSwap waits for the announcement to be withdrawn, which happens once
-// the weights are in place. It reports whether it is worth looking again.
+// awaitSwap waits for the announcement to be withdrawn, once the weights are in
+// place.
 func (a *App) awaitSwap(ctx context.Context) bool {
 	for {
 		if _, ok := coord.PendingSwap(a.coordDir); !ok {
@@ -450,18 +358,8 @@ func (a *App) awaitSwap(ctx context.Context) bool {
 }
 
 // modelWentAway reports whether the model this run has been using is still
-// the one loaded.
-//
-// A turn claims the model once, before its first request. A run with tool
-// calls makes many more after that, and between any two of them the weights
-// can change -- a load queued behind the first request completing while the
-// second is being prepared, or something outside ai-code entirely. Sending
-// the next request anyway is what makes the server load the old model back,
-// evicting whatever replaced it: churn caused by this session, several
-// requests after it last looked.
-//
-// Checked at the loop boundary because that is where the run can stop and
-// leave a conversation worth continuing.
+// the one loaded. The claim is made once per turn, but a run sends many
+// requests, and sending again after a change loads the old model back.
 func (a *App) modelWentAway(ctx context.Context) bool {
 	in, ok := a.client.(provider.Introspector)
 	if !ok {
@@ -481,10 +379,9 @@ func (a *App) modelWentAway(ctx context.Context) bool {
 	return true
 }
 
-// adoptIntended moves this session onto the model this user last asked for,
-// in whichever window they asked. It reads one local file and makes no
-// network call, which is what lets it be right while the server is busy
-// loading and slowest to answer.
+// adoptIntended moves this session onto the model last asked for in any
+// window. One local file, no network call, so it works while the server is
+// busy loading.
 func (a *App) adoptIntended(editor *ui.Editor) bool {
 	l, ok := coord.CurrentIntent(a.coordDir)
 	if !ok || l.Model == a.model.ID {
@@ -496,8 +393,8 @@ func (a *App) adoptIntended(editor *ui.Editor) bool {
 	return true
 }
 
-// adoptLoaded points this session at a model by name, filling in what it can
-// about the window from the catalogue but never depending on being able to.
+// adoptLoaded points this session at a model by name, filling in its window
+// from the catalogue where it can.
 func (a *App) adoptLoaded(id string, editor *ui.Editor) {
 	loaded := provider.ModelInfo{ID: id}
 	if models, err := a.client.Models(context.Background()); err == nil {
@@ -510,9 +407,7 @@ func (a *App) adoptLoaded(id string, editor *ui.Editor) {
 	}
 	limit, _ := contextLimitFor(loaded, a.cfg.Agent.ContextOverride)
 	if loaded.ContextWindow <= 0 && a.cfg.Agent.ContextOverride <= 0 {
-		// The catalogue was unreadable, so contextLimitFor fell back to its
-		// unknown-window default. Keeping the window already in force is the
-		// better guess: it at least belonged to a real model on this server.
+		// Catalogue unreadable: the window in force beats the unknown default.
 		if current := a.agent.Window(); current > 0 {
 			limit = current
 		}

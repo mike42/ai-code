@@ -11,13 +11,8 @@ import (
 	"ai-code/internal/tool"
 )
 
-// WorkerSystemPrompt is what a worker is told it is.
-//
-// It asks for findings rather than conclusions because the parent has the
-// conversation and this one does not: a worker that decides what matters
-// discards the context needed to judge that. It is told it cannot be reached
-// because it cannot -- the brief is the whole of what it will ever be given,
-// and a worker that stops to ask a question has stopped for good.
+// WorkerSystemPrompt is what a worker is told it is: a job with no one to ask,
+// reporting findings rather than conclusions.
 const WorkerSystemPrompt = `You are a worker agent carrying out one job for another agent.
 
 Your brief is everything you will be given. Nobody can answer a question or
@@ -94,12 +89,9 @@ does not overlap the others or what you are doing yourself.
 
 Do not use it for something you can finish in one or two tool calls.`
 
-// TaskExecutor adds the task tool to an executor.
-//
-// It is a wrapper rather than an ordinary tool because a worker needs the
-// agent, and tools are held to the other side of a boundary that exists so
-// they can run in a container or over SSH. Keeping the one tool that cannot
-// cross it here keeps that boundary true of everything in internal/tool.
+// TaskExecutor adds the task tool to an executor. It is a wrapper rather than
+// an ordinary tool because a worker needs the agent, and tools live on the far
+// side of the container/SSH boundary; the one that cannot cross stays here.
 type TaskExecutor struct {
 	inner tool.Executor
 
@@ -112,13 +104,9 @@ func NewTaskExecutor(inner tool.Executor) *TaskExecutor {
 	return &TaskExecutor{inner: inner}
 }
 
-// Attach supplies the agent whose children this will spawn, and the context
-// those children live under. Until it is called the task tool does not exist,
-// which is what the agent's own construction order requires.
-//
-// The context is the session's, not a turn's. A worker outlives the tool call
-// that started it, so a turn-scoped context would cancel every worker at the
-// end of the turn that asked for one.
+// Attach supplies the agent whose children this will spawn, and the session
+// context those children run under. The context is the session's, not a
+// turn's: a worker outlives the tool call that started it.
 func (t *TaskExecutor) Attach(ctx context.Context, parent *Agent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -126,22 +114,17 @@ func (t *TaskExecutor) Attach(ctx context.Context, parent *Agent) {
 	t.pool = NewWorkers(ctx)
 }
 
-// Pool is the set of running workers, for a caller that shows them or stops
-// them. Nil until Attach.
+// Pool is the set of running workers; nil until Attach.
 func (t *TaskExecutor) Pool() *Workers {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.pool
 }
 
-// Unwrapped is the executor without the task tool, which is what a child is
-// given. A worker that could spawn workers would need a depth counter; not
-// handing it the tool needs nothing.
+// Unwrapped is the executor without the task tool, which is what a child is given.
 func (t *TaskExecutor) Unwrapped() tool.Executor { return t.inner }
 
-// Fork forks what is underneath and does not re-wrap it, for the same reason
-// Unwrapped exists: the thing being forked is about to become a worker, and a
-// worker does not get the task tool.
+// Fork forks what is underneath and does not re-wrap it, so a worker never gets the task tool.
 func (t *TaskExecutor) Fork() (tool.Executor, error) { return t.inner.Fork() }
 
 func (t *TaskExecutor) agent() *Agent {
@@ -150,13 +133,9 @@ func (t *TaskExecutor) agent() *Agent {
 	return t.parent
 }
 
-// available reports whether the task tool may be offered at all.
-//
-// Never on a cloud provider. A sub-agent is spawned by the model rather than
-// by the user, so a cloud-backed one would send a prompt and a codebase to a
-// third party on the model's initiative. The tool is absent from the schema
-// rather than refused when called: a refusal is still a decision the model
-// gets to make, and this one is not its to make.
+// available reports whether the task tool may be offered at all. Never on a
+// cloud provider: a worker's prompt and codebase must not reach a third party
+// on the model's initiative. Absent from the schema rather than refused.
 func (t *TaskExecutor) available() bool {
 	a := t.agent()
 	return a != nil && a.client != nil && a.client.Class() != provider.ClassCloud
@@ -185,14 +164,7 @@ func (t *TaskExecutor) Execute(ctx context.Context, req tool.Request) (tool.Resu
 	return t.runWorker(ctx, req), nil
 }
 
-// SetProgress passes the progress callback through to the executor being
-// wrapped.
-//
-// Every optional interface a wrapper does not forward is a feature that
-// silently stops working. This one cost a user five minutes of watching a
-// container build with nothing on screen but a spinner: main.go asks the
-// executor whether it reports progress, and by then the executor is this
-// wrapper, which did not.
+// SetProgress passes the progress callback through to the executor being wrapped.
 func (t *TaskExecutor) SetProgress(p tool.Progress) {
 	if pr, ok := t.inner.(tool.ProgressReporter); ok {
 		pr.SetProgress(p)
@@ -229,10 +201,8 @@ func (t *TaskExecutor) runWorker(ctx context.Context, req tool.Request) tool.Res
 
 	parent := t.agent()
 
-	// Unset inherits the session's level, which is the rule that needs no
-	// per-model knowledge and no default anyone has to remember: a worker
-	// thinks as hard as the conversation that sent it, unless the caller says
-	// otherwise about this particular question.
+	// Unset inherits the session's level: a worker thinks as hard as the
+	// conversation that sent it.
 	effort := parent.Effort()
 	if strings.TrimSpace(args.Thinking) != "" {
 		e, err := provider.ParseEffort(args.Thinking)
@@ -291,11 +261,8 @@ func (t *TaskExecutor) runWorker(ctx context.Context, req tool.Request) tool.Res
 	}
 }
 
-// frameReport is how a worker's answer re-enters the parent conversation.
-//
-// Tagged rather than bare because it arrives through the same door as a
-// message the user typed, and a report the model reads as the user speaking
-// is one it will answer instead of act on.
+// frameReport is how a worker's answer re-enters the parent conversation,
+// tagged so the model does not read it as a typed message.
 func frameReport(w *Worker, rep Report) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "<worker-report id=%q label=%q turns=%q", fmt.Sprint(w.ID), w.Label,

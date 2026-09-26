@@ -10,13 +10,9 @@ import (
 	"ai-code/internal/ui"
 )
 
-// wireWorkers connects the worker pool to the terminal.
-//
-// A worker's findings reach the conversation on their own, through the same
-// queue a message typed mid-turn uses; this is only about what the person
-// sees. The two are deliberately separate: the model is told by the queue
-// whether or not anyone is watching, and a piped session with no prompt still
-// works.
+// wireWorkers connects the worker pool to the terminal. Reports reach the
+// conversation through the steer queue whether or not anything is watching;
+// this only wires the display.
 func (a *App) wireWorkers() {
 	if a.workers == nil {
 		return
@@ -38,12 +34,9 @@ func (a *App) liveEditor() *ui.Editor {
 	return a.editor
 }
 
-// showWorkerReport puts a finished worker into the scrollback.
-//
-// Only when the prompt is up. While a turn is running the renderer's
-// transient zone has one owner and this goroutine is not it; the report is
-// announced there by the steer event that folds it in, which the agent emits
-// from its own loop where writing is safe.
+// showWorkerReport puts a finished worker into the scrollback. It writes only
+// when the prompt is up: the transient zone has one owner, and mid-turn the
+// report is announced by the steer event instead.
 func (a *App) showWorkerReport(rep agent.Report) {
 	ed := a.liveEditor()
 	if ed == nil || a.isSteering() {
@@ -76,11 +69,8 @@ func (a *App) refreshWorkerLine() {
 	}
 }
 
-// workerMarker is what the prompt says about workers running behind it.
-//
-// On the prompt rather than in the header line: the header already belongs to
-// the model-change notice, and two writers on one replaceable line is how
-// that line ends up showing whichever of them wrote last.
+// workerMarker is what the prompt says about workers running behind it. It is
+// on the prompt, not the header, which the model-change notice owns.
 func (a *App) workerMarker() string {
 	if a.workers == nil {
 		return ""
@@ -93,16 +83,8 @@ func (a *App) workerMarker() string {
 }
 
 // drainWorkers finishes the background work a non-interactive run started.
-//
-// Backgrounding exists so that whoever is at the prompt can carry on while a
-// worker runs. There is no prompt here, so a run that returned with workers
-// still going would cancel them on the way out and throw the work away. It
-// waits instead, and gives the model the turn it needs to act on what comes
-// back.
-//
-// The loop ends when nothing is still running, which is the condition itself
-// rather than a count of attempts: a model that keeps starting useful work
-// should be allowed to.
+// There is no prompt to carry on at, so returning early would cancel running
+// workers and lose their work; the loop ends when the pool is idle.
 func (a *App) drainWorkers(ctx context.Context) error {
 	for a.workers != nil && a.workers.Busy() > 0 {
 		a.workers.Wait()
@@ -116,10 +98,8 @@ func (a *App) drainWorkers(ctx context.Context) error {
 	return nil
 }
 
-// stopWorkers ends everything running in the background, and says so.
-//
-// Each cancelled worker still reports, so the model is told the work stopped
-// rather than being left waiting for an answer that is not coming.
+// stopWorkers ends everything running in the background. Each cancelled worker
+// still reports, so the model is not left waiting for an answer.
 func (a *App) stopWorkers() {
 	if a.workers == nil {
 		return

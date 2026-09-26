@@ -25,9 +25,8 @@ func pipeInto(t *testing.T, text string) *os.File {
 	return r
 }
 
-// The bug this guards: a fresh bufio.Reader per ReadLine reads ahead, then
-// throws the buffer away, so every line after the first vanishes. It looks like
-// the program ignoring your input.
+// A fresh bufio.Reader per ReadLine reads ahead and discards the buffer, so
+// every line after the first vanishes.
 func TestPipedInputReadsEveryLine(t *testing.T) {
 	in := pipeInto(t, "first\n/tokens\n/compact\nlast\n")
 	defer in.Close()
@@ -127,10 +126,9 @@ func captureEditor(t *testing.T) (*Editor, func() string) {
 	return e, read
 }
 
-// The flicker guarantee. Typing a character at the end of the line must emit
-// that character and nothing else -- no line erase, no reprinted prompt. An
+// Typing at the end of the line must emit that character and nothing else: an
 // erase-and-repaint leaves the terminal a blank line to draw between the two,
-// which is exactly what you see as a flickering prompt.
+// which flickers.
 func TestRedrawEmitsOnlyTheTypedCharacter(t *testing.T) {
 	e, out := captureEditor(t)
 
@@ -206,9 +204,8 @@ func TestRedrawIsASingleWrite(t *testing.T) {
 	}
 }
 
-// The bug this guards: reading a fixed two bytes of an escape sequence leaves
-// the rest in the reader, where it is read back as ordinary typing. Press
-// Ctrl-Left in gnome-terminal and ";5D" appears in the prompt.
+// Reading a fixed two bytes of an escape sequence leaves the rest in the
+// reader, where it is read back as ordinary typing.
 func TestEscapeSequencesAreFullyConsumed(t *testing.T) {
 	cases := []struct {
 		name string
@@ -344,10 +341,9 @@ func TestTranspose(t *testing.T) {
 	}
 }
 
-// Completion replaces the word it was given and nothing else. The buffer here
-// is a prompt, not a shell command line: people go back and fix a path in the
-// middle of a sentence they have already written, and swapping the whole
-// buffer for the candidate would delete the rest of that sentence.
+// Completion replaces the word it was given and nothing else. The buffer is a
+// prompt, so swapping the whole buffer for the candidate would delete the rest
+// of the sentence around the path.
 func TestCompleteSplicesAWordAndKeepsTheRestOfTheLine(t *testing.T) {
 	e, _ := captureEditor(t)
 	e.buf = []rune("read internal/ui/ed and tell me what it does")
@@ -451,11 +447,8 @@ func TestCompleteWithNoCandidatesDoesNothing(t *testing.T) {
 	}
 }
 
-// The bug this guards: redraw scrolls a long line horizontally instead of
-// wrapping it, so when Enter is pressed the terminal is showing the last
-// seventy-odd characters and the beginning is nowhere. That fragment is what
-// the scrollback keeps, and scrolling back to find what was asked turns up a
-// sentence starting mid-word.
+// Redraw scrolls a long line horizontally instead of wrapping it, so submit
+// must put the whole line in the scrollback, not only the tail on screen.
 func TestSubmitPutsTheWholeLineInTheScrollback(t *testing.T) {
 	e, out := captureEditor(t)
 	text := "START-" + strings.Repeat("abcdefghij ", 30) + "-END"

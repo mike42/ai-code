@@ -8,14 +8,6 @@ import (
 	"ai-code/internal/provider"
 )
 
-// Compacting twice must not cost twice as much as compacting once.
-//
-// Every compaction used to re-serialise the session from message zero, so the
-// summarisation prompt grew with the transcript -- 30k, 61k, 92k tokens for
-// the first three compactions of one run. Quadratic over a session, and since
-// the summarisation request is the one request nothing assembles or bounds,
-// it eventually could not be sent at all. The session then had no way left to
-// make room, which is the opposite of what compaction is for.
 func TestCompactionCostDoesNotGrowWithTheSession(t *testing.T) {
 	client := &scriptedClient{charsPerToken: 4}
 	a := newAgent(t, client, &collectSink{})
@@ -34,8 +26,7 @@ func TestCompactionCostDoesNotGrowWithTheSession(t *testing.T) {
 		}
 	}
 
-	// Tokens sent to summarise, per compaction, on a session that keeps
-	// growing by the same amount each time.
+	// Tokens sent to summarise, per compaction.
 	var cost []int
 	compact := func() {
 		before := len(client.reqs)
@@ -57,9 +48,7 @@ func TestCompactionCostDoesNotGrowWithTheSession(t *testing.T) {
 	}
 	t.Logf("summarisation cost per compaction: %v tokens", cost)
 
-	// Each compaction covers the same amount of new conversation, so each
-	// should cost about the same. Generous margin: the checkpoint being
-	// folded in is itself part of the prompt and does vary a little.
+	// Generous margin: the checkpoint folded into the prompt varies a little.
 	for i, c := range cost[1:] {
 		if c > cost[0]*3/2 {
 			t.Errorf("compaction %d cost %d tokens against %d for the first: still growing with the session",
@@ -68,7 +57,6 @@ func TestCompactionCostDoesNotGrowWithTheSession(t *testing.T) {
 	}
 }
 
-// Nothing new since the checkpoint means there is nothing to ask a model.
 func TestSummarisingTwiceWithNoNewConversationSpendsNoCall(t *testing.T) {
 	client := &scriptedClient{charsPerToken: 4}
 	a := newAgent(t, client, &collectSink{})

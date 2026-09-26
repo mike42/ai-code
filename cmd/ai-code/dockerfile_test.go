@@ -14,13 +14,9 @@ import (
 	"ai-code/internal/tool"
 )
 
-// A devcontainer that builds from a Dockerfile must run tools, not refuse.
-//
-// This is the whole point of the build support, and it is the one thing unit
-// tests over argv cannot prove: the image really builds, the daemon really
-// starts inside it, and the workspace really lands where the configuration
-// said. It exercises the repository's own example, so the example cannot rot
-// away from the code.
+// Unit tests over argv cannot prove the image really builds, the daemon starts
+// inside it, or the workspace lands where the configuration said. This runs the
+// repository's own example, so the example cannot rot away from the code.
 func TestDockerfileDevcontainerRunsTools(t *testing.T) {
 	engine, err := detectContainerEngine()
 	if err != nil {
@@ -47,7 +43,6 @@ func TestDockerfileDevcontainerRunsTools(t *testing.T) {
 	}
 	rt.Config.SubstituteAll(example, devcontainerID(example))
 
-	// The example's configuration, as read.
 	if rt.Config.WorkspaceFolder != "/workspace" {
 		t.Errorf("WorkspaceFolder = %q, want /workspace", rt.Config.WorkspaceFolder)
 	}
@@ -58,8 +53,8 @@ func TestDockerfileDevcontainerRunsTools(t *testing.T) {
 		t.Errorf("RunArgs = %v, want [--userns=keep-id]", rt.Config.RunArgs)
 	}
 
-	// The binary that goes into the container must be static: the example's
-	// image is a different userspace from whatever built this test.
+	// The example's image is a different userspace from the one that built
+	// this test, so the binary must be static.
 	bin := filepath.Join(t.TempDir(), "ai-code")
 	build := exec.Command("go", "build", "-o", bin, "ai-code/cmd/ai-code")
 	build.Env = append(os.Environ(), "CGO_ENABLED=0")
@@ -70,8 +65,8 @@ func TestDockerfileDevcontainerRunsTools(t *testing.T) {
 	dc := NewDevcontainerExecutor(rt.Config, nil, example, example, bin)
 	defer dc.Close()
 
-	// A first tool call builds the image if it is not already built, then
-	// starts the container. Both are deferred to here, never to startup.
+	// Build and container start are deferred to the first tool call, never to
+	// startup.
 	args, _ := json.Marshal(map[string]string{"command": "pwd && id -un && cat /etc/os-release | head -1"})
 	res, err := dc.Execute(context.Background(), tool.Request{
 		CallID: "1", Name: "bash", Args: args,
@@ -83,8 +78,8 @@ func TestDockerfileDevcontainerRunsTools(t *testing.T) {
 		t.Fatalf("tool failed inside the built container:\n%s", res.Content)
 	}
 
-	// The project is mounted where workspaceFolder said, and the tools run as
-	// the user remoteUser named -- not as the image's default.
+	// Tools run as remoteUser, not as the image's default, in the configured
+	// workspaceFolder.
 	if !strings.Contains(res.Content, "/workspace") {
 		t.Errorf("working directory is not the configured workspaceFolder:\n%s", res.Content)
 	}
@@ -95,7 +90,7 @@ func TestDockerfileDevcontainerRunsTools(t *testing.T) {
 		t.Errorf("container is not the image the Dockerfile builds:\n%s", res.Content)
 	}
 
-	// The build produced a tagged image, so a second session reuses it.
+	// The build leaves a tagged image behind for a second session to reuse.
 	tag, err := rt.Config.ImageTag()
 	if err != nil {
 		t.Fatalf("ImageTag: %v", err)

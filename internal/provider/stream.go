@@ -18,10 +18,8 @@ type chunk struct {
 			Role             string `json:"role"`
 			Content          string `json:"content"`
 			ReasoningContent string `json:"reasoning_content"`
-			// OpenRouter names the same channel `reasoning` and additionally
-			// sends structured blocks in `reasoning_details`; lemonade and
-			// llama.cpp send `reasoning_content`. Accepting only one of them
-			// silently discarded every thinking token from the other.
+			// OpenRouter names this channel `reasoning`; llama.cpp and lemonade
+			// use `reasoning_content`.
 			Reasoning        string            `json:"reasoning"`
 			ReasoningDetails []json.RawMessage `json:"reasoning_details"`
 			ToolCalls        []struct {
@@ -36,8 +34,8 @@ type chunk struct {
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
 		// NativeFinishReason is the upstream provider's own word for why it
-		// stopped. When the normalised reason is "error" it is the only thing
-		// in the response that says what actually happened.
+		// stopped; when the normalised reason is "error" it is the only
+		// explanation in the response.
 		NativeFinishReason string `json:"native_finish_reason"`
 	} `json:"choices"`
 	Usage *struct {
@@ -65,10 +63,8 @@ type chunk struct {
 }
 
 // StreamError is a provider failure delivered inside the body of a 200
-// response. Branching on HTTP status cannot distinguish these: the headers
-// went out before generation started, so a context overflow that is fixable by
-// compacting and a dead upstream both arrive as 200. ErrorType is the field
-// that separates them.
+// response. Branching on HTTP status cannot see it: a fixable context overflow
+// and a dead upstream both arrive as 200, separated by ErrorType.
 type StreamError struct {
 	Message   string
 	Code      string
@@ -98,15 +94,14 @@ const ErrorTypeContextLength = "context_length_exceeded"
 
 // ExtraUsage carries the usage fields provider.Usage has no room for.
 type ExtraUsage struct {
-	// Cost is what the provider charged for this call in its own units, not an
-	// estimate derived from token counts and a price table.
+	// Cost is what the provider charged in its own units, not an estimate.
 	Cost             float64
 	ReasoningTokens  int
 	CacheWriteTokens int
 }
 
 // StreamExtras is the optional interface for wire detail the canonical Stream
-// has nowhere to put. Backends that do not send these do not implement it.
+// has nowhere to put; backends that do not send it do not implement it.
 type StreamExtras interface {
 	NativeFinishReason() string
 	ReasoningDetails() []json.RawMessage
@@ -119,13 +114,8 @@ type toolAccum struct {
 	args strings.Builder
 }
 
-// openaiStream parses a server-sent-event stream and reassembles it into a
-// single assistant message.
-//
-// Tool-call arguments arrive as arbitrary fragments of a JSON document, split
-// at positions with no relationship to JSON structure (observed live: `{`,
-// `"cmd":"`, `ls`, ` -`, `la`). Reassembly happens here so there is exactly one
-// implementation of it in the codebase.
+// openaiStream parses a server-sent-event stream into one assistant message,
+// reassembling tool-call argument fragments in the single implementation of it.
 type openaiStream struct {
 	resp *http.Response
 	br   *bufio.Reader
@@ -162,9 +152,8 @@ func (s *openaiStream) Recv() (Event, error) {
 		if err := s.readFrame(); err != nil {
 			s.finished = true
 			s.err = err
-			// A stream that ends without an explicit [DONE] still yields
-			// whatever was accumulated; the caller decides whether a partial
-			// turn is salvageable.
+			// A stream that ends without [DONE] still yields what was
+			// accumulated; the caller decides if a partial turn is salvageable.
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				s.err = nil
 				continue
@@ -208,8 +197,8 @@ func (s *openaiStream) readFrame() error {
 
 		var c chunk
 		if jsonErr := json.Unmarshal([]byte(data), &c); jsonErr != nil {
-			// A malformed frame is worth reporting but not worth destroying an
-			// otherwise good turn over.
+			// Report a malformed frame but do not destroy an otherwise good
+			// turn over it.
 			if err != nil {
 				return err
 			}
@@ -341,18 +330,13 @@ func (s *openaiStream) Message() Message {
 		acc := s.tools[i]
 		args := acc.args.String()
 		if strings.TrimSpace(args) == "" {
-			// A tool call with no arguments is legal; the schema may have no
-			// required fields. Send a valid empty object rather than "".
+			// A tool call with no arguments is legal; send {} rather than "".
 			args = "{}"
 		}
 		id := acc.id
 		if id == "" {
-			// The id arrives in the first delta of a call, so a response cut
-			// off part-way through one produces a call without it. An id is
-			// only the handle a result is matched to its call by, and it is our
-			// own message that carries both, so synthesising one costs nothing
-			// -- while leaving it empty produces a message the provider rejects
-			// and that nothing downstream can answer.
+			// A response cut off before the first delta leaves no id;
+			// synthesise one, since nothing downstream can match an empty id.
 			id = fmt.Sprintf("call_%d", i)
 		}
 		m.ToolCalls = append(m.ToolCalls, ToolCall{ID: id, Name: acc.name, Args: args})

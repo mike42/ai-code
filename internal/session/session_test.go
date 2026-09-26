@@ -268,8 +268,8 @@ func TestInputsPreferTheInputLogOverMessages(t *testing.T) {
 }
 
 func TestCheckpointLeavesTheTranscriptAlone(t *testing.T) {
-	// The whole point of the non-destructive checkpoint: the summary is
-	// recorded beside the conversation, and replay still yields every message.
+	// The checkpoint is non-destructive: the summary is recorded beside the
+	// conversation, and replay still yields every message.
 	entries := []Entry{
 		{Type: EntryMessage, Message: &provider.Message{Role: provider.RoleUser, Content: "one"}},
 		{Type: EntryMessage, Message: &provider.Message{Role: provider.RoleAssistant, Content: "two"}},

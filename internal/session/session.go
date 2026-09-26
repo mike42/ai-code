@@ -1,11 +1,6 @@
-// Package session persists a conversation as an append-only JSONL file.
-//
-// The transcript is the source of truth, not a log kept alongside some other
-// state. Rebuilding a session means replaying its entries, which makes resume,
-// fork and inspection fall out for free, and makes a crash lose at most the
-// turn in progress. It is also greppable, which matters more in practice than
-// it sounds: when something goes wrong, the record of what was actually sent is
-// the first thing anyone wants.
+// Package session persists a conversation as an append-only JSONL file. The
+// transcript is the source of truth: replaying its entries rebuilds the
+// session, so a crash loses at most the turn in progress.
 package session
 
 import (
@@ -32,16 +27,13 @@ const (
 	EntryMessage    EntryType = "message"
 	EntryCompaction EntryType = "compaction"
 	EntryNote       EntryType = "note"
-	// EntryInput is a line the user submitted, prompt or slash command,
-	// exactly as typed. It exists because neither of the other two records it
-	// faithfully: a slash command never becomes a message at all, and a prompt
-	// that does is later wrapped, summarised or dropped by compaction. Command
-	// history has to outlive all of that.
+	// EntryInput is a line submitted exactly as typed, prompt or slash command.
+	// Neither messages nor notes record it faithfully: a slash command never
+	// becomes a message, and a prompt is later wrapped or dropped.
 	EntryInput EntryType = "input"
-	// EntryCheckpoint records a summary that did NOT replace anything. This is
-	// the non-destructive counterpart of EntryCompaction: the transcript is
-	// still whole, and the summary sits beside it as a spare for a model swap
-	// or a narrower window. Replay must therefore not treat it as a reset.
+	// EntryCheckpoint records a summary that replaced nothing: the
+	// non-destructive counterpart of EntryCompaction, which replay must not
+	// treat as a reset.
 	EntryCheckpoint EntryType = "checkpoint"
 )
 
@@ -54,20 +46,16 @@ type Entry struct {
 	Note    string            `json:"note,omitempty"`
 	Input   string            `json:"input,omitempty"`
 
-	// Compaction records what a /compact replaced, so the pre-compaction
-	// history stays on disk even though it left the context. Checkpoint
-	// records a summary that replaced nothing.
+	// Summary is what a compaction replaced, so the pre-compaction history stays
+	// on disk.
 	Summary string `json:"summary,omitempty"`
-	// SummarisedThrough is how many messages from the start of the replayed
-	// conversation the summary accounts for. Meaningless without the message
-	// list it indexes, which is why it is stored with the summary rather than
-	// recomputed on resume.
+	// SummarisedThrough is how many messages from the start the summary accounts
+	// for, stored with the summary rather than recomputed on resume.
 	SummarisedThrough int `json:"summarised_through,omitempty"`
 	MessagesBefore    int `json:"messages_before,omitempty"`
 	TokensBefore      int `json:"tokens_before,omitempty"`
-	// Cut is the boundary a compaction chose: the next request starts from
-	// this message. Zero on a checkpoint written speculatively, which covers
-	// messages without deciding anything about what is sent.
+	// Cut is the boundary a compaction chose: the next request starts from this
+	// message. Zero on a speculative checkpoint.
 	Cut int `json:"cut,omitempty"`
 }
 
@@ -106,11 +94,8 @@ func Root() (string, error) {
 	return filepath.Join(home, ".local", "share", "ai-code"), nil
 }
 
-// projectKey derives a stable directory name from a project path.
-//
-// The absolute path is also recorded in the metadata, because hashing the path
-// means a moved repository looks like a different project. Keeping the original
-// path lets ai-code say so rather than silently starting from nothing.
+// projectKey derives a stable directory name from a project path. The path
+// itself is also recorded in the metadata, so a moved repository is identifiable.
 func projectKey(project string) string {
 	sum := sha256.Sum256([]byte(project))
 	base := filepath.Base(project)
@@ -131,8 +116,7 @@ func dirFor(project string) (string, error) {
 	return filepath.Join(root, "sessions", projectKey(project)), nil
 }
 
-// NewID returns a lexically sortable identifier: sorting session files by name
-// sorts them by time, which is what every listing wants.
+// NewID returns a lexically sortable identifier: name order is time order.
 func NewID() string {
 	var b [4]byte
 	_, _ = rand.Read(b[:])
@@ -156,8 +140,8 @@ func Create(meta Meta) (*Session, error) {
 	}
 
 	path := filepath.Join(dir, meta.ID+".jsonl")
-	// 0600: a transcript contains whatever the model was shown, which routinely
-	// includes source, configuration and anything a command printed.
+	// 0600: a transcript holds whatever the model was shown, including source
+	// and configuration.
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("creating session file: %w", err)
@@ -193,9 +177,8 @@ func Open(project, id string) (*Session, []Entry, error) {
 
 func (s *Session) Path() string { return s.path }
 
-// Append writes one entry and flushes it. Flushing every entry costs a syscall
-// per message and buys crash-safety, which is the right trade for a file whose
-// whole purpose is surviving an unexpected exit.
+// Append writes one entry and flushes it: a syscall per message buys
+// crash-safety on a file whose purpose is surviving an unexpected exit.
 func (s *Session) Append(e Entry) error {
 	if e.Time.IsZero() {
 		e.Time = time.Now()
@@ -260,11 +243,8 @@ func readFile(path string) ([]Entry, Meta, error) {
 	return entries, meta, sc.Err()
 }
 
-// Messages replays entries into a conversation.
-//
-// Compaction entries reset the conversation: everything before one is
-// represented by its summary, exactly as it was in context when the session was
-// live. The full history stays in the file for anyone who wants to read it.
+// Messages replays entries into a conversation; a compaction entry resets it,
+// with the summary standing in for everything before it.
 func Messages(entries []Entry) []provider.Message {
 	var out []provider.Message
 	for _, e := range entries {
@@ -280,19 +260,10 @@ func Messages(entries []Entry) []provider.Message {
 	return out
 }
 
-// Checkpoint returns the summary a resumed session should start with, how
-// many of the replayed messages it accounts for, and the boundary the next
-// request starts from.
-//
-// Cut is zero for a checkpoint written speculatively, which stands beside the
-// transcript without changing what is sent.
-//
-// EntryCompaction is the pre-append-only form, written by versions that
-// replaced the message list instead of recording a boundary. Messages replays
-// one by clearing the conversation, exactly as it was in context when the
-// session was live, so the summary is already the first message there and
-// handing it back as a checkpoint too would put the same text in front of the
-// model twice. Files already on disk are the only thing that produces one.
+// Checkpoint returns the summary a resumed session should start with, how many
+// of the replayed messages it accounts for, and the boundary the next request
+// starts from. Cut is zero for a speculative checkpoint. An EntryCompaction
+// clears the result: Messages already replays it, so it would arrive twice.
 func Checkpoint(entries []Entry) (summary string, through, cut int) {
 	for _, e := range entries {
 		switch e.Type {
@@ -305,17 +276,9 @@ func Checkpoint(entries []Entry) (summary string, through, cut int) {
 	return summary, through, cut
 }
 
-// Inputs returns the lines the user submitted, oldest first, for restoring
-// command history on resume.
-//
-// Deliberately not cleared by a compaction entry the way Messages is:
-// compaction is about what the model is shown, and it would be surprising for
-// reclaiming context to also erase what you can press Up to reach.
-//
-// Sessions recorded before EntryInput existed fall back to their user
-// messages, so a session already on disk still gets most of its history back.
-// The fallback skips the wrappers compaction introduces, which are ai-code's
-// words rather than anything the user typed.
+// Inputs returns the lines submitted, oldest first, for restoring command
+// history on resume. A compaction entry does not clear it the way Messages
+// does; sessions without EntryInput entries fall back to their user messages.
 func Inputs(entries []Entry) []string {
 	var out []string
 	for _, e := range entries {

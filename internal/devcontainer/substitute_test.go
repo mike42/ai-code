@@ -84,7 +84,7 @@ func TestWorkspaceFolderResolvesBeforeContainerWorkspaceFolder(t *testing.T) {
 	}
 }
 
-// The spec's default, which is not the /workspace this harness used to hardcode.
+// The spec's default applies when workspaceFolder is unset.
 func TestWorkspaceFolderDefault(t *testing.T) {
 	c, err := Parse([]byte(`{"image": "x"}`), "/p/.devcontainer/devcontainer.json")
 	if err != nil {
@@ -126,7 +126,7 @@ func TestExplicitWorkspaceMountIsHonoured(t *testing.T) {
 }
 
 // runArgs is how a project reaches the engine directly; on rootless podman it
-// is what keeps written files owned by the user.
+// keeps written files owned by the launching uid.
 func TestRunArgvCarriesRunArgsAndUser(t *testing.T) {
 	c, err := Parse([]byte(`{
   "image": "x",
@@ -181,8 +181,8 @@ func TestEntrypointIsOverridden(t *testing.T) {
 func TestHostPathsDoNotReachContainerEnvironment(t *testing.T) {
 	c := &Config{
 		Image: "alpine",
-		// Deliberately not the host basename, so a rewritten basename is
-		// distinguishable from one that happened to match.
+		// Not the host basename, so a rewritten basename is distinguishable
+		// from one that happened to match.
 		WorkspaceFolder: "/workspaces/app",
 		ContainerEnv: map[string]string{
 			"PROJECT_DIR": "${localWorkspaceFolder}",

@@ -84,8 +84,8 @@ func TestBannerSaysNothingAboutSlotsWhenThereIsOne(t *testing.T) {
 }
 
 // /tokens answers how full the context is and when something happens about
-// it. Everything it used to print besides that was derivable from those two
-// numbers or a restatement of the config file.
+// it; the two numbers are the whole answer, and anything else is derivable
+// from them or a restatement of the config file.
 func TestTokensIsTwoLines(t *testing.T) {
 	a := statusApp(t, dividedModel())
 	var err error

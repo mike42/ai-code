@@ -7,13 +7,9 @@ import (
 	"time"
 )
 
-// Tracing writes what every instance decided about the model to one shared
-// file, so a churn that only appears with two windows open can be read back
-// afterwards rather than reasoned about.
-//
-// Off unless AI_CODE_TRACE names a file. Lines are appended with O_APPEND in
-// single writes, which the kernel keeps whole, so several processes share
-// one file without interleaving mid-line.
+// Trace writes what every instance decided about the model to one shared file,
+// so churn that appears only with two windows open can be read back later. Off
+// unless AI_CODE_TRACE names a file; writes are single, whole O_APPEND lines.
 var (
 	traceMu   sync.Mutex
 	traceFile *os.File

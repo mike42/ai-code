@@ -16,13 +16,8 @@ func statusTester() *Interactive {
 	})
 }
 
-// The status line adopts the context figure from wherever it arrives, and
-// computes none of its own.
-//
-// It used to update on three event kinds out of twelve. A /compact emits none
-// of them, so the pre-compaction occupancy stayed on screen until the next
-// turn ended -- while the prompt marker, which asked the agent directly, had
-// already moved. Two readers, two answers, one session.
+// The status line computes no figure of its own; it adopts whatever figure is
+// published.
 func TestStatusLineAdoptsEveryPublishedFigure(t *testing.T) {
 	r := statusTester()
 	r.streaming = true
@@ -63,7 +58,7 @@ func TestUnanchoredFigureIsMarked(t *testing.T) {
 	}
 }
 
-// A context event commits nothing to the scrollback. One per tool result
+// A context event must commit nothing to the scrollback; one per tool result
 // would fill it.
 func TestContextEventWritesNothingToTheScrollback(t *testing.T) {
 	r := statusTester()

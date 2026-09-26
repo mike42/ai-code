@@ -15,9 +15,7 @@ import (
 	"ai-code/internal/session"
 )
 
-// blockingClient holds a stream open until the context is cancelled, which is
-// what a real summarisation looks like from the caller's side: a long call
-// that only ends when the model finishes or someone gives up on it.
+// blockingClient holds a stream open until the context is cancelled.
 type blockingClient struct {
 	countingClient
 	entered chan struct{}
@@ -33,8 +31,7 @@ func (c *blockingClient) Stream(ctx context.Context, req provider.Request) (prov
 	return nil, ctx.Err()
 }
 
-// summaryClient answers a summarisation the way a model would, and keeps the
-// requests so what actually went on the wire can be asserted on.
+// summaryClient answers a summarisation and records the requests.
 type summaryClient struct {
 	countingClient
 	text string
@@ -86,8 +83,8 @@ func (c *health) Health(context.Context) (*provider.Health, error) { return &c.h
 func (c *health) Load(context.Context, string) error               { return nil }
 func (c *health) Unload(context.Context, string) error             { return nil }
 
-// A keystroke cancels the context, and the checkpoint has to be gone by the
-// time the prompt returns -- everything after it touches the same agent.
+// The checkpoint must be gone by the time the prompt returns; everything
+// after it touches the same agent.
 func TestIdleCheckpointAbortsOnCancellation(t *testing.T) {
 	a, _ := swapApp(t, 262144, 200000)
 	client := &blockingClient{entered: make(chan struct{})}
@@ -166,9 +163,8 @@ func TestIdleCheckpointSkipsAColdSession(t *testing.T) {
 	}
 }
 
-// The invariant is not "send nothing" -- it is "cause no load". A session
-// that finds a different model resident adopts it, so anything it sends
-// afterwards names the model that is already there and evicts nobody.
+// The invariant is "cause no load", not "send nothing": the session adopts
+// the resident model, so nothing it sends can evict that model.
 func TestIdleCheckpointNeverSendsForAModelThatIsNotLoaded(t *testing.T) {
 	a, _ := swapApp(t, 262144, 200000)
 	client := &health{h: provider.Health{ModelLoaded: "someone-elses-model", Ready: true}}
@@ -226,7 +222,6 @@ func TestCheckpointIsPersistedOnceAndRestored(t *testing.T) {
 	a.sess = s
 
 	runIdle(t, a, 0)
-	// A second pass with nothing new must not append the same text again.
 	a.recordCheckpoint()
 	s.Close()
 
@@ -253,9 +248,8 @@ func TestCheckpointIsPersistedOnceAndRestored(t *testing.T) {
 	}
 }
 
-// Turning the speculative checkpoint off must not stop the swap watch: they
-// share a goroutine, and a window that stops answering announcements makes
-// every other window's swap hang.
+// Checkpointing and the swap watch share a goroutine, so turning the
+// checkpoint off must not stop a window answering swap announcements.
 func TestTurningTheCheckpointOffLeavesTheSwapWatchRunning(t *testing.T) {
 	a, _ := swapApp(t, 262144, 200000)
 	d := config.Defaults()
@@ -273,14 +267,9 @@ func TestTurningTheCheckpointOffLeavesTheSwapWatchRunning(t *testing.T) {
 	}
 }
 
-// runIdle runs the idle loop until it acts, then stops it and waits for the
-// goroutine to finish. The loop itself returns only when cancelled, because
-// it goes on watching for another window's swap announcement long after the
-// speculative checkpoint is done.
-//
-// Progress is watched through the client, not the agent. The agent is written
-// by the loop's goroutine, and joining before the caller reads it is what
-// makes that read safe.
+// runIdle runs the idle loop until it acts, then cancels and joins it. The
+// loop keeps watching for swap announcements after the checkpoint is done.
+// Progress is watched through the client, so joining makes the agent read safe.
 func runIdle(t *testing.T, a *App, idle time.Duration) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -291,8 +280,7 @@ func runIdle(t *testing.T, a *App, idle time.Duration) {
 	}()
 
 	if counter, ok := a.client.(interface{ calls() (int, int) }); ok {
-		// Everything under this is an in-memory fake, so work that is going
-		// to happen happens at once. The wait is for the scheduler.
+		// In-memory fakes do the work at once; the wait is for the scheduler.
 		for range 200 {
 			if streams, _ := counter.calls(); streams > 0 {
 				break
@@ -305,9 +293,8 @@ func runIdle(t *testing.T, a *App, idle time.Duration) {
 	<-done
 }
 
-// The failure this guards is the one the whole subsystem exists to stop: a
-// prompt typed before another window swapped, sent to a model that is no
-// longer loaded, making the server load it back and evict theirs.
+// A prompt typed before another window swapped must adopt the loaded model,
+// not reload its own and evict the other window's.
 func TestASendAdoptsTheLoadedModelInsteadOfReloadingItsOwn(t *testing.T) {
 	a, _ := swapApp(t, 262144, 0)
 	client := &health{h: provider.Health{ModelLoaded: "someone-elses-model", Ready: true}}
@@ -329,9 +316,8 @@ func TestASendAdoptsTheLoadedModelInsteadOfReloadingItsOwn(t *testing.T) {
 	}
 }
 
-// One invariant covers every case: the line shows the difference between
-// what the scrollback says and what is loaded. These are the cases that got
-// it wrong one at a time.
+// The report line shows the difference between what the scrollback says and
+// what is loaded.
 func TestModelChangeIsReportedAgainstWhatTheScrollbackSays(t *testing.T) {
 	newApp := func(t *testing.T, known string, loaded string) (*App, *health) {
 		t.Helper()
@@ -365,8 +351,7 @@ func TestModelChangeIsReportedAgainstWhatTheScrollbackSays(t *testing.T) {
 	})
 
 	// At a live prompt the line is a replaceable header, so nothing is
-	// committed and the scrollback still names the model it started on.
-	// Coming back to it is therefore no difference at all.
+	// committed and the scrollback still names the starting model.
 	t.Run("away and back at a prompt leaves nothing to say", func(t *testing.T) {
 		a, _ := newApp(t, "home-model", "other-model")
 
@@ -381,8 +366,8 @@ func TestModelChangeIsReportedAgainstWhatTheScrollbackSays(t *testing.T) {
 		}
 	})
 
-	// Once a line has been committed it is what the scrollback says, so a
-	// change back from there is a real difference and is reported.
+	// A committed line becomes what the scrollback says, so a change back
+	// from there is a real difference.
 	t.Run("a committed line becomes what the scrollback says", func(t *testing.T) {
 		a, c := newApp(t, "home-model", "other-model")
 		captureOut(t, func() { a.adoptModelChange(context.Background(), nil) })
@@ -405,20 +390,16 @@ func TestModelChangeIsReportedAgainstWhatTheScrollbackSays(t *testing.T) {
 			c.models = append(c.models, provider.ModelInfo{ID: "b-model", ContextWindow: 65536})
 			a.adoptModelChange(context.Background(), nil)
 		})
-		// Without a prompt to sit above, each difference commits -- but each
-		// is measured against the last thing said, never against the start.
+		// Each difference commits and is measured against the last thing
+		// said, never against the start.
 		if strings.Count(out, "was home-model") > 1 {
 			t.Errorf("a later change was measured against the original model:\n%s", out)
 		}
 	})
 }
 
-// The proactive path: a session at an idle prompt picks the change up from
-// its own watch loop, before anything is typed and before anything is sent.
-//
-// If this ever stops working the pre-send guard would silently cover for it,
-// and the harness would be back to noticing swaps only once it had already
-// sent something -- so this is asserted separately from that guard.
+// The idle watch must adopt a change before anything is typed or sent; the
+// pre-send guard would otherwise cover for a regression here.
 func TestTheIdleWatchAdoptsWithoutWaitingForASend(t *testing.T) {
 	a, _ := swapApp(t, 262144, 0)
 	client := &health{h: provider.Health{ModelLoaded: "big-model", Ready: true}}
@@ -450,10 +431,8 @@ func TestTheIdleWatchAdoptsWithoutWaitingForASend(t *testing.T) {
 	}
 }
 
-// deadClient fails every call. It stands in for the server being busy
-// loading a large model, which is precisely when the old health-and-
-// catalogue questions timed out and a session carried on naming a model
-// that had gone.
+// deadClient fails every call, standing in for a server busy loading a large
+// model.
 type deadClient struct{ countingClient }
 
 func (c *deadClient) Health(context.Context) (*provider.Health, error) {
@@ -468,10 +447,8 @@ func (c *deadClient) Models(context.Context) ([]provider.ModelInfo, error) {
 	return nil, errors.New("timeout")
 }
 
-// The point of sharing intent: on one machine, with one user, a window
-// learns which model to use from a local file and never has to ask. A
-// request naming the incoming model is queued behind the load; one naming
-// the outgoing model drags it back.
+// A window learns the intended model from the coordination file and adopts it
+// even with the server unreachable.
 func TestASessionAdoptsWithTheServerCompletelyUnreachable(t *testing.T) {
 	dir := t.TempDir()
 	a, _ := swapApp(t, 262144, 0)
@@ -482,7 +459,7 @@ func TestASessionAdoptsWithTheServerCompletelyUnreachable(t *testing.T) {
 	a.agent.SetClient(a.client)
 	a.agent.SetModel("old-model", 262144, 0)
 
-	// The user asked for something else, in another window.
+	// Another window asked for something else.
 	if err := coord.SetIntent(dir, "new-model"); err != nil {
 		t.Fatal(err)
 	}
@@ -502,14 +479,13 @@ func TestASessionAdoptsWithTheServerCompletelyUnreachable(t *testing.T) {
 	if !strings.Contains(out, "new-model") {
 		t.Errorf("the change was not reported:\n%s", out)
 	}
-	// The window is unknown with no catalogue, so the one in force stands
-	// rather than collapsing to a default.
+	// With no catalogue the new window is unknown, so the one in force
+	// stands rather than collapsing to a default.
 	if got := a.agent.ContextState().Window; got != 262144 {
 		t.Errorf("context limit = %d, want the previous window kept", got)
 	}
 }
 
-// With nothing asked for, it leaves the session alone rather than guessing.
 func TestNoRecordedIntentMeansNoChange(t *testing.T) {
 	a, _ := swapApp(t, 262144, 0)
 	a.coordDir = t.TempDir()

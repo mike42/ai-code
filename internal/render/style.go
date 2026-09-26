@@ -2,13 +2,9 @@ package render
 
 import "strings"
 
-// Style holds the ANSI palette.
-//
-// Restraint is the design goal. A harness whose output changes colour
-// constantly is unreadable while a slow model streams into it, and the colour
-// carries no information once everything is coloured. ai-code uses dim for
-// anything secondary, one accent for tool activity, and otherwise the
-// terminal's default foreground -- which is also the colour the user chose.
+// Style holds the ANSI palette: dim for anything secondary, one accent for tool
+// activity, otherwise the terminal's default foreground. Restraint keeps
+// streaming output readable.
 type Style struct {
 	enabled bool
 }
@@ -68,12 +64,8 @@ func Strip(s string) string {
 }
 
 // HasOpenSGR reports whether a line ends with an unterminated colour or
-// attribute run.
-//
-// This is the property that actually matters for copy/paste and for the line
-// below: an escape left open bleeds its styling into whatever is printed or
-// pasted next. Simply ending with a reset is not the same test, because a line
-// may legitimately end with plain text after a closed run.
+// attribute run: an escape left open bleeds into whatever is printed or pasted
+// next. A line ending with a reset is not the same test.
 func HasOpenSGR(s string) bool {
 	open := false
 	for i := 0; i < len(s); i++ {

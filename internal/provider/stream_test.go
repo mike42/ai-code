@@ -15,11 +15,8 @@ import (
 	"time"
 )
 
-// cassetteServer replays a recorded SSE response.
-//
-// The cassettes in testdata were captured from a live lemonade server, so
-// these tests exercise the actual byte stream a real backend produces -- including the fragment boundaries the
-// server happens to choose, which is precisely what reassembly has to survive.
+// cassetteServer replays a recorded SSE response, split at arbitrary read
+// boundaries.
 func cassetteServer(t *testing.T, name string) *httptest.Server {
 	t.Helper()
 	body, err := os.ReadFile(filepath.Join("testdata", name))
@@ -29,7 +26,7 @@ func cassetteServer(t *testing.T, name string) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		// Write in small pieces so the parser is exercised across arbitrary
-		// read boundaries rather than receiving one convenient buffer.
+		// read boundaries.
 		for i := 0; i < len(body); i += 37 {
 			end := min(i+37, len(body))
 			_, _ = w.Write(body[i:end])
@@ -90,7 +87,6 @@ func TestStreamReassemblesFragmentedToolCallArguments(t *testing.T) {
 		t.Error("tool call has no id; the id arrives on the first fragment only")
 	}
 
-	// The reassembled arguments must be valid JSON with the expected field.
 	var args map[string]any
 	if err := json.Unmarshal([]byte(tc.Args), &args); err != nil {
 		t.Fatalf("reassembled arguments are not valid JSON (%v): %q", err, tc.Args)
@@ -104,8 +100,8 @@ func TestStreamReassemblesFragmentedToolCallArguments(t *testing.T) {
 }
 
 func TestStreamCapturesReasoningSeparatelyFromContent(t *testing.T) {
-	// lemonade/llama.cpp emit a distinct reasoning_content channel. Folding it
-	// into the visible content would dump the model's thinking into the user's
+	// lemonade/llama.cpp emit a distinct reasoning_content channel; folding it
+	// into the visible content would put the model's thinking in the
 	// scrollback.
 	srv := cassetteServer(t, "text.sse")
 	defer srv.Close()
@@ -423,24 +419,16 @@ func TestStreamReportsLengthStop(t *testing.T) {
 	}
 }
 
-// The status line counts streamed deltas to show a live token rate, because the
-// authoritative count only arrives in the final usage chunk -- by which point
-// there is nothing left to display a rate for. That is only sound if one delta
-// really is one token, so this pins it against real captured output.
-//
-// If a backend ever batches several tokens into one delta, this test fails and
-// the rate readout is known to be wrong, rather than quietly reading low.
+// The status line counts streamed deltas for its live token rate, because the
+// authoritative count only arrives in the final usage chunk. That is sound only
+// if one delta is one token, which this pins against real captured output.
 func TestOneDeltaIsOneToken(t *testing.T) {
 	cases := []struct {
 		cassette string
 		// toleranceLow allows for tokens the server bills but the renderer
-		// never sees. Two causes, both confined to tool calls: the chat
-		// template's tool-call wrapper is billed but never streamed, and the
-		// argument fragments are reassembled inside the stream, so they arrive
-		// as one EventToolCallStart rather than as one event per token. The
-		// effect is that the rate reads low for the second or so a tool call
-		// takes to emit. Prose and reasoning -- everything you actually watch
-		// scroll past -- are exact.
+		// never sees: the chat template's tool-call wrapper is billed but not
+		// streamed, and argument fragments arrive as one EventToolCallStart.
+		// Prose and reasoning are exact.
 		toleranceLow float64
 	}{
 		{"text.sse", 0.01},
@@ -498,11 +486,6 @@ func sseServer(t *testing.T, body string) *httptest.Server {
 	}))
 }
 
-// A stream cut off part-way through a tool call still has to produce a call
-// that can be answered. The id arrives in the first delta of the call, so a
-// truncation before it leaves the call with no id -- and a tool call with no id
-// is a message the provider rejects and that nothing downstream can repair,
-// which wedged the session for good.
 func TestTruncatedToolCallStillGetsAnAnswerableID(t *testing.T) {
 	srv := sseServer(t, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"file_pa"}}]},"finish_reason":"length"}]}`+"\n\ndata: [DONE]\n\n")
 	defer srv.Close()
@@ -544,9 +527,8 @@ func TestServerSuppliedToolCallIDIsPreserved(t *testing.T) {
 	}
 }
 
-// OpenRouter puts thinking in `reasoning`, not `reasoning_content`. Reading
-// only the latter dropped every thinking token from a cloud model without a
-// trace -- no error, no short read, just a message with empty Reasoning.
+// OpenRouter puts thinking in `reasoning`, not `reasoning_content`; both names
+// must reach the same accumulator.
 func TestStreamAcceptsOpenRouterReasoningField(t *testing.T) {
 	srv := sseServer(t, `data: {"choices":[{"delta":{"reasoning":"weigh","reasoning_details":[{"type":"reasoning.text","text":"weigh"}]}}]}`+"\n\n"+
 		`data: {"choices":[{"delta":{"reasoning":" it up"}}]}`+"\n\n"+
@@ -613,9 +595,8 @@ func TestStreamAcceptsLlamaCppReasoningContentField(t *testing.T) {
 	}
 }
 
-// A content-filtered response is not a completed turn. It used to fall through
-// the switch and be reported as StopEnd, so the harness treated a refusal it
-// never saw as the model's final answer.
+// A content-filtered response is not a completed turn; reporting StopEnd would
+// treat a refusal as the model's final answer.
 func TestStreamReportsContentFilterStop(t *testing.T) {
 	srv := sseServer(t, `data: {"choices":[{"delta":{"content":"par"},"finish_reason":"content_filter","native_finish_reason":"SAFETY"}]}`+"\n\ndata: [DONE]\n\n")
 	defer srv.Close()
@@ -657,7 +638,7 @@ func TestStreamReportsErrorFinishReason(t *testing.T) {
 
 // Mid-stream the HTTP status is always 200 -- the headers left before anything
 // failed -- so error.metadata.error_type is the only thing that separates an
-// overflow we can compact our way out of from a dead upstream.
+// overflow the harness can compact out of from a dead upstream.
 func TestMidStreamErrorSurfacesRecoverableErrorType(t *testing.T) {
 	srv := sseServer(t, `data: {"choices":[{"delta":{"content":"hi"}}]}`+"\n\n"+
 		`data: {"error":{"message":"maximum context length exceeded","code":400,"metadata":{"error_type":"context_length_exceeded"}}}`+"\n\n")

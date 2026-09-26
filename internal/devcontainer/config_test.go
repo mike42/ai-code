@@ -25,8 +25,8 @@ func TestCommentsAreStripped(t *testing.T) {
 	}
 }
 
-// The old reader found the image by scanning for the text `"image"`, so a key
-// of that name nested anywhere else in the file won.
+// Scanning for the text `"image"` would match a key of that name nested
+// anywhere else in the file.
 func TestNestedImageKeyDoesNotWin(t *testing.T) {
 	raw := []byte(`{
   "build": {"dockerfile": "Dockerfile"},

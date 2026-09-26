@@ -1,11 +1,6 @@
 // Package provider defines the canonical message model and the client interface
-// every backend implements.
-//
-// The canonical types deliberately look like the OpenAI chat-completions API
-// rather than a lowest common denominator: that is the one wire format ai-code
-// speaks, and every backend we care about (lemonade, OpenRouter, llama.cpp,
-// vLLM, Ollama) exposes it. Backend-specific richness is added by optional
-// interfaces (see Introspector) rather than by widening Client.
+// every backend implements. The message model follows the OpenAI
+// chat-completions API; backend-specific richness lives in optional interfaces.
 package provider
 
 import (
@@ -14,9 +9,9 @@ import (
 	"fmt"
 )
 
-// Class separates providers we may send data to freely from providers that
-// carry compliance and privacy obligations. Switching a live session onto a
-// cloud model requires explicit confirmation; see internal/agent.
+// Class separates providers that may receive data freely from those under
+// compliance and privacy obligations. Switching a live session onto a cloud
+// model requires explicit confirmation; see internal/agent.
 type Class string
 
 const (
@@ -47,9 +42,8 @@ const (
 )
 
 // ToolCall is a single request from the model to run a tool. Args is raw JSON
-// exactly as the model produced it; validation happens at dispatch so that a
-// malformed call becomes a tool result the model can recover from rather than
-// an error that breaks the loop.
+// as the model produced it; validation happens at dispatch so a malformed call
+// becomes a tool result the model can recover from.
 type ToolCall struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
@@ -59,15 +53,14 @@ type ToolCall struct {
 // Message is one entry in the conversation.
 //
 // Invariant enforced by internal/agent/validate.go: every ToolCall in an
-// assistant message must be answered by exactly one RoleTool message carrying
-// the matching ToolCallID, in the messages immediately following it.
+// assistant message is answered by exactly one RoleTool message carrying the
+// matching ToolCallID, in the messages immediately following it.
 type Message struct {
 	Role    Role   `json:"role"`
 	Content string `json:"content,omitempty"`
 
-	// Reasoning holds a separate chain-of-thought channel when the backend
-	// exposes one (lemonade/llama.cpp emit `reasoning_content` deltas). It is
-	// rendered dimmed and, by default, not sent back on later turns.
+	// Reasoning holds a separate chain-of-thought channel (llama.cpp and
+	// lemonade emit `reasoning_content` deltas); rendered dimmed, not sent back.
 	Reasoning string `json:"reasoning,omitempty"`
 
 	// Assistant only.
@@ -79,15 +72,8 @@ type Message struct {
 	IsError    bool   `json:"is_error,omitempty"`
 
 	// PromptTokens and Completion are what the backend reported for the request
-	// that produced this assistant message: the tokens it had to read, and the
-	// tokens it generated. Zero on every other message, and on one whose
-	// reported figure failed the plausibility check in internal/agent.
-	//
-	// They live on the message rather than on the agent because a token count
-	// means nothing apart from the messages it described. A figure held in a
-	// field on the session cannot say which prefix it measured, so nothing can
-	// tell whether it still applies -- which is the whole of the accounting
-	// bug this design replaced.
+	// that produced this assistant message: tokens read and tokens generated.
+	// Zero elsewhere, and on any figure that failed the plausibility check.
 	PromptTokens int `json:"prefill,omitempty"`
 	Completion   int `json:"completion,omitempty"`
 }
@@ -109,7 +95,7 @@ type Request struct {
 	Stop        []string
 
 	// Effort is the thinking level for this call, already resolved against the
-	// model's detected shape. EffortUnset sends nothing.
+	// model's detected shape; EffortUnset sends nothing.
 	Effort Effort
 	// TemplateKwargs carries chat_template_kwargs for backends that route
 	// thinking controls through the template rather than reasoning_effort.
@@ -122,16 +108,13 @@ type Usage struct {
 	CachedTokens     int `json:"cached_tokens"`
 	TotalTokens      int `json:"total_tokens"`
 
-	// ReasoningTokens is the part of CompletionTokens spent thinking. On a
-	// model at maximum effort this routinely dwarfs the visible answer, which
-	// is why it is worth separating: a turn that looks cheap by output length
-	// can have consumed most of the window.
+	// ReasoningTokens is the part of CompletionTokens spent thinking; on a model
+	// at maximum effort it can dwarf the visible answer.
 	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
 	// CacheWriteTokens is what a provider charged to populate its prompt cache.
 	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
-	// Cost is what the provider says the call cost, in its own units. Taken
-	// from the response rather than derived from a local price table, which
-	// goes stale silently.
+	// Cost is what the provider says the call cost, in its own units, taken from
+	// the response rather than a local price table that goes stale.
 	Cost float64 `json:"cost,omitempty"`
 }
 
@@ -145,9 +128,8 @@ const (
 	EventUsage
 )
 
-// Event is one incremental update from a Stream. Consumers that only want the
-// finished message can ignore events entirely and read Stream.Message() after
-// the stream ends.
+// Event is one incremental update from a Stream; consumers that only want the
+// finished message can read Stream.Message() after the stream ends.
 type Event struct {
 	Kind      EventKind
 	Text      string
@@ -166,22 +148,18 @@ const (
 	StopToolCalls StopReason = "tool_calls"
 	StopLength    StopReason = "length"
 	StopAborted   StopReason = "aborted"
-	// StopError and StopContentFilter used to fall through the finish-reason
-	// switch, leaving the stop empty so a filtered or failed response was
-	// presented as a turn that completed normally.
+
 	StopError         StopReason = "error"
 	StopContentFilter StopReason = "content_filter"
 )
 
 // Stream yields incremental events and accumulates the final assistant message.
-//
-// Accumulation of streamed tool-call argument fragments lives here, in one
-// place, rather than in each consumer: reassembling those deltas is a classic
-// source of subtle corruption and it should have exactly one implementation.
+// Reassembly of streamed tool-call argument fragments lives here, in one
+// implementation, rather than in each consumer.
 type Stream interface {
 	// Recv returns the next event, or io.EOF when the stream is complete.
 	Recv() (Event, error)
-	// Message returns the accumulated assistant message. Valid once Recv has
+	// Message returns the accumulated assistant message, valid once Recv has
 	// returned io.EOF; safe to call earlier to inspect partial state.
 	Message() Message
 	Usage() Usage
@@ -193,9 +171,8 @@ type Stream interface {
 type ModelInfo struct {
 	ID string
 
-	// ContextWindow is the effective per-request context in tokens: what we may
-	// actually fill. For llama.cpp backends this is NOT ctx_size, because the KV
-	// cache is divided across --parallel slots. See EffectiveContext.
+	// ContextWindow is the effective per-request context in tokens, not
+	// llama.cpp's ctx_size: the KV cache is divided across --parallel slots.
 	ContextWindow int
 
 	// MaxContextWindow is the model's architectural limit, when known.
@@ -205,31 +182,28 @@ type ModelInfo struct {
 	// Parallel is the number of concurrent slots sharing CtxSize.
 	Parallel int
 
-	// KVUnified reports whether slots share one KV pool. When they do, a slot
-	// is not limited to CtxSize/Parallel. llama.cpp enables this by default iff
-	// the slot count was left to auto, so it cannot be inferred from Parallel.
+	// KVUnified reports whether slots share one KV pool; when they do, a slot is
+	// not limited to CtxSize/Parallel. Not inferable from Parallel.
 	KVUnified bool
-	// PerSlotLimit is an explicit --kv-unified-per-slot, which overrides both
-	// the division and KVUnified. Zero when not set.
+	// PerSlotLimit is an explicit --kv-unified-per-slot, overriding the division
+	// and KVUnified.
 	PerSlotLimit int
 
-	// Slots is the number of concurrent request slots observed on the backend,
-	// 0 when it does not report them. Distinct from Parallel, which is what the
-	// launch arguments asked for: `auto` resolves to a number only at runtime.
+	// Slots is the number of concurrent request slots observed on the backend, 0
+	// when it does not report them; distinct from Parallel, what was requested.
 	Slots int
 	// SlotsBusy is how many of them were processing when last observed.
 	SlotsBusy int
 
-	// MaxOutputTokens is the backend's own cap on a single completion, when it
-	// advertises one. Zero means unknown, not unlimited.
+	// MaxOutputTokens is the backend's own cap on a single completion; zero means
+	// unknown, not unlimited.
 	MaxOutputTokens int
 
 	SupportsTools bool
 	Labels        []string
 	Loaded        bool
 
-	// Estimated marks a ContextWindow that was inferred rather than observed,
-	// so the UI can say so instead of implying a measurement.
+	// Estimated marks a ContextWindow that was inferred rather than observed.
 	Estimated bool
 }
 
@@ -242,8 +216,7 @@ type Client interface {
 }
 
 // Health is the state of a backend that can only hold a limited number of
-// models resident. On a single-slot server this is how ai-code detects that
-// something else evicted the model a session was using.
+// models resident; on a single-slot server it shows when the model was evicted.
 type Health struct {
 	Ready       bool
 	ModelLoaded string
@@ -253,8 +226,7 @@ type Health struct {
 }
 
 // Introspector is implemented by backends that can report and control model
-// residency. Absence of this interface is not an error; it means ai-code falls
-// back to assuming the requested model is always servable.
+// residency; when absent, the requested model is assumed servable.
 type Introspector interface {
 	Health(ctx context.Context) (*Health, error)
 	Load(ctx context.Context, model string) error

@@ -1,9 +1,4 @@
 // Command ai-code is a coding agent for the terminal.
-//
-// Design commitments, in the order they get compromised in other harnesses:
-// no telemetry of any kind; no provider lock-in; self-hosted backends are the
-// primary target rather than an afterthought; the terminal's own scrollback,
-// search and selection keep working; and it starts instantly.
 package main
 
 import (
@@ -55,11 +50,8 @@ func main() {
 		}
 		var restart *restartRequest
 		if errors.As(err, &restart) {
-			// Last thing this process does. Every deferred teardown has run by
-			// now -- the session file is flushed and closed, the renderer's
-			// ticker is stopped, the terminal is back in its own mode -- which
-			// is the entire reason the request travels up here instead of
-			// exec'ing where it was raised.
+			// Last thing this process does: every deferred teardown has run by
+			// now, which is why the request travels up here.
 			err = execSelf(restart.binary, restart.argv)
 			fmt.Fprintln(os.Stderr, "ai-code: could not restart: "+err.Error())
 			os.Exit(1)
@@ -81,10 +73,8 @@ type restartRequest struct {
 func (r *restartRequest) Error() string { return "restart" }
 
 func run() error {
-	// Internal mode: run the tool executor as a JSON-lines server on stdio,
-	// inside a sandbox (devcontainer or future remote host). Not a user-facing
-	// flag; it is how a DevcontainerExecutor talks to the container. It is
-	// checked before flag parsing so the flag parser does not reject it.
+	// Internal mode: serve the tool executor as a JSON-lines server on stdio
+	// inside a sandbox, checked before flag parsing.
 	if len(os.Args) > 2 && os.Args[1] == "--executor-daemon" {
 		if cwd, err := os.Getwd(); err == nil {
 			return runExecutorDaemon(cwd)
@@ -109,16 +99,13 @@ func run() error {
 		return err
 	}
 
-	// A .nocloud file in the working directory or any parent marks the tree as
-	// off-limits to cloud providers. Restrict everything -- sessions and the
-	// subcommands that touch a provider -- to on-premises providers so an
-	// internal code-base cannot accidentally end up on a cloud model.
+	// A .nocloud file in the working directory or a parent marks the tree
+	// off-limits to cloud providers.
 	nocloud := config.NoCloud(cwd)
 	if nocloud {
 		fmt.Fprintln(os.Stderr, "ai-code: .nocloud detected -- restricting to on-premises providers")
 	}
 
-	// Subcommands that do not start a session.
 	if len(f.args) > 0 {
 		switch f.args[0] {
 		case "models":
@@ -265,32 +252,28 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error 
 			modeName, strings.Join(cfg.ModeNames(), ", "))
 	}
 
-	// Compute the project root (git root, or cwd) once. The executor mounts this
-	// into a devcontainer and tools run against it there.
+	// The project root (git root, or cwd) is what a devcontainer mounts and
+	// tools run against.
 	env := prompt.DetectEnv(cwd)
 	projectRoot := env.GitRoot
 	if projectRoot == "" {
 		projectRoot = cwd
 	}
 	// Kept before anything rewrites env for a container: AGENTS.md files are
-	// read off this machine's disk whatever the model is told about paths,
-	// and the walk that finds them has to stop at this machine's git root.
+	// read off this machine's disk.
 	hostGitRoot := env.GitRoot
 	// nil means the model's paths and this machine's are the same thing.
 	var showPath func(string) (string, bool)
 
-	// Decide where tools run. This is a safety decision and is fixed for the
-	// session. Only a flag parse and a filesystem probe happen here -- anything
-	// slow (container engine detection, starting a container, an SSH handshake)
-	// is deferred to the first tool call so the user reaches a prompt instantly.
+	// Where tools run is a safety decision, fixed for the session. Slow work is
+	// deferred to the first tool call.
 	rt, err := runtime.Resolve(f.runtime, cwd)
 	if err != nil {
 		return err
 	}
 
-	// Pick the executor for the resolved runtime. The local executor runs tools
-	// in this process; the devcontainer executor lazily starts a container on
-	// the first tool call and runs the same binary inside it as a daemon.
+	// The local executor runs tools in this process; the devcontainer executor
+	// starts a container on the first tool call.
 	var exe tool.Executor
 	var toolState *tool.State
 	switch rt.Kind {
@@ -299,9 +282,8 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error 
 		if err != nil {
 			return fmt.Errorf("could not find the ai-code binary to run in the container: %w", err)
 		}
-		// Expand the configuration's ${...} references before anything reads
-		// it. workspaceFolder is resolved as part of this, and the rest of
-		// this block depends on knowing it.
+		// Expand ${...} references before anything reads the config;
+		// workspaceFolder is resolved here.
 		if rt.Config != nil {
 			rt.Config.SubstituteAll(projectRoot, devcontainerID(projectRoot))
 		}
@@ -309,10 +291,8 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error 
 		exe = dc
 		defer dc.Close()
 
-		// Tools run inside the container, where the project is mounted at the
-		// configuration's workspaceFolder. The model is told the host paths
-		// otherwise, and every path it derives from them is wrong -- including
-		// the working directory it starts from.
+		// Tools run inside the container, where the project is mounted at
+		// workspaceFolder; telling the model host paths would be wrong.
 		workspaceFolder := "/workspace"
 		if rt.Config != nil {
 			workspaceFolder = rt.Config.WorkspaceFolder
@@ -321,9 +301,8 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error 
 		if env.IsGitRepo {
 			env.GitRoot = workspaceFolder
 		}
-		// The shell and platform belong to the container too. Reporting this
-		// machine's is not a disclosure so much as a wrong answer: the model
-		// picks commands on the strength of them.
+		// The shell and platform belong to the container: the model picks
+		// commands on the strength of them.
 		env.Shell = ""
 		env.OS = "linux"
 		showPath = func(hostPath string) (string, bool) {
@@ -343,9 +322,8 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error 
 			}
 		}
 
-		// A configuration key that is read but not acted on is reported once,
-		// here, rather than being discovered as behaviour that silently did
-		// not happen.
+		// A configuration key read but not acted on is reported here, rather
+		// than silently ignored.
 		if rt.Config != nil {
 			if missing := rt.Config.Unsupported(); len(missing) > 0 {
 				fmt.Fprintf(os.Stderr, "devcontainer.json: not applied by this build: %s\n",
@@ -366,13 +344,12 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error 
 			return fmt.Errorf("agent.thinking: %w", err)
 		}
 	}
-	// The task tool is added here, outside the executor boundary, because a
-	// worker needs the agent. It stays dormant until Attach below.
+	// The task tool sits outside the executor boundary because a worker needs
+	// the agent; dormant until Attach.
 	tasks := agent.NewTaskExecutor(exe)
 	exe = tasks
 
-	// Renderer selection. Non-interactive output is a first-class consumer of
-	// the same event stream, not a degraded fallback.
+	// Non-interactive output consumes the same event stream as the terminal.
 	screen := render.NewScreen(os.Stdout, cfg.UI.Color)
 	defer watchResize(screen)()
 	var (
@@ -385,14 +362,11 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error 
 		sink = render.NewJSON(os.Stdout)
 	case !screen.IsTTY():
 		// Piped or redirected: plain text, no escapes, no cursor movement.
-		// This is how ai-code is tested, scripted and run in CI.
 		plain := render.NewPlain(os.Stdout, f.verbose)
 		sink, verbosity = plain, plain
 	default:
-		// A terminal gets the full renderer even for a one-shot --print run.
-		// Deciding by output destination rather than by mode means `ai-code -p
-		// "..."` in a terminal is styled and `ai-code -p "..." > file` is not,
-		// which is what both cases actually want.
+		// A terminal gets the full renderer even for --print; the output
+		// destination decides, not the mode.
 		showStatus := !f.noStatus && (cfg.UI.StatusLine == nil || *cfg.UI.StatusLine)
 		interactive = render.NewInteractive(screen, render.InteractiveOptions{
 			ShowStatus:  showStatus,
@@ -417,8 +391,8 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error 
 		providerName: providerName,
 		providerCfg:  pc,
 		model:        model,
-		// The banner is about to say this, which makes it the first thing a
-		// later change is measured against.
+		// The banner is about to say this, so a later change is measured
+		// against it.
 		knownModel:  model.ID,
 		modeName:    modeName,
 		exec:        exe,
@@ -433,9 +407,8 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error 
 		flags:       f,
 	}
 
-	// An executor that can block for minutes on its first call reports what
-	// it is doing through the renderer, so it lands in the zone the renderer
-	// owns rather than as raw writes over it.
+	// An executor that blocks for minutes on its first call reports through
+	// the renderer's own zone.
 	if pr, ok := exe.(tool.ProgressReporter); ok {
 		pr.SetProgress(app.progress)
 	}
@@ -447,13 +420,9 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error 
 	}
 	defer app.closeSession()
 
-	// The renderer is the only event sink. Messages reach the transcript from
-	// the agent's own message list after each turn rather than from the event
-	// stream: the transcript must hold exactly what was sent to the model, and
-	// events are a rendering of that, not the thing itself.
-	// The App is a second consumer of the same stream, for the one figure the
-	// prompt marker needs between turns. It is a consumer and not a caller:
-	// see App.noteContext.
+	// The renderer is the only event sink; messages reach the transcript from
+	// the agent's message list, which holds exactly what was sent. The App is a
+	// second consumer of the stream, for the prompt marker's context figure.
 	app.agent = agent.New(client, model.ID, exe,
 		agent.MultiSink{sink, agent.SinkFunc(app.noteContext)}, agent.Options{
 			MaxIterations:   cfg.Agent.MaxIterations,
@@ -472,21 +441,18 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error 
 			ReserveTokens:    cfg.Agent.CompactReserveTokens,
 			KeepRecentTokens: cfg.Agent.CompactKeepRecentTokens,
 		})
-	// After Attach, so the tool list the prompt recites includes the task tool
-	// on the sessions that have one.
+	// After Attach, so the prompt recites the task tool.
 	tasks.Attach(ctx, app.agent)
 	app.workers = tasks.Pool()
 	app.wireWorkers()
-	// Workers outlive turns, so nothing else in the loop ends them. Without
-	// this a session that quits with one running leaves it writing to the
-	// tree after the prompt has gone.
+	// Workers outlive turns, so nothing else ends them; without this one would
+	// keep writing after the prompt is gone.
 	defer app.workers.Cancel()
-	// The loop's own boundary is where a run can be stopped cleanly, and the
-	// only place a long agentic run can be reached from outside.
+	// The loop boundary is the only place a long agentic run can be stopped
+	// from outside.
 	app.agent.SetTurnBoundary(app.stopForSwap)
 
-	// Announce this window to the others. A failure is not worth reporting:
-	// the session works, it just cannot be considered by a peer's model swap.
+	// A failed registration is not worth reporting: the session works without it.
 	app.coordDir = coord.DefaultDir()
 	if reg, err := coord.Register(app.coordDir, coord.Peer{
 		Session:  sessionID(app),
@@ -559,16 +525,6 @@ func readAllStdin() (string, error) {
 	}
 	return b.String(), nil
 }
-
-// watchResize keeps the screen's idea of the terminal width current.
-//
-// It matters only for the transient zone, and there it matters absolutely:
-// every transient line is truncated to the width so that it occupies exactly
-// one row, and the erase that precedes the next commit walks up a counted
-// number of rows. Against a stale width the truncation is too generous, the
-// line wraps, the count is wrong, and the erase leaves half of it behind in the
-// scrollback. Committed text needs nothing -- the terminal reflows it, which is
-// the advantage of not owning the screen.
 
 // installInterrupt wires Ctrl-C to context cancellation rather than to process
 // death. A killed process leaves the transcript with an unanswered tool call;
@@ -707,10 +663,8 @@ func cmdModels(f *flags, cwd string, nocloud bool) error {
 	fmt.Printf("%s (%s)\n\n", name, pc.BaseURL)
 	fmt.Println(formatModelList(models, 500))
 
-	// State the slot arithmetic explicitly. A server reporting a large ctx_size
-	// while running several parallel slots gives each request a fraction of it,
-	// and reading the headline number is how people end up with mid-session
-	// context errors they cannot explain.
+	// A large ctx_size split across several parallel slots gives each request a
+	// fraction of it.
 	for _, m := range models {
 		if windowIsDivided(m) {
 			fmt.Printf("\nNote: %s splits a %s KV cache across %d slots,\n"+

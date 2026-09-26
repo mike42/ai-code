@@ -5,15 +5,9 @@ import (
 	"strings"
 )
 
-// Truncate shortens tool output that would otherwise eat the context window.
-//
-// It keeps both ends. That is not an aesthetic choice: the useful part of build
-// output, test runs and stack traces is at the *end*, and head-only truncation
-// throws away exactly the lines the model needs. The elision marker states how
-// much was removed so the model knows it is looking at an excerpt and can go
-// back for more with a narrower command.
-//
-// headShare controls the split; 0.4 keeps 40% of the budget at the top.
+// Truncate shortens tool output that would otherwise eat the context window,
+// keeping the start and the end: build output and stack traces pay off at the
+// end.
 func Truncate(s string, maxBytes int) (string, bool) {
 	return truncateShare(s, maxBytes, 0.4)
 }
@@ -56,8 +50,7 @@ func truncateShare(s string, maxBytes int, headShare float64) (string, bool) {
 
 	elidedLines := tailStart - headEnd
 	if elidedLines <= 0 {
-		// Budgets met in the middle: nothing actually elided, but the content
-		// still exceeded maxBytes, so a single very long line is the culprit.
+		// Budgets met in the middle: nothing elided, but one very long line exceeded maxBytes.
 		return truncateMiddle(s, maxBytes), true
 	}
 
@@ -101,9 +94,7 @@ func plural(n int, word string) string {
 	return fmt.Sprintf("%d %s", n, pluralise(word))
 }
 
-// pluralise handles the sibilant endings that a bare "+s" gets wrong. "match"
-// becoming "matchs" in tool output is small, but it is the kind of small that
-// makes a tool feel unfinished.
+// pluralise handles sibilant endings that a bare "+s" gets wrong.
 func pluralise(word string) string {
 	switch {
 	case strings.HasSuffix(word, "s"), strings.HasSuffix(word, "x"),

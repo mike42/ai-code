@@ -21,42 +21,28 @@ import (
 	"ai-code/internal/tool"
 )
 
-// DevcontainerExecutor runs tools inside the project's devcontainer.
-//
-// Startup is deferred to the first Execute call, so the user reaches a prompt
-// without waiting on engine detection and a container start.
-//
-// It launches the same binary inside the container in --executor-daemon mode
-// over an attached pipe and speaks JSON-lines to it, which remotes the whole
-// tool set and keeps the file tools on the same filesystem as the shell.
+// DevcontainerExecutor runs tools inside the project's devcontainer, launching
+// the same binary there in --executor-daemon mode over an attached pipe. The
+// container starts on the first Execute call, not at startup.
 type DevcontainerExecutor struct {
-	// cfg is the parsed devcontainer.json. It decides the image, the mounts,
-	// the user and everything else about the container.
+	// cfg is the parsed devcontainer.json.
 	cfg *devcontainer.Config
-	// cfgErr is a devcontainer.json that could not be parsed. Startup declined
-	// to fail on it so the user got a session; it is reported here, where the
-	// container is actually needed.
+	// cfgErr is a devcontainer.json that could not be parsed; reported when the
+	// container is needed.
 	cfgErr error
 	// project is the host directory mounted into the container.
 	project string
 	// binary is the path to this ai-code binary on the host.
 	binary string
-	// workdir is the container path the daemon starts in -- the mounted
-	// equivalent of the directory the user launched ai-code from.
+	// workdir is the container path the daemon starts in.
 	workdir string
-	// progress names each startup phase as it is reached, so a tool call that
-	// waits minutes for a container says why while it waits. A note after the
-	// wait would not do: the point is to speak during it. nil in a session
-	// with nowhere to show it. Set once, before the executor is used.
+	// progress names each startup phase as it is reached.
 	progress tool.Progress
-	// ready guards the one-off "ready" note, and is cleared by teardown so a
-	// restarted container announces itself again.
+	// ready guards the one-off "ready" note; teardown clears it.
 	ready bool
 
-	// host is set on a forked executor and names the one that owns the
-	// container. A fork runs a second daemon inside that container rather
-	// than starting a container of its own, so the two agents share a
-	// filesystem exactly and differ only in which shell they are talking to.
+	// host names the executor that owns the container on a fork; a fork runs a
+	// second daemon inside it, so agents share a filesystem.
 	host *DevcontainerExecutor
 
 	mu   sync.Mutex
@@ -64,25 +50,18 @@ type DevcontainerExecutor struct {
 	enc  *json.Encoder
 	dec  *json.Decoder
 	init error
-	// cid is the container this executor started, once it has started one,
-	// and engine the command that started it. Read by forks, which exec into
-	// it. Taken from --cidfile rather than from a name we chose: the engine
-	// reports the container it actually created, which stays correct even if
-	// the project's runArgs renamed it.
+	// cid is the container this executor started, from --cidfile; engine is the
+	// command that started it, and forks exec into cid.
 	cid    string
 	engine string
-	// stderr holds the engine's captured output, for a failure report. It is
-	// only meaningful after start has launched the container.
+	// stderr holds the engine's captured output, for a failure report.
 	stderr *cappedBuffer
 }
 
-// stderrCap bounds how much podman startup output we retain for a failure
-// report. Enough to show the real error, not a dump of progress bars.
+// stderrCap bounds the podman startup output kept for a failure report.
 const stderrCap = 64 * 1024
 
-// cappedBuffer keeps only the tail of what is written to it, so a chatty
-// subprocess cannot accumulate unbounded output while we hold it for a failure
-// report.
+// cappedBuffer keeps only the tail of what is written to it.
 type cappedBuffer struct {
 	buf []byte
 }
@@ -102,15 +81,9 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 func (b *cappedBuffer) String() string { return string(b.buf) }
 
 // NewDevcontainerExecutor wires up a lazily-started devcontainer executor.
-//
-// project is the host directory mounted into the container; cwd is the
-// directory the user launched ai-code from, which may be a subdirectory of
-// project. The daemon starts in the mounted equivalent of cwd so the agent's
-// first shell prompt lands where the user is, not at the mount root.
+// project is the mount source; cwd is the launch directory.
 func NewDevcontainerExecutor(cfg *devcontainer.Config, cfgErr error, project, cwd, binary string) *DevcontainerExecutor {
-	// The mount source must be absolute: it is passed to the container engine on
-	// the host, where relative paths would resolve against the engine's cwd
-	// rather than ours. Resolve it here so a `./ai-code` launch still works.
+	// The mount source must be absolute or the engine resolves it against its own cwd.
 	if abs, err := filepath.Abs(binary); err == nil {
 		binary = abs
 	}
@@ -148,10 +121,8 @@ func compactDuration(d time.Duration) string {
 	return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
 }
 
-// mountCwd maps the user's launch directory into the container's mount layout.
-// The project is mounted at workspaceFolder, so a cwd inside it becomes
-// workspaceFolder/<relative path>. Anything that escapes the project (or that
-// cannot be relativised) falls back to the mount root.
+// mountCwd maps the launch directory into the container's mount layout; a cwd
+// outside the project falls back to the mount root.
 func mountCwd(project, cwd, workspaceFolder string) string {
 	if workspaceFolder == "" {
 		workspaceFolder = "/workspace"
@@ -163,18 +134,14 @@ func mountCwd(project, cwd, workspaceFolder string) string {
 	return path.Join(workspaceFolder, filepath.ToSlash(rel))
 }
 
-// start brings the container up on first use. It is not called from the startup
-// path; only from Execute.
-//
-// The context is the turn's, so Ctrl-C during a multi-minute image build stops
-// the build. It does not govern the container itself, which has to outlive the
-// call that started it.
+// start brings the container up on first use, called only from Execute. The
+// context is the turn's, so Ctrl-C during an image build stops the build; the
+// container itself outlives the call.
 func (e *DevcontainerExecutor) start(ctx context.Context) error {
 	if e.init != nil || e.cmd != nil {
 		return e.init
 	}
-	// A fork has no container of its own to bring up; it attaches a second
-	// daemon to the one its host owns.
+	// A fork has no container of its own; it attaches a daemon to its host's.
 	if e.host != nil {
 		return e.startForked(ctx)
 	}
@@ -194,17 +161,13 @@ func (e *DevcontainerExecutor) start(ctx context.Context) error {
 		e.init = err
 		return err
 	}
-	// The command's own timeout does not start until the container is up --
-	// it is applied by the bash tool running inside it -- which is the first
-	// thing anyone watching a four-minute tool call wants to know.
+	// The command's timeout starts once the container is up, in the bash tool inside it.
 	e.report("devcontainer: preparing the container with %s. The command has not started yet, "+
 		"so its timeout is not running.", engine)
 
 	image, err := e.resolveImage(ctx, engine)
 	if err != nil {
-		// A build the user interrupted is not a broken configuration. Caching
-		// it would make one Ctrl-C disable the container for the rest of the
-		// session.
+		// An interrupted build is not a broken configuration, so do not cache it.
 		if ctx.Err() != nil {
 			return err
 		}
@@ -214,19 +177,15 @@ func (e *DevcontainerExecutor) start(ctx context.Context) error {
 
 	argv := e.cfg.RunArgv(e.project, e.workdir, e.binary, binInContainer)
 
-	// --cidfile after RunArgv, so the id belongs to the container that was
-	// actually created. The engine refuses to write to a file that exists, so
-	// the name is fresh and the file is removed rather than truncated.
+	// --cidfile after RunArgv binds the id to the container actually created;
+	// the name is fresh because the engine refuses an existing file.
 	cidfile := filepath.Join(os.TempDir(), fmt.Sprintf("ai-code-cid-%d-%d", os.Getpid(), time.Now().UnixNano()))
 	os.Remove(cidfile)
 	argv = append(argv, "--cidfile", cidfile)
 	argv = append(argv, image, "--executor-daemon", e.workdir)
 	e.engine = engine
 
-	// Checked rather than assumed: the engine pulls a missing image as part of
-	// run, and that is the long wait for an "image" configuration exactly as a
-	// build is for a "build" one. Claiming a pull that did not happen would be
-	// as unhelpful as saying nothing.
+	// The engine pulls a missing image during run, so only report a real pull.
 	if !devcontainer.HaveImage(engine, image) {
 		e.report("devcontainer: pulling %s. The first time, this can take several minutes.", image)
 	}
@@ -249,12 +208,8 @@ func (e *DevcontainerExecutor) start(ctx context.Context) error {
 		e.init = fmt.Errorf("container stdout: %w", err)
 		return e.init
 	}
-	// The engine's stderr is captured, never streamed to the terminal. Startup
-	// and image-pull progress is noisy, multi-line and interleaved with nothing
-	// the renderer owns -- streaming it would corrupt the transient zone (the
-	// thinking marquee, the spinner) with raw terminal writes it cannot clean
-	// up. The tail is kept and reported if startup fails; a successful run
-	// discards it.
+	// The engine's stderr is captured, never streamed: its multi-line progress
+	// would corrupt the renderer's transient zone. Kept for a failure report.
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		e.init = fmt.Errorf("container stderr: %w", err)
@@ -268,8 +223,7 @@ func (e *DevcontainerExecutor) start(ctx context.Context) error {
 		return e.init
 	}
 	go func() {
-		// Drain so a chatty engine cannot block on a full pipe while the agent
-		// waits for its tool result.
+		// Drain so a chatty engine cannot block on a full pipe.
 		io.Copy(stderr, stderrPipe)
 	}()
 
@@ -280,17 +234,12 @@ func (e *DevcontainerExecutor) start(ctx context.Context) error {
 	return nil
 }
 
-// binInContainer is where this binary is mounted inside the container. The
-// daemon, and every forked daemon, is that binary.
+// binInContainer is where this binary is mounted inside the container.
 const binInContainer = "/ai-code-bin"
 
-// readCIDFile waits briefly for the engine to record the container id.
-//
-// The engine writes it at creation, which is a moment after our process
-// starts, so the first look is usually too early. An id that never appears is
-// not a failure of the session -- the container is up and the first daemon is
-// answering -- it only means forks cannot exec into it, which is reported at
-// the point a fork is asked for.
+// readCIDFile waits briefly for the engine to record the container id, which
+// it writes a moment after creation. An id that never appears only disables
+// forks, which is reported where a fork is asked for.
 func readCIDFile(path string) string {
 	defer os.Remove(path)
 	for range 100 {
@@ -304,23 +253,13 @@ func readCIDFile(path string) string {
 	return ""
 }
 
-// Fork runs a second executor daemon inside the same container.
-//
-// Not a second container: the point of a fork is an agent that sees exactly
-// what its parent sees, and a second container would diverge on everything
-// written outside the workspace mount -- installed packages, build caches,
-// /tmp -- which is most of what a worker doing real work produces.
-//
-// The container is not started here. A fork is created while the parent may
-// still be idle, and a worker that turns out to need no shell at all would
-// pay minutes for nothing. The exec happens on the fork's first tool call,
-// against whatever container the parent has by then, and Close ends it when
-// the worker is done.
+// Fork runs a second executor daemon inside the same container, so a worker
+// sees everything its parent does. Nothing starts here: the exec happens on
+// the fork's first tool call, against the parent's container.
 func (e *DevcontainerExecutor) Fork() (tool.Executor, error) {
 	host := e
 	if e.host != nil {
-		// A fork of a fork still belongs to the container's owner. Chaining
-		// would make the daemon depth follow the agent depth for no reason.
+		// A fork of a fork still belongs to the container's owner.
 		host = e.host
 	}
 	return &DevcontainerExecutor{
@@ -356,12 +295,7 @@ func (e *DevcontainerExecutor) startForked(ctx context.Context) error {
 				"cannot be given its own shell inside it")
 		return e.init
 	}
-	// Asked rather than assumed. The host reports a started *process*, which
-	// is not a running container: a `run` that fails leaves the process
-	// exiting a moment later, and the first thing anyone sees is a worker
-	// exec'ing into an id that no longer exists. Ask the engine, and report
-	// what it said about the container rather than what it said about the
-	// exec that could not find it.
+	// A started process is not a running container, so ask the engine.
 	if !containerRunning(engine, cid) {
 		e.host.mu.Lock()
 		why := e.host.stderrTail()
@@ -410,8 +344,8 @@ func (e *DevcontainerExecutor) startForked(ctx context.Context) error {
 	return nil
 }
 
-// resolveImage produces the image to run: the one the configuration names, or
-// one built from its Dockerfile.
+// resolveImage produces the image to run: the configured one, or one built from
+// its Dockerfile.
 func (e *DevcontainerExecutor) resolveImage(ctx context.Context, engine string) (string, error) {
 	switch e.cfg.Kind() {
 	case devcontainer.KindImage:
@@ -422,9 +356,7 @@ func (e *DevcontainerExecutor) resolveImage(ctx context.Context, engine string) 
 		if err != nil {
 			return "", err
 		}
-		// The engine's layer cache makes an unchanged rebuild cheap, but not
-		// free, and the tag already changes whenever the Dockerfile does. An
-		// image we have built before is therefore taken as current.
+		// The tag changes whenever the Dockerfile does, so a tagged image is current.
 		if devcontainer.HaveImage(engine, tag) {
 			return tag, nil
 		}
@@ -454,15 +386,9 @@ func (e *DevcontainerExecutor) resolveImage(ctx context.Context, engine string) 
 	}
 }
 
-// Execute runs a tool in the container, starting it on first use.
-//
-// A container that has died is restarted rather than reported, once per call.
-// The failure this recovers from is a write to a closed pipe, which is what a
-// container that exited between two tool calls looks like from here -- and
-// because start() treated a non-nil cmd as a live one, the old behaviour was
-// to keep writing to that same dead pipe for the rest of the session. Every
-// subsequent tool call failed identically and no amount of retrying by the
-// model could clear it.
+// Execute runs a tool in the container, starting it on first use. A dead
+// container is restarted once per call: its closed pipe fails every later
+// write identically, so a restart is the only recovery.
 func (e *DevcontainerExecutor) Execute(ctx context.Context, req tool.Request) (tool.Result, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -472,9 +398,7 @@ func (e *DevcontainerExecutor) Execute(ctx context.Context, req tool.Request) (t
 	}
 
 	if err := e.enc.Encode(req); err != nil {
-		// Nothing was delivered, so re-running it cannot double-execute
-		// anything. Take the container down, bring a fresh one up and send it
-		// once more before giving up.
+		// Nothing was delivered, so re-running cannot double-execute.
 		first := e.failure("write", err)
 		e.teardown()
 		if err := e.start(ctx); err != nil {
@@ -488,36 +412,25 @@ func (e *DevcontainerExecutor) Execute(ctx context.Context, req tool.Request) (t
 
 	var res tool.Result
 	if err := e.dec.Decode(&res); err != nil {
-		// Deliberately not retried: the request was delivered, so the tool may
-		// already have run. Re-sending a write or an edit because the reply
-		// went missing is worse than reporting the failure. The container is
-		// still torn down, so the next call starts a clean one.
+		// Not retried: the request was delivered, so a write or edit may have run.
 		msg := e.failure("read", err)
 		e.teardown()
 		return tool.Errorf("%s", msg), nil
 	}
 	if !e.ready {
-		// Announced here rather than after Start, because a started container
-		// is not yet a working one -- this reply is the first evidence that
-		// the agent inside it is answering.
+		// The first reply is the first evidence the container daemon answers.
 		e.ready = true
 		e.report("devcontainer: ready.")
 	}
 	return res, nil
 }
 
-// failure describes a dead container in terms of what actually happened to it.
-//
-// "broken pipe" on its own sends people looking at ai-code when the engine has
-// printed the real reason -- a missing mount source, an image that will not
-// run, an OOM kill -- and thrown it away. The exit status and the engine's own
-// output are the diagnosis, so they go in the message.
+// failure reports a dead container with the engine's exit status and stderr,
+// not a bare "broken pipe".
 func (e *DevcontainerExecutor) failure(op string, err error) string {
 	status := ""
 	if e.cmd != nil && e.cmd.Process != nil {
-		// Reap it so the exit status is knowable. Nothing else waits on this
-		// process, so without it a container that exited on its own stays a
-		// zombie and its status is lost.
+		// Reap it: nothing else waits on this process, so the status would be lost.
 		_ = e.cmd.Process.Kill()
 		_ = e.cmd.Wait()
 		if st := e.cmd.ProcessState; st != nil {
@@ -537,12 +450,8 @@ func (e *DevcontainerExecutor) teardown() {
 	e.stderr = nil
 }
 
-// Definitions advertises the same tools as the local executor. The container
-// serves identical definitions from the same binary, so this is safe to
-// advertise before the container starts.
+// Definitions advertises the same tools as the local executor, built locally.
 func (e *DevcontainerExecutor) Definitions() []tool.Definition {
-	// Build the definitions locally so the model sees them without waiting for
-	// the container. The daemon builds the same set from the same binary.
 	cfg, err := config.Load(e.project)
 	if err != nil {
 		return nil
@@ -551,8 +460,7 @@ func (e *DevcontainerExecutor) Definitions() []tool.Definition {
 	return exec.Definitions()
 }
 
-// IsReadOnly reports whether a tool is safe to run concurrently. The container
-// serves the same tools from the same binary.
+// IsReadOnly reports whether a tool is safe to run concurrently.
 func (e *DevcontainerExecutor) IsReadOnly(name string) bool {
 	return isReadOnlyLocally(e.project, name)
 }
@@ -569,9 +477,7 @@ func (e *DevcontainerExecutor) Close() error {
 	return err
 }
 
-// stderrTail returns the tail of podman's captured stderr, formatted as a
-// diagnostic appendix. Empty when there was nothing to capture or the start
-// failed before the pipe existed.
+// stderrTail returns the tail of podman's captured stderr, or "".
 func (e *DevcontainerExecutor) stderrTail() string {
 	if e.stderr == nil {
 		return ""
@@ -580,14 +486,12 @@ func (e *DevcontainerExecutor) stderrTail() string {
 	if s == "" {
 		return ""
 	}
-	// A single newline keeps the appended block out of the tool's own first
-	// line.
+	// A single newline keeps the block out of the tool's own first line.
 	return "\n\nContainer engine output:\n" + s
 }
 
-// detectContainerEngine picks podman or docker. This is the potentially slow
-// step, and it is why startup defers it: probing podman on a machine where it
-// is not installed can take seconds, and the user should not wait.
+// detectContainerEngine picks podman or docker; probing is slow, so startup
+// defers it.
 func detectContainerEngine() (string, error) {
 	for _, eng := range []string{"podman", "docker"} {
 		if p, err := exec.LookPath(eng); err == nil {
@@ -597,8 +501,7 @@ func detectContainerEngine() (string, error) {
 	return "", fmt.Errorf("no container engine found (tried podman, docker)")
 }
 
-// isReadOnlyLocally mirrors the local executor's read-only map without holding
-// a container. Used to keep concurrency decisions consistent before start.
+// isReadOnlyLocally mirrors the local executor's read-only map without a container.
 func isReadOnlyLocally(project, name string) bool {
 	cfg, err := config.Load(project)
 	if err != nil {

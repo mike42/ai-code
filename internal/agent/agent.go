@@ -13,17 +13,12 @@ import (
 )
 
 type Options struct {
-	// MaxIterations caps the turns one Run may take. 0 -- the default -- is
-	// unlimited: the runaway cases a turn count looked like it was covering
-	// are covered by looping() and guardContext() instead.
+	// MaxIterations caps the turns one Run may take; 0 is unlimited.
 	MaxIterations int
-	// MaxTokens is a ceiling on one response, not the cap ai-code sends. The
-	// cap is derived from the window every turn (see outputBudget); this only
-	// lowers it further. 0 means no ceiling of the user's own.
+	// MaxTokens is a ceiling on one response, below the window-derived cap; 0 means none.
 	MaxTokens int
-	// MaxOutputTokens is the backend's own limit on a single completion, from
-	// ModelInfo.MaxOutputTokens. 0 when unknown -- which is not the same as
-	// unlimited, so it only ever lowers the cap, never raises it.
+	// MaxOutputTokens is the backend's limit on a single completion, 0 when unknown.
+	// It only ever lowers the cap, never raises it.
 	MaxOutputTokens int
 	Temperature     *float64
 	TopP            *float64
@@ -34,11 +29,10 @@ type Options struct {
 	// WarnPercent is the occupancy at which the agent emits a context warning.
 	WarnPercent int
 
-	// AutoCompact summarises the session when it reaches the reserve rather
-	// than stopping and asking.
+	// AutoCompact summarises the session when it reaches the reserve instead of stopping.
 	AutoCompact bool
-	// ReserveTokens is the room kept free at the top of the window: enough for
-	// one full response plus the summarisation call compaction itself makes.
+	// ReserveTokens is the room kept free at the top of the window: one response
+	// plus the summarisation call compaction makes.
 	ReserveTokens int
 	// KeepRecentTokens is how much of the tail survives compaction verbatim.
 	KeepRecentTokens int
@@ -56,73 +50,43 @@ type Agent struct {
 	system   string
 	messages []provider.Message
 
-	// Token accounting lives in accounting.go. Ground truth is recorded on the
-	// assistant message it describes; the only accounting state here is the
-	// ratio, which is a property of the model rather than of the messages, and
-	// the position that says which recorded figures still apply.
-	//
-	// charsSent is the size of the request currently in flight, kept so the
-	// response can be divided by it.
+	// charsSent is the size of the request in flight, so the response can be divided by it.
 	charsSent int
-	// charsPerToken is the measured ratio, defaultCharsPerToken until a
-	// response has been seen.
+	// charsPerToken is the measured ratio; defaultCharsPerToken until a response is seen.
 	charsPerToken float64
-	// requestChangedAt is the length of the transcript when what sits in front
-	// of it last moved. A prefill recorded before that point described a
-	// prefix that no longer exists. See requestChanged.
+	// requestChangedAt is the transcript length when the request prefix last moved.
 	requestChangedAt int
-	// toolChars caches the size of the tool definitions, which are sent on
-	// every request and do not change during a session.
+	// toolChars caches the size of the tool definitions, constant per session.
 	toolChars int
 	warned    bool
 
 	readOnly func(name string) bool
 
-	// steer holds messages typed while the turn was running. They are appended
-	// at turn boundaries rather than injected where they arrive, because the
-	// message list has a shape the provider enforces: a user message may not
-	// come between an assistant message that requested tools and the results of
-	// those tools. Waiting for the boundary is not a limitation to be worked
-	// around -- it is the only point at which an insertion is well-formed.
+	// steer holds messages typed while the turn was running; they are appended
+	// only at turn boundaries, because a user message may not come between an
+	// assistant message that requested tools and those tools' results.
 	steerMu sync.Mutex
 	steerQ  []string
 
-	// summary is a standby copy of the conversation so far, kept beside the
-	// transcript rather than in place of it. Nothing sends it while the real
-	// messages fit; MessagesFitting reaches for it only when they do not,
-	// which is what makes it safe to write one speculatively and throw it
-	// away. It is also fed back into the next summarisation, so a second one
-	// updates the checkpoint rather than starting again from a shrinking
-	// window of history.
+	// summary is a standby checkpoint kept beside the transcript, not in place
+	// of it; assembly reaches for it only when the messages do not fit. Each
+	// new checkpoint folds in the previous one.
 	summary string
-	// startAt is where the next request begins. Messages before it are not
-	// sent; the summary stands in for them. Zero means everything is sent.
-	//
-	// Separate from summarisedThrough because a summary written while the
-	// session was idle covers messages without changing what gets sent. Only
-	// /compact and the automatic path move this.
-	//
-	// Nothing is deleted when it moves: the session on disk stays whole, so
-	// a wider model can still reach the older messages.
+	// startAt is where the next request begins: earlier messages are not sent,
+	// the summary stands in for them. Zero means everything is sent.
 	startAt int
 	// summarisedThrough is how many messages from the start of the transcript
-	// the summary accounts for. Without it there is no way to tell whether a
-	// checkpoint still covers what a request has to leave out, and the choice
-	// is between summarising every turn and silently dropping detail.
+	// the summary accounts for.
 	summarisedThrough int
 
-	// resumeFromTranscript is the user's answer to a window that shrank under
-	// them: carry recent messages verbatim and let the older ones fall off,
-	// rather than spend part of a small window on a checkpoint. See
-	// SetResumeFromTranscript.
+	// resumeFromTranscript carries recent messages verbatim and lets older ones
+	// fall off, rather than spend a small window on a checkpoint.
 	resumeFromTranscript bool
 
-	// stuck watches for a session going in circles without repeating a call
-	// exactly, which is the shape the loop guard cannot see.
+	// stuck watches for a session going in circles without repeating a call exactly.
 	stuck stuckWatch
 
-	// atBoundary is consulted between iterations, where the message list is
-	// complete. Returning true ends the run cleanly. See SetTurnBoundary.
+	// atBoundary is consulted between iterations, where the message list is complete.
 	atBoundary func(context.Context) bool
 }
 
@@ -141,41 +105,29 @@ func New(client provider.Client, model string, exec tool.Executor, sink Sink, op
 	} else {
 		a.readOnly = func(string) bool { return false }
 	}
-	// An opening figure, so a consumer that only ever adopts what it is told
-	// has something to show before the first turn rather than a zero.
+	// An opening figure, so a consumer has something before the first turn.
 	a.publish()
 	return a
 }
 
 // Window is the context length of the model now loaded, 0 when unknown.
-//
-// A property of the model rather than of the accounting, which is why it is
-// asked for directly instead of being read off the context figure.
 func (a *Agent) Window() int { return a.opts.ContextLimit }
 
 func (a *Agent) SetSystem(prompt string) {
 	a.system = prompt
-	// Part of every request, so changing it changes the prefix that any
-	// recorded figure described.
+	// Part of every request, so changing it invalidates recorded prefills.
 	a.requestChanged()
 	a.publish()
 }
 
-// System returns the assembled system prompt, for a caller that needs to
-// inspect what the model is actually being told.
+// System returns the assembled system prompt.
 func (a *Agent) System() string { return a.system }
 
-// budget is the sizing derived from the window the agent is on now.
-//
-// Read rather than stored, so a model swap re-derives it. Stored, every
-// caller of SetModel would have to remember to recompute, and the one that
-// forgot would leave a 262k session's sizes on a 32k model.
+// budget is the sizing derived from the window the agent is on now. Read
+// rather than stored, so a model swap re-derives it.
 func (a *Agent) budget() Budget { return BudgetFor(a.opts.ContextLimit) }
 
-// reserveTokens and keepRecentTokens are the derived sizes unless the user
-// set them. A configured value is a global override and is taken as given:
-// someone who writes a number in a config file has said they know better than
-// the formula, which is a thing they are allowed to be right about.
+// reserveTokens is the derived reserve unless a configured value overrides it.
 func (a *Agent) reserveTokens() int {
 	if a.opts.ReserveTokens > 0 {
 		return a.opts.ReserveTokens
@@ -193,20 +145,14 @@ func (a *Agent) keepRecentTokens() int {
 	return a.budget().KeepRecent
 }
 
-// SummaryCap is the most a checkpoint of this session may run to.
-//
-// Derived from the reserve actually in force rather than from the window,
-// because the reserve is what has to hold the checkpoint: someone who
-// overrides the reserve downwards has lowered the room a summary has to fit
-// in, whether or not they were thinking about summaries at the time.
+// SummaryCap is the most a checkpoint of this session may run to. Derived
+// from the reserve in force, because the checkpoint must fit in it.
 func (a *Agent) SummaryCap() int {
 	return clamp(a.reserveTokens()/2, minSummaryTokens, SummaryMaxTokens)
 }
 
 // contextChars sizes the request ai-code would send now: system prompt, tool
-// definitions, and the messages that would go with them -- which is the whole
-// transcript only while the whole transcript fits. The first two are thousands
-// of tokens and go out every turn, so leaving them out understates a session.
+// definitions, and the messages that would go with them.
 func (a *Agent) contextChars() int {
 	return a.fixedChars() + charsOf(a.messagesToSend())
 }
@@ -224,8 +170,7 @@ func charsOf(msgs []provider.Message) int {
 	return n
 }
 
-// transcriptChars is the size of the whole conversation, whether or not all of
-// it would be sent.
+// transcriptChars is the size of the whole conversation, sent or not.
 func (a *Agent) transcriptChars() int { return a.fixedChars() + charsOf(a.messages) }
 
 func (a *Agent) toolDefChars() int {
@@ -239,9 +184,8 @@ func (a *Agent) toolDefChars() int {
 
 func (a *Agent) Messages() []provider.Message { return a.messages }
 
-// SetMessages replaces the conversation. Any checkpoint goes with it: a
-// summary of the session /new just left behind would be handed to the model as
-// the state of the one it is starting.
+// SetMessages replaces the conversation and clears any checkpoint that
+// described the one it replaces.
 func (a *Agent) SetMessages(m []provider.Message) {
 	a.messages = m
 	a.summary = ""
@@ -253,88 +197,61 @@ func (a *Agent) SetMessages(m []provider.Message) {
 }
 
 // Summary returns the standby checkpoint and how many messages from the start
-// of the transcript it accounts for. Both are empty until something has
-// summarised the session.
+// of the transcript it accounts for.
 func (a *Agent) Summary() (string, int) { return a.summary, a.summarisedThrough }
 
-// SetSummary puts back a checkpoint recorded by an earlier run. Call it after
+// SetSummary restores a checkpoint from a saved session. Call it after
 // SetMessages, which clears one.
-//
-// A resumed session with no checkpoint is the ordinary case, not an error:
-// every session recorded before checkpoints existed is one, and so is every
-// session that never filled its window.
 func (a *Agent) SetSummary(summary string, summarisedThrough int) {
 	a.SetCheckpoint(summary, summarisedThrough, 0)
 }
 
-// SetCheckpoint puts back a checkpoint recorded by an earlier run, including
-// the boundary a compaction chose.
-//
-// A cut of zero restores a checkpoint that stood beside the transcript and
-// changed nothing about what was sent; a non-zero one restores a compaction,
-// so the resumed session assembles its requests from the same place the
-// original did rather than replaying everything the compaction made room by
-// setting aside.
+// SetCheckpoint restores a checkpoint and the boundary a compaction chose. A
+// cut of zero restores a standby checkpoint; a non-zero one restores a
+// compaction, so a resumed session sends the same prefix the original did.
 func (a *Agent) SetCheckpoint(summary string, summarisedThrough, cut int) {
 	clampIndex := func(n int) int { return clamp(n, 0, len(a.messages)) }
 	a.summary = summary
 	a.summarisedThrough = clampIndex(summarisedThrough)
 	a.startAt = clampIndex(cut)
 	// Whatever was recorded against these messages was recorded under a
-	// different system prompt and a different tool set, in another process.
+	// different system prompt and tool set.
 	a.requestChanged()
 	a.publish()
 }
 
 func (a *Agent) Model() string { return a.model }
 
-// SetModel points the agent at a different model. The backend's own output
-// limit travels with it: it is a property of the model being swapped to, and
-// leaving the previous one in place would cap every later request at a number
-// belonging to a model that is no longer loaded.
 // SetTurnBoundary installs a check that runs between loop iterations, after
-// the tool results and before the next request.
-//
-// That is the only point at which a run can be stopped and leave a
-// well-formed message list behind, which is what makes the stop recoverable.
-// A long agentic run reaches it many times; it reaches the end of the run
-// only when the model decides to finish, which may be a long way off.
+// the tool results and before the next request. That is the only point at
+// which a stop leaves a well-formed message list behind.
 func (a *Agent) SetTurnBoundary(fn func(context.Context) bool) { a.atBoundary = fn }
 
+// SetModel points the agent at a different model. The backend's own output
+// limit travels with it: it is a property of the model being swapped to.
 func (a *Agent) SetModel(model string, contextLimit, maxOutputTokens int) {
 	a.model = model
 	a.opts.ContextLimit = contextLimit
 	a.opts.MaxOutputTokens = maxOutputTokens
 	a.warned = false
-	// A different model tokenizes differently, so the learned ratio belongs
-	// to the one being left behind, and every figure recorded under it
-	// described a request this model will never see.
+	// A different model tokenizes differently, so the learned ratio and every
+	// recorded prefill are stale.
 	a.charsPerToken = 0
 	defer func() {
 		a.requestChanged()
 		a.publish()
 	}()
-	// A choice about how to survive one window must not outlive it. Carried
-	// into a wider model it would keep auto-compaction switched off for a
-	// session that has room for it again.
+	// A choice about how to survive one window must not outlive it.
 	a.resumeFromTranscript = false
 }
 
-// SetResumeFromTranscript records that the user would rather lose the oldest
-// turns outright than spend a narrow window on a checkpoint.
-//
-// Call it after SetModel, which clears it. It changes two things: assembly
-// stops reaching for the summary, and the automatic compaction that would
-// otherwise write one is skipped -- a checkpoint nothing will send is a model
-// call, and on a local model that is minutes, for nothing.
+// SetResumeFromTranscript records that losing the oldest turns outright is
+// preferred to spending a narrow window on a checkpoint. Call it after
+// SetModel, which clears it.
 func (a *Agent) SetResumeFromTranscript(v bool) { a.resumeFromTranscript = v }
 
 // StoppedMidTurn reports whether the transcript ends part-way through an
-// exchange: a request with no reply, or a tool round the model never got to
-// read back.
-//
-// A session in that state has work outstanding that nobody has to be asked
-// about, which is what makes resuming it automatically safe.
+// exchange: a request with no reply, or a tool round not read back.
 func (a *Agent) StoppedMidTurn() bool {
 	if len(a.messages) == 0 {
 		return false
@@ -361,11 +278,9 @@ func (a *Agent) AppendUser(text string) {
 	a.publish()
 }
 
-// Steer queues a message to be folded into the running turn.
-//
-// Safe to call from another goroutine, and from outside a turn: anything queued
-// while nothing is running stays queued until TakeSteering collects it, so a
-// message typed in the instant a turn ends is not lost to the race.
+// Steer queues a message to be folded into the running turn. Safe to call
+// from another goroutine, and from outside a turn: anything queued while
+// nothing runs stays queued until TakeSteering collects it.
 func (a *Agent) Steer(text string) bool {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -405,24 +320,19 @@ func (a *Agent) applySteering() bool {
 
 var ErrContextFull = errors.New("context window is full")
 
-// Run performs turns until the model stops requesting tools.
-//
-// The context governs everything: the HTTP stream, every running tool, and the
-// loop itself. Cancelling it leaves the conversation in a sendable state, which
-// is the whole reason cancellation is threaded rather than bolted on.
+// Run performs turns until the model stops requesting tools. The context
+// governs the HTTP stream, every running tool, and the loop. Cancelling it
+// leaves the conversation in a sendable state.
 func (a *Agent) Run(ctx context.Context, userInput string) error {
-	// Anything queued before the turn began -- typed in the moment the previous
-	// one was ending -- goes in ahead of the new input, in the order it was
-	// actually typed.
+	// Anything queued before the turn began goes in ahead of the new input, in order.
 	a.applySteering()
 	if userInput != "" {
 		a.AppendUser(userInput)
 	}
 
 	var recent []string
-	// One retry for the whole run, not one per turn: a window that is wrong
-	// is wrong for every turn, and retrying each of them turns one bad
-	// reading into a session that never makes progress.
+	// One retry for the whole run, not one per turn: a wrong window is wrong
+	// for every turn.
 	overflowRetried := false
 
 	for turn := 1; a.opts.MaxIterations <= 0 || turn <= a.opts.MaxIterations; turn++ {
@@ -440,11 +350,9 @@ func (a *Agent) Run(ctx context.Context, userInput string) error {
 			if ctx.Err() != nil {
 				return a.finishInterrupted()
 			}
-			// The backend refused the request for length despite the guard
-			// clearing it. That means the window is not what the model
-			// reported, or a prefix the server adds was not counted. Make
-			// room and try once. Not twice: the second attempt would run
-			// against the state the first one already failed on.
+			// The backend refused for length despite the guard clearing it, so
+			// the window is not what the model reported. Make room and try
+			// once, not twice: the second attempt would fail the same way.
 			if provider.IsContextOverflow(err) && !overflowRetried {
 				overflowRetried = true
 				a.emit(Event{Kind: EvNotice, Level: LevelWarn, Text: "The server rejected the request " +
@@ -461,25 +369,17 @@ func (a *Agent) Run(ctx context.Context, userInput string) error {
 			return err
 		}
 
-		// The reported figures travel on the message itself, attached in
-		// streamTurn, so nothing here has to remember that they describe this
-		// point in the conversation and not a later one.
+		// The reported figures travel on the message itself, attached in streamTurn.
 		a.messages = append(a.messages, assistant)
 		a.publish()
 
 		if len(assistant.ToolCalls) == 0 {
-			// A finished turn that said nothing is indistinguishable from a
-			// hung one: EvDone paints nothing, and reasoning never reaches
-			// the scrollback, so the session appears to have stopped
-			// answering. Whatever else is wrong, the user is owed the
-			// difference between "no reply" and "no response".
+			// A finished turn that said nothing looks like a hung one: with no
+			// output and no visible reasoning there is no reply to read.
 			a.noticeEmptyTurn(assistant, reasoned)
 
-			// The model has finished, but the user may have typed something
-			// while it was talking. Taking it up here rather than dropping it
-			// is the whole point of steering: you correct the course as you
-			// read the reply, and the correction lands without you having to
-			// wait for the prompt and repeat yourself.
+			// Take up anything queued while the model was talking rather than
+			// dropping it.
 			if a.applySteering() {
 				continue
 			}
@@ -524,32 +424,25 @@ func (a *Agent) Run(ctx context.Context, userInput string) error {
 		a.applySteering()
 
 		if a.atBoundary != nil && a.atBoundary(ctx) {
-			// Something outside the loop needs it to stop, and this is the
-			// only place it can stop cleanly. A long agentic run may be many
-			// iterations from the user's prompt, so waiting for the run to
-			// end is waiting indefinitely.
+			// The only place a run can stop cleanly.
 			a.emit(Event{Kind: EvDone, Text: "stopped", Context: ptr(a.ContextState())})
 			return nil
 		}
 	}
 
-	// Only reachable when agent.max_iterations was set deliberately; the
-	// default is unlimited.
+	// Reachable only when MaxIterations was set; the default is unlimited.
 	a.emit(Event{Kind: EvNotice, Level: LevelWarn, Text: fmt.Sprintf(
 		"Stopped after the configured limit of %d turns, without the model finishing.",
 		a.opts.MaxIterations)})
 	return nil
 }
 
-// streamTurn sends one request and consumes the response stream.
-//
-// reasoned reports that the model emitted thinking, which in collapsed mode
-// never reaches the scrollback -- so it is the difference between a turn that
-// said nothing and a turn that did nothing.
+// streamTurn sends one request and consumes the response stream. reasoned
+// reports that the model emitted thinking, which collapsed mode never shows,
+// so a turn that only reasoned is distinguishable from one that did nothing.
 func (a *Agent) streamTurn(ctx context.Context, turn int) (msg provider.Message, stop provider.StopReason, usageKnown, reasoned bool, err error) {
-	// What goes on the wire is decided here rather than held in a.messages,
-	// because the window belongs to whichever model is loaded now and the
-	// transcript belongs to the session.
+	// What goes on the wire is decided here rather than held in a.messages:
+	// the window belongs to the loaded model, the transcript to the session.
 	sending := a.messagesToSend()
 	messages := a.withSystem(sending)
 	if err := Validate(messages); err != nil {
@@ -565,10 +458,6 @@ func (a *Agent) streamTurn(ctx context.Context, turn int) (msg provider.Message,
 			"Repaired %s left by an interrupted or truncated turn.", pluralise(n, "problem"))})
 	}
 
-	// Whether the model thought without answering. Reasoning is not committed
-	// to the scrollback in collapsed mode, so a turn that only reasons leaves
-	// nothing behind at all, and the difference matters to what we tell the
-	// user about it.
 	outCap, capFrom := a.outputBudget()
 	req := provider.Request{
 		Model:       a.model,
@@ -596,9 +485,8 @@ func (a *Agent) streamTurn(ctx context.Context, turn int) (msg provider.Message,
 		}
 		if err != nil {
 			// A stream that dies mid-turn leaves a partial assistant message.
-			// Partial text is kept because it is often the useful part; partial
-			// tool calls are discarded by finishPartial, because a truncated
-			// arguments blob is worse than no call at all.
+			// Partial text is kept; partial tool calls are discarded by
+			// finishPartial, a truncated arguments blob being worse than none.
 			if ctx.Err() != nil {
 				return provider.Message{}, "", false, false, ctx.Err()
 			}
@@ -612,10 +500,7 @@ func (a *Agent) streamTurn(ctx context.Context, turn int) (msg provider.Message,
 			reasoned = true
 			a.emit(Event{Kind: EvReasoning, Text: ev.Text, Turn: turn})
 		case provider.EventToolCallStart:
-			// Deliberately not announced here. A tool call is announced once,
-			// by dispatch, when it actually starts running -- announcing it
-			// again as it streams in produces a duplicate line for every call
-			// and tells the user nothing they are not about to see.
+			// Announced once, by dispatch, when the call actually starts running.
 		case provider.EventUsage:
 			u := ev.Usage
 			a.emit(Event{Kind: EvUsage, Usage: &u, Turn: turn})
@@ -627,9 +512,8 @@ func (a *Agent) streamTurn(ctx context.Context, turn int) (msg provider.Message,
 	stop = stream.StopReason()
 
 	// Ground truth is attached to the message the request produced, and only
-	// if it can be believed. A backend that reports a cache hit as a tiny
-	// prompt_tokens leaves the message unmarked rather than anchoring the
-	// session to a figure that would hide an overflow.
+	// if it can be believed: a cache-hit prefill is left unmarked rather than
+	// anchoring the session to a figure that would hide an overflow.
 	usageKnown = a.recordUsage(&msg, a.charsSent, usage)
 
 	if stop == provider.StopLength {
@@ -642,7 +526,7 @@ func (a *Agent) streamTurn(ctx context.Context, turn int) (msg provider.Message,
 	return msg, stop, usageKnown, reasoned, nil
 }
 
-// noticeEmptyTurn reports a turn that ended with nothing for the user to read.
+// noticeEmptyTurn reports a turn that ended with nothing to read.
 func (a *Agent) noticeEmptyTurn(assistant provider.Message, reasoned bool) {
 	if strings.TrimSpace(assistant.Content) != "" {
 		return
@@ -671,15 +555,11 @@ func (a *Agent) finishPartial(stream provider.Stream) provider.Message {
 }
 
 // dispatch runs the requested tools and returns their results in call order.
-//
-// Read-only tools in the same batch run concurrently, which is most of the
-// latency win, while anything that writes or executes is serialised. Working
-// out whether a shell command mutates state would mean parsing shell grammar,
-// so bash is simply never concurrent.
+// Read-only calls in a batch run concurrently; anything that writes or
+// executes is serialised, and bash is never treated as read-only.
 func (a *Agent) dispatch(ctx context.Context, calls []provider.ToolCall) ([]provider.Message, []tool.Result) {
 	results := make([]provider.Message, len(calls))
-	// Indexed by call, so concurrent runs write to distinct slots and no lock
-	// is needed. The messages lose the fields stuck detection reads.
+	// Indexed by call, so concurrent runs write distinct slots without a lock.
 	raw := make([]tool.Result, len(calls))
 	completed := make([]bool, len(calls))
 
@@ -691,21 +571,17 @@ func (a *Agent) dispatch(ctx context.Context, calls []provider.ToolCall) ([]prov
 			CallID: tc.ID, Name: tc.Name, Args: []byte(tc.Args),
 		})
 		if err != nil {
-			// The executor itself failed, not the tool. Still has to become a
-			// tool result: an unanswered call breaks the next request.
+			// The executor failed, not the tool; it still has to become a
+			// tool result, because an unanswered call breaks the next request.
 			res = tool.Result{
 				Content: fmt.Sprintf("The tool could not be run: %v", err),
 				IsError: true,
 			}
 		}
 
-		// A tool that handles cancellation itself may return an ordinary-looking
-		// result. Reporting that verbatim would tell the model the work
-		// completed. Whatever it managed to say is kept, but the interruption
-		// is stated first and the result is marked as an error.
-		//
-		// Tools that already reported the interruption themselves are left
-		// alone: they said it better, with detail this layer does not have.
+		// A tool that handles cancellation may return an ordinary-looking
+		// result; remarking it as interrupted stops the model reading it as
+		// completed. Tools that already reported the interruption are left alone.
 		if ctx.Err() != nil && !res.Interrupted {
 			res = tool.Result{
 				IsError: true,
@@ -736,7 +612,7 @@ func (a *Agent) dispatch(ctx context.Context, calls []provider.ToolCall) ([]prov
 			break
 		}
 
-		// Gather the longest run of consecutive read-only calls.
+		// Longest run of consecutive read-only calls.
 		j := i
 		if a.opts.ParallelReads {
 			for j < len(calls) && a.readOnly(calls[j].Name) {
@@ -762,8 +638,7 @@ func (a *Agent) dispatch(ctx context.Context, calls []provider.ToolCall) ([]prov
 		i++
 	}
 
-	// Anything not reached, because the context was cancelled partway through,
-	// still needs an answer.
+	// Calls not reached because the context was cancelled still need an answer.
 	for k := range calls {
 		if !completed[k] {
 			results[k] = provider.Message{
@@ -804,48 +679,35 @@ func (a *Agent) finishInterrupted() error {
 	return nil
 }
 
-// Default sizes for the context reserve. See Options.
 const (
-	// DefaultReserveTokens is the headroom kept free at the top of the window.
-	// It must hold one full response plus the summarisation call that
-	// compaction makes, because compaction runs at the moment the reserve is
-	// reached and needs room to do it.
+	// DefaultReserveTokens is the headroom kept free at the top of the window:
+	// one full response plus the summarisation call compaction makes.
 	DefaultReserveTokens = 16384
 	// DefaultKeepRecentTokens is how much of the tail survives verbatim.
 	DefaultKeepRecentTokens = 20000
-	// minOutputTokens is the least room worth starting a turn with. A tool call
-	// carrying a path and a small edit is a few hundred tokens before the model
-	// has said anything, so under this the turn stops mid-arguments and
-	// finishPartial throws the call away: a wasted round trip rather than a
-	// short answer. Reaching it means the session is full, not that the reply
-	// should be terse.
+	// minOutputTokens is the least room worth starting a turn with: under this
+	// a turn stops mid-arguments and finishPartial throws the call away.
 	minOutputTokens = 512
 )
 
-// Usable is the window minus the reserve: the point at which the session is
-// compacted. Zero when the window is unknown.
+// Usable is the window minus the reserve, 0 when the window is unknown.
 func (a *Agent) Usable() int { return a.usableIn(a.opts.ContextLimit) }
 
-// usableIn is Usable for a window the agent is not on yet, so a model change
-// can be costed before it is made rather than discovered after it.
+// usableIn is Usable for a window the agent is not on yet.
 func (a *Agent) usableIn(limit int) int {
 	if limit <= 0 {
 		return 0
 	}
 	reserve := a.reserveTokens()
-	// A reserve wider than the window itself would compact on every turn and
-	// never converge. Half the window is the most that can sensibly be held
-	// back. The derived reserve is an eighth, so this now only ever catches a
-	// configured override that was set for a roomier model than the one
-	// actually loaded.
+	// A reserve wider than the window would compact on every turn and never
+	// converge, so half the window is the most that can be held back.
 	if reserve > limit/2 {
 		reserve = limit / 2
 	}
 	return limit - reserve
 }
 
-// budgetSource records which limit produced the cap, so a length stop can name
-// the component the user has to go and change.
+// budgetSource records which limit produced the cap, for a length-stop message.
 type budgetSource int
 
 const (
@@ -857,24 +719,19 @@ const (
 )
 
 // outputBudget is the max_tokens for this turn: the room actually left.
-//
-// Recomputed rather than fixed, because a thinking model can spend tens of
-// thousands of reasoning tokens against the same budget and overflow the
-// window mid-stream. Zero means no cap, which is what an unknown window gets.
+// Recomputed each turn, because a thinking model can spend tens of thousands
+// of reasoning tokens mid-stream. Zero means no cap, which an unknown window gets.
 func (a *Agent) outputBudget() (int, budgetSource) {
 	n, src := 0, budgetServer
 	if usable := a.Usable(); usable > 0 {
 		n, src = usable-a.RequestTokens(), budgetContext
 		if n < minOutputTokens {
-			// guardContext compacts before it gets this far, so arriving here
-			// means the estimate moved under us between the two. Eating a little
-			// of the reserve beats sending a request that cannot answer.
+			// The estimate moved under the guard; the output floor beats an
+			// unanswerable request.
 			n = minOutputTokens
 		}
 	}
-	// Both of these only ever lower the cap. The user asked for a ceiling, not
-	// permission to overrun the window; the backend's own limit is a fact about
-	// what it will accept.
+	// Both only ever lower the cap: a ceiling is not permission to overrun the window.
 	if a.opts.MaxTokens > 0 && (n == 0 || a.opts.MaxTokens < n) {
 		n, src = a.opts.MaxTokens, budgetConfig
 	}
@@ -884,12 +741,9 @@ func (a *Agent) outputBudget() (int, budgetSource) {
 	return n, src
 }
 
-// lengthStopMessage names whose cap stopped the response and what to do about
-// it. The bare version sent people to their server settings when the limit was
-// ai-code's own, which is the single most expensive kind of wrong message: it
-// costs an hour of debugging the wrong component.
+// lengthStopMessage names whose cap stopped the response and what to change.
 func (a *Agent) lengthStopMessage(sent int, src budgetSource, completion int) string {
-	// A stop well short of what we asked for was not our cap, whatever we sent.
+	// A stop well short of the cap was not ai-code's cap, whatever was sent.
 	if sent == 0 || (completion > 0 && completion < sent*9/10) {
 		if sent == 0 {
 			return "The response was cut off by the server's own output limit, not by ai-code: " +
@@ -921,15 +775,9 @@ func (a *Agent) lengthStopMessage(sent int, src budgetSource, completion int) st
 	}
 }
 
-// guardContext keeps the session inside the window, compacting when it reaches
-// the reserve.
-//
-// Both call sites matter and they are the two pi identified: before a new user
-// prompt, and after a round of tool results has been appended but before the
-// next request. Those are the points at which the message list is complete and
-// a rewrite of it is well-formed. Checking anywhere else means either
-// compacting a conversation that is missing its tool results, or discovering
-// the overflow as a provider error mid-stream.
+// guardContext keeps the session inside the window, compacting when it
+// reaches the reserve. It runs only on a complete message list: before a new
+// prompt, and after a round of tool results.
 func (a *Agent) guardContext(ctx context.Context) error {
 	window := a.opts.ContextLimit
 	usable := a.Usable()
@@ -938,20 +786,15 @@ func (a *Agent) guardContext(ctx context.Context) error {
 	}
 
 	// The projection of the request the cut describes -- not of the one that
-	// would be sent, which has already been trimmed to fit and so always
-	// fits, and not of the transcript, which since compaction records a
-	// boundary rather than deleting anything goes on growing for the rest of
-	// the session.
+	// would be sent, already trimmed to fit, and not of the transcript, which
+	// only grows.
 	projected := a.plannedTokens()
 
-	// Room to answer in, not merely room to sit in. A session that fits but
-	// leaves nothing for the reply produces a request that cannot succeed, so
-	// the output floor is part of the trigger rather than a check further down.
+	// Room to answer in, not merely room to sit in: the output floor is part
+	// of the trigger.
 	if usable-projected >= minOutputTokens {
-		// The warning is a fraction of the *budget*, not of the window. Measured
-		// against the window it is dead on any model whose reserve is a large
-		// share of it: 80% of 64k is 52k, which is past the 49k budget, so the
-		// heads-up would arrive after the thing it was warning about.
+		// The warning is a fraction of the budget, not the window: against the
+		// window it would fire after the compaction it warns about.
 		if trigger := usable * a.opts.WarnPercent / 100; projected >= trigger && !a.warned {
 			a.warned = true
 			a.emit(Event{Kind: EvNotice, Level: LevelInfo, Text: fmt.Sprintf(
@@ -972,28 +815,16 @@ func (a *Agent) fits() bool {
 	return usable <= 0 || usable-a.plannedTokens() >= minOutputTokens
 }
 
-// makeRoom makes room for the next request, cheapest mechanism first.
-//
-// The order is the whole design. Pruning costs nothing and clears the trigger
-// outright on a session whose weight is tool output, which is most coding
-// sessions; summarising costs a model call, which on a local backend is
-// minutes. Doing them the other way round -- or only ever doing the second --
-// is what made compaction feel like a treadmill.
-//
-// Every step strictly shrinks the request, so the ladder terminates on the
-// number of entries rather than on a step count. What it must never do is
-// return nil having freed nothing: that is the wedge, where a session spends
-// the rest of its life sending a request it has already been told is too big.
+// makeRoom makes room for the next request, cheapest first: prune, then
+// summarise, then drop the oldest turns. Never returns having freed nothing.
 func (a *Agent) makeRoom(ctx context.Context, before int) error {
 	window := a.opts.ContextLimit
 	usable := a.Usable()
 
-	// 1. Clear old tool output. No model call, no waiting.
+	// 1. Clear old tool output: no model call, no waiting.
 	if p := a.ClearOldOutput(); p.Results > 0 {
-		// What the next request saved, not how much text was removed. Most
-		// of a long session is not in the next request at all, so the amount
-		// removed can be several times the whole window -- a true number
-		// that tells the reader nothing and looks like a bug.
+		// Report what the next request saved, not the text removed: most of
+		// it was never in the request.
 		saved := max(before-a.plannedTokens(), 0)
 		a.emit(Event{Kind: EvNotice, Level: LevelInfo, Text: fmt.Sprintf(
 			"Cleared the output of %s the model had already read, which takes %s off the next request. "+
@@ -1004,10 +835,8 @@ func (a *Agent) makeRoom(ctx context.Context, before int) error {
 		}
 	}
 
-	// A checkpoint that already accounts for everything the next request has
-	// to leave out is as good as a fresh one, and costs no model call. Neither
-	// is one the user has said not to send: assembly is already dropping the
-	// oldest turns on their instruction, so the request fits without it.
+	// A checkpoint that already covers what the next request leaves out is as
+	// good as a fresh one, and costs no model call.
 	if a.resumeFromTranscript {
 		return nil
 	}
@@ -1021,9 +850,8 @@ func (a *Agent) makeRoom(ctx context.Context, before int) error {
 			compactTokens(window-usable))
 	}
 
-	// 2. Summarise. One attempt: it is itself a request, and retrying it runs
-	// into the same wall. A failure leaves the session exactly as it was,
-	// because nothing has been removed.
+	// 2. Summarise. One attempt: summarising is itself a request that has to
+	// fit, and nothing has been removed if it fails.
 	a.emit(Event{Kind: EvNotice, Level: LevelInfo, Text: fmt.Sprintf(
 		"The next request would be %s, and the window is %s. Summarising the older messages to make room. "+
 			"Nothing is deleted -- the session on disk keeps every message.",
@@ -1032,8 +860,8 @@ func (a *Agent) makeRoom(ctx context.Context, before int) error {
 	res, err := a.Compact(ctx, 0)
 	switch {
 	case errors.Is(err, ErrNothingToFree):
-		// Nothing left that a summary could stand in for. Not a failure --
-		// the escalation below is exactly the case this describes.
+		// Nothing left a summary could stand in for; the escalation below is
+		// exactly that case.
 	case err != nil:
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -1050,15 +878,9 @@ func (a *Agent) makeRoom(ctx context.Context, before int) error {
 		}
 	}
 
-	// 3. The kept tail is still too large, which means one turn inside it is.
-	// Drop the oldest of them, one at a time.
-	//
-	// Never the newest, whatever it costs. The checkpoint covers everything
-	// up to the cut, so a turn dropped from in front of it is at worst
-	// summarised rather than verbatim -- but the newest turn is what the
-	// model is in the middle of, and the summary was written before it, so
-	// dropping that one loses work outright and leaves a tool call with no
-	// result behind it.
+	// 3. The kept tail is still too large, so one turn inside it is. Drop the
+	// oldest, one at a time, and never the newest: the checkpoint was written
+	// before it, so dropping it loses work outright.
 	lastTurn := a.lastTurnStart()
 	dropped := 0
 	for a.startAt < lastTurn && !a.fits() {
@@ -1083,14 +905,12 @@ func (a *Agent) makeRoom(ctx context.Context, before int) error {
 		return nil
 	}
 
-	// 4. One message is larger than the whole budget. Say which, because
-	// nothing the session can do to itself will change that.
+	// 4. One message is larger than the whole budget. Say which.
 	return fmt.Errorf("%w: %s",
 		ErrContextFull, a.oversizedMessage(usable))
 }
 
-// lastTurnStart is where the newest turn begins, which is the boundary
-// escalation will not cross.
+// lastTurnStart is where the newest turn begins, the boundary escalation will not cross.
 func (a *Agent) lastTurnStart() int {
 	for i := len(a.messages) - 1; i >= 0; i-- {
 		if a.messages[i].Role == provider.RoleUser {
@@ -1110,8 +930,7 @@ func (a *Agent) nextTurnAfter(i int) int {
 	return len(a.messages)
 }
 
-// oversizedMessage names the single entry that no amount of summarising can
-// shed, so the report is actionable rather than a restatement of the arithmetic.
+// oversizedMessage names the single entry no amount of summarising can shed.
 func (a *Agent) oversizedMessage(usable int) string {
 	worst, size := -1, 0
 	for i := a.startAt; i < len(a.messages); i++ {
@@ -1194,18 +1013,13 @@ func looping(recent []string, n int) bool {
 	return true
 }
 
-// maxMessageChars bounds one message in the transcript.
-//
-// The unit is the verbatim tail, because a message larger than the whole tail
-// budget can never be kept beside the conversation it belongs to: whatever
-// else compaction drops, that one message still does not fit. Half the usable
-// window caps it again on narrow windows, where the configured tail may be a
-// large share of everything there is.
+// maxMessageChars bounds one message in the transcript. The unit is the
+// verbatim tail, because a message larger than that can never be kept beside
+// the conversation it belongs to; half the usable window caps it again.
 func (a *Agent) maxMessageChars() int {
 	limit := a.budget().MaxToolResult
 	if a.opts.KeepRecentTokens > 0 {
-		// An override of the tail budget carries the result cap with it, so
-		// the two cannot be configured into disagreeing.
+		// An override of the tail budget carries the result cap with it.
 		limit = max(a.opts.KeepRecentTokens/4, minToolResultTokens)
 	}
 	if usable := a.Usable(); usable > 0 && limit > usable/2 {
@@ -1214,19 +1028,9 @@ func (a *Agent) maxMessageChars() int {
 	return int(float64(limit) * a.charsPerTokenNow())
 }
 
-// clampOversized trims a tool result too large to live in the transcript.
-//
-// The tools bound their own output, so this is a backstop rather than the
-// first line of defence -- but it is the only one that holds for every tool
-// at once, including whichever one gets a new early-return path next. It runs
-// where the results enter the transcript, which is the last moment anything
-// can be done about them: afterwards they are history, and rewriting history
-// is what compaction is deliberately not allowed to do.
-//
-// Only tool results. A user who pastes something enormous has said what they
-// meant to say, and silently cutting it up is worse than the context cost;
-// compaction bounds the opening request separately, see
-// preservedRequestBudget.
+// clampOversized trims tool results too large to live in the transcript. It
+// runs as results enter, the last moment before they become history. Only
+// tool results: cutting a pasted message up is worse than the context cost.
 func (a *Agent) clampOversized(msgs []provider.Message) {
 	limit := a.maxMessageChars()
 	if limit <= 0 {
@@ -1242,16 +1046,8 @@ func (a *Agent) clampOversized(msgs []provider.Message) {
 	}
 }
 
-// estimateMessage approximates a message's token cost.
-//
-// Only ever used for content appended since the last response, because the
-// provider's own prompt_tokens covers everything before that. Four bytes per
-// token is close enough for code and prose, and the per-message constant covers
-// role and delimiter overhead.
 // messageOverheadChars approximates the role markers and JSON scaffolding a
-// message costs beyond its own text. The exact value barely matters: it is
-// included in the figure calibration divides, so a systematic error in it is
-// absorbed by the measured ratio rather than accumulated.
+// message costs beyond its own text; calibration absorbs any error in it.
 const messageOverheadChars = 32
 
 // messageChars is the size of one message as it will be sent. One definition,
@@ -1281,11 +1077,8 @@ func pluralise(n int, word string) string {
 
 func ptr[T any](v T) *T { return &v }
 
-// SetClient swaps the backend mid-session.
-//
-// Used by /provider. The conversation is unaffected: messages are canonical and
-// every backend ai-code speaks to takes the same shape, so a switch is a change of
-// destination rather than a translation.
+// SetClient swaps the backend mid-session, as /provider does. Messages are
+// canonical, so a switch is a change of destination rather than a translation.
 func (a *Agent) SetClient(c provider.Client) { a.client = c }
 
 // Client returns the current backend.

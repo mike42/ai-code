@@ -1,28 +1,6 @@
 // Package coord lets the ai-code instances belonging to one person on one
-// machine see each other.
-//
-// Everything here assumes a single user and a single desktop session: several
-// windows, one of them in front and the others running work that was started
-// and walked away from. There is no second party, so there is nothing to
-// authenticate, negotiate or arbitrate. That assumption is why a directory of
-// files under flock is enough, where anything crossing a trust boundary would
-// need a daemon and a protocol.
-//
-// Four small files in one shared directory, and that is the whole of it:
-//
-//   - <pid>.json   what one window is doing, and <pid>.lock, held open for
-//     as long as that window lives, so a dead one is known
-//     immediately rather than after a timeout
-//   - intent.json  the model the user last asked for, in any window
-//   - swap.json    a swap about to happen, while it is happening
-//   - model.lock   held for the moment a window decides about the model,
-//     so two windows cannot decide at the same time
-//
-// It stays silent. The files are read at exactly one moment -- a model swap
-// that would take the model out from under a session using it -- and nothing
-// here prints, polls on a timer, or adds a command. Another window is one
-// alt-tab away, so a feature that merely listed them would be telling the
-// user what their own screen already shows.
+// machine see each other. It assumes a single user and desktop session, where
+// a shared directory of files under flock is enough; there is no second party.
 package coord
 
 import (
@@ -55,16 +33,13 @@ type Peer struct {
 	// person reads. See State.
 	State State `json:"state"`
 	// NoSummary is set when this session needed a summary before losing the
-	// model and could not write one. The swap proceeds anyway -- one broken
-	// window must not hold the machine -- but the person swapping is told.
+	// model and could not write one. The swap proceeds anyway; the person
+	// swapping is told.
 	NoSummary bool `json:"no_summary"`
 }
 
-// State is what a session is doing about the model it holds.
-//
-// The words are the ones in local-coordination.md §8, which exists because an
-// earlier draft invented PARK/COMPACT/DEGRADED and they read as precise
-// without being so. Each says what is being waited for.
+// State is what a session is doing about the model it holds. Each value says
+// what is being waited for.
 type State string
 
 const (
@@ -76,9 +51,7 @@ const (
 	// StateSummarising holds a slot and is generating.
 	StateSummarising State = "summarising"
 	// StateReady means this session has done whatever it needed to before
-	// losing the model, and the swap may proceed. Usually that is nothing at
-	// all: a session whose conversation still fits the incoming window just
-	// carries on with the new model.
+	// losing the model; usually that is nothing.
 	StateReady State = "ready"
 )
 
@@ -111,20 +84,13 @@ func (p Peer) Describe() string {
 	return dir
 }
 
-// usable reports whether the shared directory can be worked with at all.
-//
-// An empty path is the case to catch: filepath.Join("", "x") is the
-// *relative* path "x", so every read and write would land in whatever
-// directory the process happens to be in. A session that failed to work out
-// where the shared directory is must take no part in coordination, not
-// scatter files through the user's project.
+// usable reports whether the shared directory can be worked with. An empty
+// path would make filepath.Join produce relative paths, scattering files
+// through the project.
 func usable(dir string) bool { return canDetectLiveness && dir != "" }
 
-// DefaultDir is the directory the windows share.
-//
-// XDG_RUNTIME_DIR is the right home for it: per-user, cleared on logout, and
-// on a tmpfs, so a machine that lost power comes back with nothing in it
-// rather than with stale files. The fallback is only for systems without it.
+// DefaultDir is the directory the windows share: XDG_RUNTIME_DIR, per-user and
+// cleared on logout, with a temp-directory fallback for systems without it.
 func DefaultDir() string {
 	if d := os.Getenv("XDG_RUNTIME_DIR"); d != "" {
 		return filepath.Join(d, "ai-code", "peers")
@@ -142,10 +108,8 @@ type Registration struct {
 }
 
 // Register announces this instance and holds the lock that proves it alive.
-//
-// A failure is returned but is never worth stopping for: coordination is an
-// improvement on a session that otherwise works, and a read-only runtime
-// directory should not stop someone using the harness.
+// Failure is never worth stopping for: coordination is an improvement on a
+// session that otherwise works.
 func Register(dir string, self Peer) (*Registration, error) {
 	if !usable(dir) {
 		return nil, errNoLiveness
@@ -171,9 +135,7 @@ func Register(dir string, self Peer) (*Registration, error) {
 		if err != nil {
 			return nil, err
 		}
-		// A live process already owns this pid's entry, which on a sane system
-		// means our own pid was reused after an unclean exit. Its lock is
-		// authoritative; ours is not.
+		// A live process owns this pid's entry, so the pid was reused; its lock is authoritative.
 		return nil, fmt.Errorf("another process holds the registration for pid %d", self.PID)
 	}
 
@@ -248,11 +210,8 @@ func (r *Registration) Self() Peer {
 }
 
 // Peers lists the other live instances, and deletes the entries of any that
-// died without cleaning up.
-//
-// "Other" is not optional and is not a parameter. Every caller wants it, and
-// a caller that passed the wrong pid produced a session waiting for itself to
-// park -- which presents as a hang rather than as an error.
+// died without cleaning up. Excluding self is not optional: a session that
+// waits on its own pid presents as a hang rather than an error.
 func Peers(dir string) []Peer {
 	if !usable(dir) {
 		return nil
@@ -292,35 +251,24 @@ func Peers(dir string) []Peer {
 func alive(dir string, pid int) bool {
 	f, err := os.Open(filepath.Join(dir, fmt.Sprintf("%d.lock", pid)))
 	if err != nil {
-		// No lock file: the entry was written by something that never held one,
-		// or the lock was already cleaned up. Either way nobody is holding it.
+		// No lock file: an entry written without one, or one already cleaned up; nobody holds it.
 		return false
 	}
 	defer f.Close()
 	return isHeld(f)
 }
 
-// ---------------------------------------------------------------------------
-// Announcing a swap
-// ---------------------------------------------------------------------------
-
 // SwapNotice is one instance telling the others it is about to load a
-// different model, so the sessions on the current one can park first.
-//
-// The announcement is the whole point of coordinating. Finding out afterwards
-// that the model has gone is too late by construction: writing a summary
-// needs the model, so a session that learns about the swap after it happened
-// has already lost the ability to save itself. Noticing a missing model is a
-// safety net for changes made outside ai-code, never the path between
-// instances.
+// different model, so the sessions on the current one can park first. Finding
+// out afterwards is too late: writing a summary needs the model.
 type SwapNotice struct {
 	// PID is who announced it, so nobody parks for their own swap.
 	PID int `json:"pid"`
 	// Model is the one being unloaded. Sessions on any other are unaffected.
 	Model string `json:"model"`
 	// Into and IntoWindow describe what is being loaded instead. The window
-	// is what lets a peer decide whether its transcript will still fit, which
-	// is half of whether it needs a summary at all.
+	// tells a peer whether its transcript will still fit, half of whether it
+	// needs a summary at all.
 	Into       string    `json:"into"`
 	IntoWindow int       `json:"into_window"`
 	Since      time.Time `json:"since"`
@@ -366,11 +314,9 @@ func (a *Announcement) End() {
 	os.Remove(filepath.Join(a.dir, swapFile))
 }
 
-// PendingSwap reads the current announcement, if there is one.
-//
-// One left behind by a process that died is cleared rather than honoured:
-// otherwise a single crash mid-swap would leave every other window parking
-// against a model change that will never happen.
+// PendingSwap reads the current announcement, if there is one. One left behind
+// by a process that died is cleared rather than honoured, or a crash mid-swap
+// would leave every window parking forever.
 func PendingSwap(dir string) (SwapNotice, bool) {
 	selfPID := os.Getpid()
 	if !usable(dir) {
@@ -401,14 +347,9 @@ func (r *Registration) SetNoSummary() {
 	r.Update(func(p *Peer) { p.NoSummary, p.State = true, StateReady })
 }
 
-// NotReady lists the live sessions on a model that still have something to
-// do before it goes. An empty result means the swap is safe.
-//
-// Anything that is not actively holding the model counts as ready. Waiting
-// is for sessions that said they are doing something; a session that has
-// published no state at all -- one that has never run a turn, so has never
-// had a state to publish -- has no claim, and treating its silence as a
-// claim makes every swap around it wait for an answer that never comes.
+// NotReady lists the live sessions on a model that still have something to do
+// before it goes; an empty result means the swap is safe. A session not
+// actively holding the model counts as ready.
 func NotReady(dir, model string) []Peer {
 	var out []Peer
 	for _, p := range Peers(dir) {
@@ -434,32 +375,14 @@ func OnModel(dir, model string) []Peer {
 	return out
 }
 
-// ---------------------------------------------------------------------------
-// The decision lock
-// ---------------------------------------------------------------------------
-
 const decisionFile = "model.lock"
 
-// Decide runs fn while holding the machine-wide lock on model decisions.
-//
-// It closes the one race the announcement alone cannot. A swap reads the list
-// of sessions to wait for; a session about to send marks itself as working.
-// Interleave those two and the swap loads while a request is on its way to
-// the model it is unloading -- which the server answers by loading that model
-// straight back. That is the churn, and no amount of checking health first
-// removes it, because the check and the send are not one action.
-//
-// Both sides do their deciding here instead, so the interleaving cannot
-// happen: whoever takes the lock second sees what the first one published.
-// The section is a few file operations on a local filesystem with no network
-// in it, so blocking is measured in microseconds.
-//
-// Every instance is the same user on the same machine, which is what makes a
-// file lock sufficient; nothing here would survive a trust boundary.
+// Decide runs fn while holding the machine-wide lock on model decisions. Both
+// a swap and a session about to send decide here, so whoever takes the lock
+// second sees what the first published.
 func Decide(dir string, fn func()) error {
 	if !usable(dir) {
-		// Without flock there is no mutual exclusion to be had. The caller's
-		// work still happens; it is simply not serialised against anyone.
+		// Without flock there is no mutual exclusion; the work still happens, unserialised.
 		fn()
 		return nil
 	}
@@ -484,26 +407,9 @@ func Decide(dir string, fn func()) error {
 	return nil
 }
 
-// ---------------------------------------------------------------------------
-// Which model the user wants
-// ---------------------------------------------------------------------------
-
-// Intent is the model this machine's user last asked for, written by
-// whichever window they asked in.
-//
-// The server remains the authority on what is actually loaded; nothing here
-// can know that, and a record claiming to would be wrong the moment someone
-// loaded a model by hand. What this is instead is a more up-to-date record
-// of what was *wanted*, and because every instance belongs to the same
-// person on the same machine, they can act on it together.
-//
-// Which makes it more useful than the server's answer on the path that
-// matters. A request issued while a model is still loading should name the
-// model being loaded, not the one still resident: lemonade queues it behind
-// the load and answers it from the new weights. Asking the server would give
-// the old name, and sending that is what drags the old model back.
-//
-// It stands until the user asks for something else.
+// Intent is the model this machine last asked for, written by whichever window
+// asked. The server remains the authority on what is loaded; this records what
+// was wanted, useful while a load is still in progress.
 type Intent struct {
 	Model string    `json:"model"`
 	PID   int       `json:"pid"`
@@ -512,9 +418,9 @@ type Intent struct {
 
 const intentFile = "intent.json"
 
-// SetIntent records the model the user has asked for. Call it with the
-// decision lock held, and before the load rather than after: the point is
-// that every window agrees on the target while it is still on its way.
+// SetIntent records the model asked for. Call it with the decision lock held
+// and before the load, so every window agrees on the target while it is on its
+// way.
 func SetIntent(dir, model string) error {
 	if !usable(dir) || model == "" {
 		return nil
@@ -531,9 +437,8 @@ func SetIntent(dir, model string) error {
 	return os.Rename(tmp, path)
 }
 
-// CurrentIntent reads that record. Absent means nobody has asked for
-// anything through ai-code since these files were created, which says
-// nothing about what the server has loaded.
+// CurrentIntent reads that record. Absent means nothing has been asked for
+// through ai-code, which says nothing about what the server has loaded.
 func CurrentIntent(dir string) (Intent, bool) {
 	if !usable(dir) {
 		return Intent{}, false

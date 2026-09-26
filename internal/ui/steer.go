@@ -10,41 +10,26 @@ import (
 	"golang.org/x/term"
 )
 
-// Steerer reads the terminal while a turn is running, so the user can correct
-// the model without waiting for it to stop.
-//
-// The Steerer never writes to the terminal. It maintains a buffer and reports
-// it through Render, because the transient zone has exactly one owner and two
-// writers on the last line interleave halfway through a word.
-//
-// Smaller than Editor by design: history, reverse search and Ctrl-G all need
-// the scrollback or the whole terminal, and the terminal is busy. Completion
-// is the exception -- extending a word in the buffer touches nothing outside
-// it, and only the ambiguous-match listing needs a screen to print on.
+// Steerer reads the terminal while a turn is running, so the model can be
+// corrected without waiting for it to stop. It never writes to the terminal:
+// it maintains a buffer and reports it through Render, which owns the zone.
 type Steerer struct {
 	// Render reports the current line. display is already a single line, with
 	// multi-line input summarised; cursorCol is a column within it; active is
-	// false when there is nothing typed, which is the renderer's cue to put the
-	// status line back.
+	// false when nothing is typed, the cue to restore the status line.
 	Render func(display string, cursorCol int, active bool)
 	// Submit receives a finished message. It is called from the read goroutine.
 	Submit func(text string)
 	// Interrupt is called for Ctrl-C on an empty line.
 	Interrupt func()
-	// Completions supplies Tab candidates for the line up to the cursor, in
-	// the same shape as Editor.Completions: the byte offset where the
-	// candidates begin, and the candidates themselves.
-	//
-	// It is called off the lock, because it reads the filesystem and holding
-	// the buffer while it does would stall the keystroke after it.
+	// Completions supplies Tab candidates for the line up to the cursor, in the
+	// same shape as Editor.Completions. Called off the lock; it reads the
+	// filesystem.
 	Completions func(line string) (start int, candidates []string)
 
-	// Control writes a terminal mode sequence. It is the one thing the Steerer
-	// puts on the terminal, and it draws nothing: bracketed paste has to be on
-	// while steering reads, because the line editor turns it off when it stops
-	// reading and without it a pasted snippet submits itself a line at a time.
-	// It goes through the caller so that it is serialised with everything else
-	// being written, rather than racing the renderer's buffered writer.
+	// Control writes a terminal mode sequence: bracketed paste has to be on
+	// while steering reads, or a pasted snippet submits itself a line at a
+	// time. It goes through the caller, serialised with everything else written.
 	Control func(seq string)
 
 	fd  int
@@ -104,12 +89,8 @@ func (s *Steerer) Start() error {
 	return nil
 }
 
-// Stop restores the terminal and returns whatever was typed but not submitted.
-//
-// Returning the leftover matters. A turn can end while a sentence is half
-// typed, and the alternative to handing those characters to the prompt that
-// replaces this one is throwing them away in front of the person who typed
-// them.
+// Stop restores the terminal and returns whatever was typed but not submitted;
+// a half-typed sentence belongs in the prompt that replaces this one.
 func (s *Steerer) Stop() string {
 	if !s.started {
 		return ""
@@ -126,10 +107,8 @@ func (s *Steerer) Stop() string {
 	return left
 }
 
-// maxPending bounds the bytes held waiting for a keystroke to complete. A
-// bracketed paste is one keystroke and can be a whole file, so the bound is
-// generous; it exists only so that a terminal emitting a sequence that never
-// terminates cannot grow the buffer without limit.
+// maxPending bounds the bytes held waiting for a keystroke to complete; a
+// bracketed paste can be a whole file, so the bound is generous.
 const maxPending = 4 << 20
 
 func (s *Steerer) control(seq string) {
@@ -139,10 +118,8 @@ func (s *Steerer) control(seq string) {
 }
 
 // consume processes as many complete keystrokes as the bytes allow, returning
-// the incomplete tail. A multi-byte rune, an escape sequence or a bracketed
-// paste can be split across reads, and treating the halves as separate keys is
-// how "ü" becomes two replacement characters, Ctrl-Left becomes a literal
-// ";5D", and a pasted snippet submits itself one line at a time.
+// the incomplete tail: a rune, an escape sequence or a paste can be split across
+// reads, and treating the halves as separate keys mangles all three.
 func (s *Steerer) consume(b []byte) []byte {
 	for len(b) > 0 {
 		n, ok := s.key(b)
@@ -151,8 +128,8 @@ func (s *Steerer) consume(b []byte) []byte {
 			continue
 		}
 		// Incomplete. A truncated rune is at most four bytes, so anything
-		// longer that is not an escape sequence began with a byte that cannot
-		// start one: drop it and carry on rather than stalling on it forever.
+		// longer that is not an escape began with a byte that cannot start one:
+		// drop it rather than stall on it forever.
 		if b[0] != 0x1b && len(b) > 4 {
 			b = b[1:]
 			continue
@@ -165,7 +142,7 @@ func (s *Steerer) consume(b []byte) []byte {
 	return nil
 }
 
-// key handles one keystroke, returning how many bytes it consumed. ok is false
+// key handles one keystroke, returning how many bytes it consumed; ok is false
 // when b holds only part of one.
 func (s *Steerer) key(b []byte) (int, bool) {
 	switch b[0] {
@@ -174,18 +151,17 @@ func (s *Steerer) key(b []byte) (int, bool) {
 		return 1, true
 
 	case 3: // Ctrl-C
-		// On an empty line this is the documented "cancel the turn". With
-		// something typed it means "forget what I typed" -- so Ctrl-C twice
-		// still cancels, and cancelling never silently discards a message the
-		// user believed they had queued.
+		// On an empty line this cancels the turn; with something typed it
+		// forgets the typing, so Ctrl-C twice still cancels and never discards
+		// a queued message silently.
 		if s.discard() && s.Interrupt != nil {
 			s.Interrupt()
 		}
 		return 1, true
 
 	case 4: // Ctrl-D
-		// Not end-of-input here. Exiting ai-code by holding a key down while a
-		// turn runs is not a thing anyone means to do.
+		// Not end-of-input here: holding a key down while a turn runs is not a
+		// way to exit ai-code.
 		return 1, true
 
 	case 21: // Ctrl-U
@@ -243,9 +219,8 @@ func (s *Steerer) key(b []byte) (int, bool) {
 }
 
 // escape handles the CSI sequences worth having at a steering prompt: the
-// motions, and bracketed paste. Anything else is consumed and discarded, which
-// is the point of parsing it at all -- an unconsumed tail is read back as
-// literal keystrokes.
+// motions and bracketed paste. Anything else is consumed and discarded, since an
+// unconsumed tail is read back as literal keystrokes.
 func (s *Steerer) escape(b []byte) (int, bool) {
 	if len(b) < 2 {
 		return 0, false
@@ -272,9 +247,8 @@ func (s *Steerer) escape(b []byte) (int, bool) {
 	i++
 
 	if final == '~' && strings.HasPrefix(params, "200") {
-		// Bracketed paste. The payload runs to the closing marker, and it is
-		// taken as a block so a pasted snippet does not submit on its first
-		// newline.
+		// Bracketed paste: the payload runs to the closing marker, taken as a
+		// block so a pasted snippet does not submit on its first newline.
 		const end = "\x1b[201~"
 		j := strings.Index(string(b[i:]), end)
 		if j < 0 {
@@ -338,20 +312,13 @@ func (s *Steerer) motion(final rune, mod int) {
 	case 'F':
 		s.edit(func() { s.cur = len(s.buf) })
 	}
-	// Up and Down are ignored. History belongs to the prompt, and stepping
-	// through it here would replace a message the user is part-way through
-	// writing with one they wrote an hour ago.
+	// Up and Down are ignored: history belongs to the prompt, and stepping
+	// through it would replace a half-written message.
 }
 
-// complete extends the word before the cursor, the way Tab does at the
-// prompt.
-//
-// Tab used to fall through to the "any other control character" case and be
-// discarded, so the key did nothing at all while a turn was running. The
-// listing of ambiguous candidates is the only part that genuinely cannot
-// happen here: it prints above the prompt, and the Steerer must not write to
-// a terminal the renderer is already using. Everything else is an ordinary
-// buffer edit.
+// complete extends the word before the cursor, the way Tab does at the prompt.
+// The ambiguous-match listing cannot happen here: it prints above the prompt,
+// and the Steerer must not write to a terminal the renderer is using.
 func (s *Steerer) complete() {
 	if s.Completions == nil {
 		return
@@ -367,8 +334,8 @@ func (s *Steerer) complete() {
 
 	text := matches[0]
 	if len(matches) > 1 {
-		// Nothing shared beyond what is already typed: at the prompt this
-		// lists the candidates, and here there is nowhere to list them.
+		// Nothing shared beyond what is typed: at the prompt this lists the
+		// candidates, and here there is nowhere to list them.
 		common := longestCommonPrefix(matches)
 		if len(common) <= len(line)-start {
 			return
@@ -378,9 +345,8 @@ func (s *Steerer) complete() {
 
 	at := utf8.RuneCountInString(line[:start])
 	s.edit(func() {
-		// The candidates were gathered off the lock. If anything arrived in
-		// the meantime the offsets describe a line that no longer exists, and
-		// applying them would corrupt the one that does.
+		// The candidates were gathered off the lock; if the line changed
+		// since, the offsets describe a line that no longer exists.
 		if s.cur > len(s.buf) || at > s.cur || string(s.buf[:s.cur]) != line {
 			return
 		}
@@ -409,9 +375,8 @@ func (s *Steerer) deleteWordLocked() {
 	s.cur = i
 }
 
-// edit applies a mutation and reports the result. The render callback is made
-// outside the lock: it reaches the screen, and the screen has a lock of its
-// own.
+// edit applies a mutation and reports the result; the render callback runs
+// outside the lock, since it reaches the screen and the screen has a lock.
 func (s *Steerer) edit(f func()) {
 	s.mu.Lock()
 	f()
@@ -471,10 +436,9 @@ func decodeRune(b []byte) (rune, int) {
 	return rs[0], need
 }
 
-// summariseLine reduces a buffer to one displayable line and a column within
-// it, the same way the line editor does: multi-line input is not rendered
-// inline, it is described. It is echoed into the scrollback in full when it is
-// submitted.
+// summariseLine reduces a buffer to one displayable line and a column in it,
+// the same way the line editor does: multi-line input is described, not
+// rendered, and echoed in full on submit.
 func summariseLine(buf []rune, cur int) (string, int) {
 	s := string(buf)
 	if i := strings.IndexByte(s, '\n'); i >= 0 {

@@ -15,13 +15,12 @@ func toolExecutor(t *testing.T) *tool.LocalExecutor {
 	return tool.NewLocalExecutor(tool.NewState(t.TempDir()))
 }
 
-// realisticSystemPrompt stands in for ai-code's real one, which with the tool
-// schemas is several thousand characters. Its size is the point: it is what
-// makes the very first response a large enough sample to calibrate against.
+// realisticSystemPrompt is large enough that the first response is a usable
+// calibration sample.
 var realisticSystemPrompt = strings.Repeat(
 	"You are ai-code, a coding agent. Prefer the dedicated tools over shell commands. ", 60)
 
-// bigTool returns a large result, the way grep or bash does.
+// bigTool stands in for grep or bash returning a large result.
 type bigTool struct {
 	name string
 	out  string
@@ -35,23 +34,12 @@ func (b *bigTool) Run(context.Context, *tool.State, json.RawMessage) tool.Result
 	return tool.Result{Content: b.out}
 }
 
-// The reported number must never fall while the conversation is only growing.
-//
-// It did. The count mixes two measures: the provider's prompt_tokens, which is
-// ground truth, and a chars/4 guess for everything appended since. When the
-// guess overshoots -- and on tool output it overshoots badly, because code and
-// paths tokenise denser than four characters a token -- the next response
-// replaces it with the real figure and the display drops. Nothing was pruned;
-// the earlier number was simply wrong and too high.
 func TestContextUsedNeverFallsWhileTheConversationGrows(t *testing.T) {
-	// 40k of realistic tool output. Roughly 4 chars/token by the old guess,
-	// nearer 9 in reality for repeated structured text.
 	out := strings.Repeat("internal/render/screen.go:142: func (s *Screen) commitLocked\n", 650)
 
 	bt := &bigTool{name: "grep", out: out}
-	// Nine characters a token: structured output with repeated paths is far
-	// denser than the four the old estimator assumed, which is precisely the
-	// case that made the count jump backwards.
+	// Nine characters a token: repeated structured paths tokenise denser than
+	// four.
 	client := &scriptedClient{
 		charsPerToken: 9,
 		turns: []scriptedTurn{
@@ -86,9 +74,6 @@ func TestContextUsedNeverFallsWhileTheConversationGrows(t *testing.T) {
 	}
 }
 
-// The estimate for what has been appended since the last response has to be
-// close, not merely monotone. It is what decides when compaction fires, so a
-// reading that runs 2x high compacts a session that had half its window left.
 func TestContextEstimateIsCloseToTheProvidersCount(t *testing.T) {
 	out := strings.Repeat("internal/render/screen.go:142: func (s *Screen) commitLocked\n", 650)
 	bt := &bigTool{name: "grep", out: out}
@@ -104,8 +89,6 @@ func TestContextEstimateIsCloseToTheProvidersCount(t *testing.T) {
 	a := newAgent(t, client, &collectSink{}, bt)
 	a.SetSystem(realisticSystemPrompt)
 
-	// Capture what ai-code predicted just before each request, against what the
-	// server then said the request actually cost.
 	var predicted []int
 	client.onStream = func() { predicted = append(predicted, a.ContextState().Projected) }
 
@@ -113,8 +96,7 @@ func TestContextEstimateIsCloseToTheProvidersCount(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The first prediction is made with no calibration yet, so it is allowed to
-	// be poor; every one after has a measured ratio behind it.
+	// The first prediction has no calibration behind it; later ones do.
 	for i, req := range client.requests() {
 		if i == 0 {
 			continue
@@ -134,9 +116,8 @@ func TestContextEstimateIsCloseToTheProvidersCount(t *testing.T) {
 	}
 }
 
-// A resumed session reports what is really in the window, which includes the
-// system prompt and every tool schema -- they are sent on every request and on
-// this codebase they are thousands of tokens.
+// The system prompt and tool schemas are sent on every request, so a resumed
+// session must count them.
 func TestResumedSessionCountsTheSystemPromptAndTools(t *testing.T) {
 	ft := &fakeTool{name: "probe", readOnly: true}
 	a := newAgent(t, &scriptedClient{}, &collectSink{}, ft)
@@ -154,10 +135,6 @@ func TestResumedSessionCountsTheSystemPromptAndTools(t *testing.T) {
 	}
 }
 
-// Some llama.cpp builds report prompt_tokens as the tokens actually processed,
-// which on a prompt-cache hit is a small fraction of the real prompt. Believing
-// that figure would set the ratio to something absurd and wreck every later
-// estimate, so an implausible reading is discarded and the previous one kept.
 func TestImplausibleUsageDoesNotPoisonTheEstimate(t *testing.T) {
 	a := newAgent(t, &scriptedClient{}, &collectSink{})
 
@@ -186,10 +163,7 @@ func TestImplausibleUsageDoesNotPoisonTheEstimate(t *testing.T) {
 		t.Errorf("ratio = %.2f after a cache-hit usage report, want it unchanged at 9", got)
 	}
 
-	// A plausible-looking ratio that is still far below what the conversation
-	// can possibly be: 30,000 tokens reported for 90,000 characters reads as
-	// 3.0 chars a token, inside the sanity band, but this model has been
-	// measured at 9. Believing it would understate the window by two thirds.
+	// 3.0 chars/token is inside the sanity band but far below the measured 9.
 	if _, ok := report(90000, 3000); ok {
 		t.Error("a report a third of the measured size was believed")
 	}
@@ -197,9 +171,8 @@ func TestImplausibleUsageDoesNotPoisonTheEstimate(t *testing.T) {
 		t.Errorf("ratio = %.2f after an under-report, want it unchanged at 9", got)
 	}
 
-	// And a sample too small to learn anything from: accepted as a figure,
-	// because a small request's size hardly matters either way, but it must
-	// not move the ratio.
+	// A sample too small to learn from: the figure is accepted but the ratio
+	// must not move.
 	if _, ok := report(120, 40); !ok {
 		t.Error("a small request's usage was rejected")
 	}
@@ -208,9 +181,6 @@ func TestImplausibleUsageDoesNotPoisonTheEstimate(t *testing.T) {
 	}
 }
 
-// Compaction is the one thing that legitimately reduces the count, and when it
-// does the count must reflect the conversation that now exists rather than the
-// one that was replaced.
 func TestCompactionResetsTheGroundTruthFigures(t *testing.T) {
 	client := &scriptedClient{charsPerToken: 9, turns: []scriptedTurn{
 		{text: "ok"},
@@ -240,8 +210,7 @@ func TestCompactionResetsTheGroundTruthFigures(t *testing.T) {
 	if after.Projected >= before.Projected {
 		t.Errorf("compaction left usage at %d, up from %d", after.Projected, before.Projected)
 	}
-	// It must match the request that will actually be sent now, not a
-	// leftover figure describing one that no longer exists.
+	// The projection must match the request that will be sent now.
 	if want := a.estimate(a.fixedChars() + charsOf(a.request().msgs)); after.Projected != want {
 		t.Errorf("after compaction the projection is %d, but the next request is %d tokens",
 			after.Projected, want)
@@ -251,11 +220,6 @@ func TestCompactionResetsTheGroundTruthFigures(t *testing.T) {
 	}
 }
 
-// A length stop has to name whose limit it was. The old message said only that
-// "the model hit its output token cap", which sent people to their server
-// settings -- while the cap was ai-code's own, applied to every request. Now
-// that ai-code always sends a computed cap when it knows the window, there are
-// three distinct culprits and each has a different remedy.
 func TestLengthStopNamesWhoImposedTheCap(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -290,9 +254,6 @@ func TestLengthStopNamesWhoImposedTheCap(t *testing.T) {
 	}
 }
 
-// A response that stopped well short of the cap ai-code sent was not stopped by
-// that cap, and saying otherwise sends the user to edit a setting that had
-// nothing to do with it.
 func TestLengthStopShortOfOurCapBlamesTheServer(t *testing.T) {
 	client := &scriptedClient{turns: []scriptedTurn{{
 		text:  "cut off",
@@ -317,16 +278,6 @@ func TestLengthStopShortOfOurCapBlamesTheServer(t *testing.T) {
 	}
 }
 
-// A request that got smaller has to report as smaller.
-//
-// The count is ground truth plus an estimate of whatever was appended since,
-// and the estimate used to be clamped at zero. That is fine while a
-// conversation only grows, and wrong the moment one shrinks: compaction
-// replaces a long transcript with a short checkpoint, the difference goes
-// negative, the clamp throws it away, and the figure stays pinned at the
-// high-water mark. The user sees a compaction that freed nothing -- or, once
-// the checkpoint adds its own characters back on the positive side, one that
-// somehow made the session bigger.
 func TestContextUsedFallsWhenTheRequestShrinks(t *testing.T) {
 	a := newAgent(t, &scriptedClient{}, &collectSink{})
 	a.SetSystem(realisticSystemPrompt)
@@ -335,8 +286,7 @@ func TestContextUsedFallsWhenTheRequestShrinks(t *testing.T) {
 	a.opts.KeepRecentTokens = DefaultKeepRecentTokens
 	a.charsPerToken = 4
 
-	// A session well past its window: one repeated bulky tool result, which is
-	// the shape that gets a transcript there in a single turn.
+	// A session well past its window: one repeated bulky tool result.
 	bulk := strings.Repeat("match at offset 0x0000 in section .text\n", 400)
 	a.messages = append(a.messages, provider.Message{Role: provider.RoleUser, Content: "search the binary"})
 	for i := 0; i < 140; i++ {
@@ -346,16 +296,13 @@ func TestContextUsedFallsWhenTheRequestShrinks(t *testing.T) {
 			provider.Message{Role: provider.RoleTool, ToolCallID: "c", Content: bulk})
 	}
 
-	// Ground truth from the last response, recorded where it belongs: on the
-	// assistant message the request produced. The figure and the messages it
-	// describes cannot drift apart, because they are the same object.
+	// Ground truth lives on the assistant message it describes, so the figure
+	// and the messages cannot drift apart.
 	last := &a.messages[len(a.messages)-2]
 	last.PromptTokens = a.estimate(a.contextChars())
 	last.Completion = 400
 	before := a.ContextState().Projected
 
-	// A compaction lands. The transcript is untouched; the assembled request
-	// collapses to the checkpoint plus the tail.
 	a.setSummary(strings.Repeat("## Goal\nfind the prologues.\n", 40), a.startPoint(a.keepRecentTokens()))
 
 	sent := a.messagesToSend()
@@ -372,24 +319,12 @@ func TestContextUsedFallsWhenTheRequestShrinks(t *testing.T) {
 	if after >= before {
 		t.Errorf("Used = %d after compaction, was %d before: the figure never fell", after, before)
 	}
-	// Ground truth plus a signed estimate should land near the real size. A
-	// wide tolerance: the estimate divides by a calibrated ratio, so it is
-	// meant to be close, not exact.
+	// Wide tolerance: the estimate is meant to be close, not exact.
 	if after > actual*3/2 {
 		t.Errorf("Used = %d, but the request is really about %d tokens", after, actual)
 	}
 }
 
-// A message the checkpoint has already summarised must not come back.
-//
-// When a session ends on a tool result so large that splitPoint summarises
-// the whole transcript, summarisedThrough reaches the end of the message list
-// and firstKept's floor swallows its own loop. The fallback for "the window
-// is too small for even the last message" then fired, walked back onto that
-// last turn, and put the oversized result the checkpoint had just replaced
-// into every request for the rest of the session -- where no further
-// compaction could reach it, because summarising it is what put the floor
-// there.
 func TestAssemblyDoesNotResurrectSummarisedMessages(t *testing.T) {
 	a := newAgent(t, &scriptedClient{}, &collectSink{})
 	a.SetSystem(realisticSystemPrompt)
@@ -452,8 +387,8 @@ func TestOversizedToolResultIsClampedOnArrival(t *testing.T) {
 	if !strings.Contains(msgs[0].Content, "too large for the context window") {
 		t.Error("the model was not told the result was cut")
 	}
-	// A person who pastes something enormous meant to; cutting it up silently
-	// is worse than the context it costs.
+	// A pasted message is meant to be enormous; cutting it silently is worse
+	// than the context it costs.
 	if len(msgs[1].Content) != len(huge) {
 		t.Error("a user message was clamped")
 	}

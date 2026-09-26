@@ -126,8 +126,7 @@ func (t *GrepTool) Run(ctx context.Context, st *State, raw json.RawMessage) Resu
 			}
 			defer f.Close()
 
-			// Sniff for binary content before scanning: a packed object or a
-			// compiled binary will match almost any pattern and produce noise.
+			// Sniff first: a packed object or compiled binary matches almost any pattern.
 			head := make([]byte, 4096)
 			n, _ := f.Read(head)
 			if looksBinary(head[:n]) {
@@ -234,8 +233,8 @@ func (t *GrepTool) linesResult(st *State, a grepArgs, root string, hits []grepHi
 	}
 }
 
-// noMatchesMessage says what was actually searched. "No matches" alone leaves
-// the model unable to tell an absent symbol from a mistargeted search.
+// noMatchesMessage says what was actually searched; "No matches" alone leaves
+// an absent symbol indistinguishable from a mistargeted search.
 func noMatchesMessage(a grepArgs, root string, scanned int) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "No matches for %q.\n\nSearched %d files under %s",
@@ -249,8 +248,6 @@ func noMatchesMessage(a grepArgs, root string, scanned int) string {
 	}
 	return b.String()
 }
-
-// ---------------------------------------------------------------------------
 
 //go:embed glob.txt
 var globDescription string
@@ -316,9 +313,7 @@ func (t *GlobTool) Run(ctx context.Context, st *State, raw json.RawMessage) Resu
 		hint := "Patterns are matched against paths relative to that directory. " +
 			"Use `**/` to match at any depth, for example `**/*_test.go`."
 		if !a.All {
-			// Explaining `**/` to someone whose pattern was fine, and whose
-			// real problem is that the walker skipped a dot directory, is the
-			// expensive kind of wrong message.
+			// Hidden-file hint only when the pattern did not name a dot directory.
 			hint += " Hidden files are skipped unless the pattern names them " +
 				"or `all` is set."
 		}
@@ -344,12 +339,9 @@ func (t *GlobTool) Run(ctx context.Context, st *State, raw json.RawMessage) Resu
 	}
 }
 
-// globMatch supports `**` for any depth, which filepath.Match does not.
 // literalHiddenSegments picks out the dot-prefixed path segments a pattern
-// names outright, as opposed to ones it might happen to match. `.devcontainer`
-// counts; `.*` does not, because a wildcard has not asked for anything in
-// particular and letting it through would quietly turn every search into a
-// search of .git.
+// names outright. `.*` does not count: a wildcard has asked for nothing in
+// particular, and letting it through would turn every search into one of .git.
 func literalHiddenSegments(pattern string) map[string]bool {
 	var out map[string]bool
 	for _, seg := range strings.Split(pattern, "/") {
@@ -364,13 +356,13 @@ func literalHiddenSegments(pattern string) map[string]bool {
 	return out
 }
 
+// globMatch supports `**` for any depth, which filepath.Match does not.
 func globMatch(pattern, name string) bool {
 	if !strings.Contains(pattern, "**") {
 		if ok, _ := filepath.Match(pattern, name); ok {
 			return true
 		}
-		// A pattern with no directory component matches on basename, which is
-		// what people mean by `*.go`.
+		// A pattern with no directory component matches on basename, which is what `*.go` means.
 		if !strings.Contains(pattern, "/") {
 			ok, _ := filepath.Match(pattern, filepath.Base(name))
 			return ok
@@ -391,7 +383,6 @@ func globMatch(pattern, name string) bool {
 	if after == "" {
 		return true
 	}
-	// Try the remainder against every suffix of the path.
 	segments := strings.Split(name, "/")
 	for i := range segments {
 		if globMatch(after, strings.Join(segments[i:], "/")) {

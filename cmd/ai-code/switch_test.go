@@ -19,11 +19,9 @@ import (
 	"ai-code/internal/tool"
 )
 
-// countingClient records what the swap path asked of the provider.
-//
-// Counting rather than failing, because "no model call at swap time" is the
-// requirement being tested and a client that refuses to be called can only
-// report the violation as a panic somewhere unrelated.
+// countingClient records what the swap path asked of the provider. Counting
+// rather than failing: a client that refuses to be called can only report the
+// violation as a panic somewhere unrelated.
 type countingClient struct {
 	mu      sync.Mutex
 	streams int
@@ -88,8 +86,8 @@ func swapApp(t *testing.T, oldLimit, sessionChars int) (*App, *countingClient) {
 		model:        provider.ModelInfo{ID: "wide-model", ContextWindow: oldLimit},
 		screen:       render.NewScreen(io.Discard, "never"),
 	}
-	// Wired exactly as main.go wires it: the App learns the context figure
-	// from the event stream and never asks the agent for one.
+	// Wired as main.go wires it: the App learns the context figure from the
+	// event stream, never by asking the agent.
 	app.agent = agent.New(client, "wide-model", noTools{},
 		agent.SinkFunc(app.noteContext), agent.Options{
 			ContextLimit:  oldLimit,
@@ -159,9 +157,7 @@ func swap(t *testing.T, a *App, model provider.ModelInfo, answer string) string 
 
 const askMarker = "What the next request should carry"
 
-// A wider window takes nothing away, so there is nothing to decide. This is
-// the case that makes the feature bearable: a dialog after every /model would
-// be worse than the overflow it warns about.
+// A wider window takes nothing away, so there is nothing to decide.
 func TestSwapToRoomierWindowAsksNothing(t *testing.T) {
 	a, _ := swapApp(t, 32768, 120000)
 
@@ -175,8 +171,6 @@ func TestSwapToRoomierWindowAsksNothing(t *testing.T) {
 	}
 }
 
-// Narrower, but the session still fits with room to answer: also nothing to
-// decide.
 func TestSwapThatStillFitsAsksNothing(t *testing.T) {
 	a, _ := swapApp(t, 262144, 4000)
 
@@ -204,9 +198,8 @@ func TestNarrowerWindowStatesConsequences(t *testing.T) {
 	if !strings.Contains(out, askMarker) {
 		t.Fatalf("expected a choice:\n%s", out)
 	}
-	// The numbers are the choice. Each option has to say what it sends, what
-	// is left to work in, and how much of the session stops being sent -- a
-	// bare "use summary / use transcript" is the failure this test exists for.
+	// Each option has to state what it sends, what is left to work in, and
+	// how much of the session stops being sent.
 	for _, want := range []string{
 		tokenCount(plan.Session),
 		tokenCount(plan.Checkpoint.Prompt),
@@ -226,8 +219,6 @@ func TestNarrowerWindowStatesConsequences(t *testing.T) {
 	}
 }
 
-// Choosing the transcript has to mean something: the checkpoint stops going on
-// the wire.
 func TestTranscriptChoiceDropsTheCheckpoint(t *testing.T) {
 	a, _ := swapApp(t, 262144, 200000)
 	a.agent.SetSummary("## Goal\nfinish the thing", 20)
@@ -241,9 +232,8 @@ func TestTranscriptChoiceDropsTheCheckpoint(t *testing.T) {
 	}
 }
 
-// With no checkpoint in hand the only way to offer one is to write it, and
-// writing it is a model call the user would sit and wait through. Saying so is
-// the honest option; producing one silently is not.
+// With no checkpoint stored, offering one would mean a model call; the dialog
+// says so instead.
 func TestCheckpointOptionAbsentWithoutOne(t *testing.T) {
 	a, client := swapApp(t, 262144, 200000)
 
@@ -260,9 +250,8 @@ func TestCheckpointOptionAbsentWithoutOne(t *testing.T) {
 	}
 }
 
-// The requirement the whole design turns on: swapping to a narrower model
-// makes no request. A summary generated here would run on the model being
-// swapped away from, at a few tokens a second, while the user waits.
+// A swap makes no provider call: a summary here would run on the outgoing
+// model while the caller waits.
 func TestSwapMakesNoProviderCall(t *testing.T) {
 	for _, answer := range []string{"c\n", "t\n", "w\n", ""} {
 		a, client := swapApp(t, 262144, 200000)
@@ -295,8 +284,6 @@ func TestWaitStaysOnTheCurrentModel(t *testing.T) {
 	}
 }
 
-// An unanswerable prompt -- no terminal, a closed stdin -- takes the answer
-// that cannot be wrong.
 func TestUnreadableAnswerStaysPut(t *testing.T) {
 	a, _ := swapApp(t, 262144, 200000)
 
@@ -364,9 +351,8 @@ func cloudProviderApp(t *testing.T) (*App, *int32) {
 			DefaultModel: "remote-model",
 		},
 	}
-	// The model cache lives under the user's real data directory unless this
-	// is set, and a cached catalogue would answer the very request this test
-	// is counting.
+	// A cached catalogue would answer the request this test counts, so point
+	// the data directory somewhere empty.
 	t.Setenv("AI_CODE_DATA_DIR", t.TempDir())
 	return app, &hits
 }
@@ -390,9 +376,8 @@ func answering(t *testing.T, keys string, fn func()) {
 	fn()
 }
 
-// A .nocloud tree forbids the provider outright, so the refusal has to come
-// before anything is sent to it. Refusing after asking it for its catalogue
-// has already made the contact the marker exists to prevent.
+// The refusal must come before any request reaches the provider: reading its
+// catalogue would already be the contact .nocloud forbids.
 func TestANoCloudTreeContactsNothingBeforeRefusing(t *testing.T) {
 	app, hits := cloudProviderApp(t)
 	app.noCloud = true
@@ -406,9 +391,8 @@ func TestANoCloudTreeContactsNothingBeforeRefusing(t *testing.T) {
 	}
 }
 
-// The confirmation says "Nothing was sent", so nothing may have been sent --
-// including the catalogue read that would otherwise be needed to name the
-// model in the prompt itself.
+// "Nothing was sent" must hold, including the catalogue read needed to name
+// the model in the prompt.
 func TestDecliningTheCloudSwitchSendsNothing(t *testing.T) {
 	app, hits := cloudProviderApp(t)
 

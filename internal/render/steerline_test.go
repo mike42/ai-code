@@ -22,9 +22,8 @@ func newSteerRenderer(width int) (*Interactive, *bytes.Buffer) {
 	return r, &buf
 }
 
-// The interaction as asked for: the status line owns the bottom row until the
-// user types, the prompt takes it while they are typing, and clearing the line
-// gives it back.
+// The status line owns the bottom row until typing starts; the steering prompt
+// takes it while typing, and clearing the line gives it back.
 func TestSteeringPromptReplacesTheStatusLineAndGivesItBack(t *testing.T) {
 	r, buf := newSteerRenderer(80)
 
@@ -74,8 +73,8 @@ func TestSteeringPromptScrollsRatherThanWrapping(t *testing.T) {
 	}
 }
 
-// The cursor has to sit where the user thinks it does, or editing anywhere but
-// the end of the line is blind.
+// The cursor has to sit where typing expects it, or editing anywhere but the
+// end of the line is blind.
 func TestSteeringPromptParksTheCursor(t *testing.T) {
 	r, buf := newSteerRenderer(80)
 	r.SetSteering("hello", 5, true)
@@ -125,9 +124,8 @@ func stripCursorMoves(s string) string {
 	}
 }
 
-// Pressing Enter has to visibly do something. The message may not be folded in
-// for a whole tool call, and until then the only place that can say it was
-// received is the status line the prompt just gave back.
+// Until the message is folded in, the status line the prompt just gave back is
+// the only place that can acknowledge it.
 func TestQueuedSteeringIsAcknowledgedInTheStatusLine(t *testing.T) {
 	r, buf := newSteerRenderer(80)
 
@@ -153,10 +151,8 @@ func TestQueuedSteeringIsAcknowledgedInTheStatusLine(t *testing.T) {
 	}
 }
 
-// A failed turn is a finished turn. The renderer used to stay in its streaming
-// state after EvError, so the ticker kept repainting the transient zone ten
-// times a second over the prompt the line editor had just drawn -- which looks
-// exactly like the prompt returning instantly and refusing input.
+// A failed turn is a finished turn: a renderer left streaming would repaint the
+// transient zone over the just-drawn prompt ten times a second.
 func TestErrorEndsTheTurnForTheRenderer(t *testing.T) {
 	r, buf := newSteerRenderer(80)
 	r.md = NewMarkdown(func(string) {}, func([]string) {}, Style{}, false, "", func() int { return 80 })

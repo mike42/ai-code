@@ -182,14 +182,6 @@ func TestLsSeparatesDirectoriesFromFiles(t *testing.T) {
 	}
 }
 
-// A glob that names a hidden directory must find it.
-//
-// The pattern matcher always handled `**/.devcontainer/**` correctly; the
-// walker never let it see one, because it skips every dot-prefixed name
-// unless `all` is set. So the tool answered "no matches" for a directory
-// sitting in the project root, and the accompanying message explained `**/`
-// depth semantics -- sending the reader to debug the one thing that was not
-// wrong.
 func TestGlobFindsHiddenDirectoriesThePatternNames(t *testing.T) {
 	dir := t.TempDir()
 	for _, p := range []string{".devcontainer", "sub/.devcontainer"} {

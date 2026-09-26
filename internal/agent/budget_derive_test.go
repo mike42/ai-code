@@ -2,8 +2,7 @@ package agent
 
 import "testing"
 
-// The sizes have to stay in a sane relationship to each other at every window,
-// not just at the 262k one they were originally tuned against.
+// The derived sizes must stay in proportion at every window size.
 func TestBudgetScalesWithTheWindow(t *testing.T) {
 	for _, window := range []int{8192, 16384, 32768, 65536, 131072, 262144, 1 << 20} {
 		b := BudgetFor(window)
@@ -15,8 +14,8 @@ func TestBudgetScalesWithTheWindow(t *testing.T) {
 		if b.Reserve >= window/2 {
 			t.Errorf("window %d: reserve %d is half the window or more", window, b.Reserve)
 		}
-		// The point of the whole exercise: whatever survives compaction must
-		// leave the session room to grow before the next one.
+		// Whatever survives compaction must leave room to grow before the
+		// next one.
 		if free := prompt - b.KeepRecent - b.Summary; free < prompt/3 {
 			t.Errorf("window %d: only %d of %d prompt tokens free after a compaction",
 				window, free, prompt)
@@ -24,9 +23,7 @@ func TestBudgetScalesWithTheWindow(t *testing.T) {
 		if b.KeepRecent >= prompt {
 			t.Errorf("window %d: tail %d cannot fit in a %d prompt", window, b.KeepRecent, prompt)
 		}
-		// The tail has to hold several exchanges, not one result and a stub --
-		// except at the bottom, where the floor on a usable excerpt wins and
-		// the window is simply too small to have both.
+		// The tail must hold several exchanges, not one result and a stub.
 		if b.MaxToolResult > minToolResultTokens && b.MaxToolResult > b.KeepRecent/4 {
 			t.Errorf("window %d: one result (%d) claims more than a quarter of the tail (%d)",
 				window, b.MaxToolResult, b.KeepRecent)
@@ -66,8 +63,6 @@ func TestConfiguredSizesOverrideTheFormula(t *testing.T) {
 	}
 }
 
-// A model swap re-derives, rather than leaving a wide model's sizes on a
-// narrow one.
 func TestSwappingModelsRederivesTheBudget(t *testing.T) {
 	a := newAgent(t, &scriptedClient{}, &collectSink{})
 	a.SetModel("wide", 262144, 0)

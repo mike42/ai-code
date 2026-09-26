@@ -16,10 +16,6 @@ func newRateTester() *Interactive {
 	return &Interactive{streaming: true, showStatus: true, style: Style{}}
 }
 
-// The bug this guards: the rate was completion_tokens from the *previous*
-// request divided by seconds elapsed in the *current* one. The numerator was
-// frozen and the denominator grew, so the reading was a 1/t curve -- it opened
-// absurdly high and sank steadily while generation carried on at one speed.
 func TestRateDoesNotCarryOverFromThePreviousRequest(t *testing.T) {
 	r := newRateTester()
 	base := time.Now()
@@ -46,9 +42,8 @@ func TestRateDoesNotCarryOverFromThePreviousRequest(t *testing.T) {
 	}
 }
 
-// The rate must follow the current speed, not the average since the request
-// began. A cumulative average converges as 1/t, which is what made the number
-// visibly sink while output was plainly still flowing.
+// A cumulative average converges as 1/t and sinks while output keeps flowing,
+// so the reading tracks a trailing window instead.
 func TestRateTracksTheCurrentSpeedNotTheAverage(t *testing.T) {
 	r := newRateTester()
 	base := time.Now()
@@ -79,10 +74,8 @@ func TestRateTracksTheCurrentSpeedNotTheAverage(t *testing.T) {
 	}
 }
 
-// Prompt processing can be most of the wait on a long context. Folding it into
-// the rate made the number meaningless -- measured live, a turn spent 34.7s in
-// prefill and 9.6s generating, so the whole-request average read 20 tok/s for
-// output that was arriving at 94.
+// Prefill can be most of the wait on a long context, so it is shown separately
+// and excluded from the rate.
 func TestPrefillIsShownAndExcludedFromTheRate(t *testing.T) {
 	r := newRateTester()
 	r.turnStarted = time.Now().Add(-30 * time.Second)
@@ -111,8 +104,8 @@ func TestPrefillIsShownAndExcludedFromTheRate(t *testing.T) {
 	}
 }
 
-// No tokens are generated while a tool runs, so there is no rate. Leaving the
-// last one on screen states something about the past as if it were the present.
+// No tokens arrive while a tool runs, so a leftover rate would state the past
+// as if it were the present.
 func TestNoRateIsShownWhileAToolRuns(t *testing.T) {
 	r := newRateTester()
 	base := time.Now()
@@ -131,10 +124,9 @@ func TestNoRateIsShownWhileAToolRuns(t *testing.T) {
 	}
 }
 
-// A reasoning model spends most of its output budget on the thinking channel.
-// Those tokens cost the same time whether or not they are displayed, so they
-// have to be in the rate -- otherwise it reads near zero for the whole of a
-// long think.
+// Reasoning tokens cost the same time whether or not they are displayed, so
+// they count towards the rate; otherwise it reads near zero through a long
+// think.
 func TestReasoningDeltasCountTowardsTheRate(t *testing.T) {
 	for _, mode := range []string{"off", "collapsed", "full"} {
 		t.Run(mode, func(t *testing.T) {
@@ -165,13 +157,9 @@ func TestRateWindowStaysBounded(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// /verbose and /quiet
-// ---------------------------------------------------------------------------
-
 // newVerbosityTester wires a renderer to a buffer standing in for the
-// scrollback. The ticker is deliberately not started: every repaint here is
-// the one the event caused.
+// scrollback. The ticker is not started, so every repaint here is the one the
+// event caused.
 func newVerbosityTester(t *testing.T, tty bool) (*Interactive, *Screen, *bytes.Buffer) {
 	t.Helper()
 	var buf bytes.Buffer
@@ -185,8 +173,8 @@ func think(r *Interactive, text string) {
 	r.Emit(agent.Event{Kind: agent.EvReasoning, Text: text})
 }
 
-// Reasoning is watched, not kept. In the default mode none of it may reach the
-// scrollback, because that is also what a selection and a copy pick up.
+// In the default mode none of the reasoning may reach the scrollback, since a
+// selection or a copy picks that up.
 func TestQuietModeKeepsThinkingOutOfTheScrollback(t *testing.T) {
 	r, _, buf := newVerbosityTester(t, false)
 
@@ -219,8 +207,8 @@ func TestVerboseModeCommitsThinkingToTheScrollback(t *testing.T) {
 	}
 }
 
-// The marquee and the committed thinking are the same words. Showing both is
-// the double-rendering this mode exists to avoid.
+// Showing the marquee and the committed thinking would render the same words
+// twice.
 func TestVerboseThinkingIsNotAlsoInTheMarquee(t *testing.T) {
 	r, s, buf := newVerbosityTester(t, true)
 	r.SetVerbose(true)
@@ -288,8 +276,7 @@ func TestFullToolOutputIsShownOnSuccessOnlyInVerbose(t *testing.T) {
 	}
 }
 
-// The error path is the one place quiet mode already prints output, and it
-// prints six lines of it. /verbose must not have moved that goalpost.
+// Quiet mode caps error output at six lines; /verbose must not move that cap.
 func TestErrorOutputIsUnchangedInQuietModeAndFullInVerbose(t *testing.T) {
 	var lines []string
 	for i := 1; i <= 20; i++ {
@@ -348,9 +335,8 @@ func TestTogglingVerbosityTakesEffectOnTheNextEvent(t *testing.T) {
 		t.Errorf("thinking was still committed after /quiet: %q", got)
 	}
 
-	// The transient zone has to survive the round trip: a row drawn and not
-	// counted is a row the next commit cannot erase, and it stays in the
-	// scrollback forever.
+	// The transient zone must survive the round trip: a row drawn and not counted
+	// is a row the next commit cannot erase.
 	r.redraw()
 	if s.transient > 1 {
 		t.Errorf("transient zone is %d rows after toggling, want at most 1", s.transient)
@@ -376,15 +362,8 @@ func TestASwitchToQuietFlushesTheBufferedThinkingLine(t *testing.T) {
 	}
 }
 
-// The status line has to keep moving for as long as the agent is working,
-// not only while a request is streaming.
-//
-// It was driven entirely by EvTurnStart/EvTurnEnd and the tool events, and
-// those do not cover the whole turn. Compaction runs between requests, emits
-// nothing of its own, and on a local model takes minutes: the spinner stopped
-// and the elapsed counter froze for the duration. That is indistinguishable
-// from a hung session, and it is what the user reported as the thinking
-// marquee freezing for several turns.
+// The status line must keep moving for the whole turn, including between
+// requests, where compaction runs.
 func TestStatusKeepsMovingBetweenRequests(t *testing.T) {
 	r, _, _ := newVerbosityTester(t, true)
 	r.showStatus = true
@@ -416,14 +395,8 @@ func TestStatusKeepsMovingBetweenRequests(t *testing.T) {
 	}
 }
 
-// Turning /verbose on part-way through a turn has to show the thinking that
-// already happened.
-//
-// At a few tokens a second the user only decides they want to read the
-// reasoning once it is well underway, and in collapsed mode only the last few
-// hundred runes were kept for the marquee -- so switching showed the
-// remainder and silently dropped everything before it, which is the half the
-// user was reaching for.
+// /verbose mid-turn must show the reasoning already generated, not only the
+// retained marquee tail.
 func TestVerboseMidTurnShowsTheThinkingAlreadyDone(t *testing.T) {
 	r, _, buf := newVerbosityTester(t, false)
 

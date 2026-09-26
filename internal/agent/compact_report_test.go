@@ -25,17 +25,7 @@ func sessionForCompaction(t *testing.T, client *scriptedClient) *Agent {
 	return a
 }
 
-// Every figure in a CompactResult has to measure the same thing.
-//
-// They did not. TokensBefore/After came from ContextState, which sizes the
-// request that would be sent now, while MessagesBefore counted the transcript
-// and MessagesAfter counted the assembled request. So a checkpoint that
-// removed nothing announced "166 messages -> 4", and a /compact that really
-// did drop 164 messages reported freeing nothing.
-//
-// Every figure now measures the request, because the request is the thing a
-// compaction changes -- the transcript is append-only and is the same length
-// afterwards either way.
+// Every figure in a CompactResult measures the request; the transcript is append-only.
 func TestCheckpointAndCompactionReportDifferentThings(t *testing.T) {
 	client := &scriptedClient{charsPerToken: 4}
 	a := sessionForCompaction(t, client)
@@ -60,8 +50,8 @@ func TestCheckpointAndCompactionReportDifferentThings(t *testing.T) {
 			res.MessagesAfter, len(a.request().msgs))
 	}
 
-	// The one that moves the boundary, on the same session, must report a
-	// real saving -- and must still not have removed anything.
+	// Compact moves the boundary and must report a real saving without
+	// removing messages.
 	a2 := sessionForCompaction(t, &scriptedClient{charsPerToken: 4})
 	transcript := len(a2.Messages())
 	before := a2.RequestTokens()

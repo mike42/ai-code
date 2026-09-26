@@ -11,12 +11,9 @@ import (
 	"ai-code/internal/render"
 )
 
-// cmdConsult asks the model to argue against the session's own work.
-//
-// It inherits the conversation and runs at the strongest thinking the model
-// has, with no tools: the point is a second reading of what is already known,
-// not more searching. The answer is appended to the conversation, because a
-// critique the main loop cannot see is one the user has to relay by hand.
+// cmdConsult asks the model to argue against the session's own work. It
+// inherits the conversation, runs at the strongest thinking, and uses no
+// tools; the answer is appended so the main loop sees the critique.
 func (a *App) cmdConsult(ctx context.Context, args string) error {
 	if len(a.agent.Messages()) == 0 {
 		return errors.New("there is nothing to consult about yet")
@@ -29,8 +26,7 @@ func (a *App) cmdConsult(ctx context.Context, args string) error {
 	a.echoPrompt("/consult " + args)
 	a.out(style.Dim("Reviewing the session…"))
 
-	// No tools: a reviewer that starts reading files is doing the work again
-	// rather than reading it.
+	// No tools: a reviewer that reads files is doing the work again.
 	child, err := a.agent.Spawn(agent.Child{
 		System:  consultSystemPrompt,
 		Effort:  provider.EffortHigh,
@@ -41,8 +37,7 @@ func (a *App) cmdConsult(ctx context.Context, args string) error {
 		return err
 	}
 
-	// The window belongs to the model that is loaded, so the transcript is
-	// fitted to it the same way an ordinary turn would be.
+	// The transcript is fitted to the loaded model's window, as a turn would be.
 	limit, _ := contextLimitFor(a.model, a.cfg.Agent.ContextOverride)
 	transcript := serialiseForReview(a.agent.MessagesFitting(limit))
 
@@ -77,8 +72,8 @@ func (a *App) runChild(ctx context.Context, child *agent.Agent, input, foldAs st
 	return nil
 }
 
-// interactiveSink is where a child's output goes: the same renderer the main
-// loop writes to, so the user watches it work.
+// interactiveSink is where a child's output goes: the renderer the main loop
+// writes to.
 func (a *App) interactiveSink() agent.Sink {
 	if a.interactive != nil {
 		return a.interactive
@@ -104,8 +99,8 @@ Be specific and short. Name files and functions. If the work is sound, say so
 in one line and name the strongest remaining risk -- do not invent a problem
 to justify the exercise.`
 
-// serialiseForReview flattens the conversation into something to read rather
-// than something to continue.
+// serialiseForReview flattens the conversation into something to read, not
+// continue.
 func serialiseForReview(msgs []provider.Message) string {
 	var b strings.Builder
 	for _, m := range msgs {

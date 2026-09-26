@@ -12,9 +12,8 @@ import (
 	"time"
 )
 
-// modelEntry is the union of the fields the backends ai-code speaks to put in
-// /models. Unknown fields are ignored; absent fields stay zero and the context
-// computation degrades gracefully.
+// modelEntry is the union of the fields the supported backends put in /models.
+// Unknown fields are ignored and absent fields stay zero.
 type modelEntry struct {
 	ID string `json:"id"`
 
@@ -51,19 +50,9 @@ func (c *OpenAI) getJSON(ctx context.Context, path string, out any, key keyUse) 
 	return nil
 }
 
-// catalogueKey says whether listing models must carry the API key.
-//
-// On OpenRouter it must not. The catalogue is public and answers without one,
-// while sending the key turns a routine listing -- done at startup whenever
-// the six-hour cache has expired, before the user has typed anything -- into
-// an authenticated, attributable contact with a third party. No user content
-// is in it either way; what the key adds is the account it is charged to.
-//
-// Everywhere else the key stays on. A self-hosted endpoint may well refuse to
-// list anything without it, and withholding it from your own server buys no
-// privacy. The question is asked of the dialect rather than the base URL for
-// the reason given on Dialect: which protocol an endpoint speaks is
-// configuration, not something to infer from a hostname.
+// catalogueKey says whether listing models must carry the API key. Not on
+// OpenRouter: the catalogue is public, so sending the key would attribute a
+// routine startup listing to the account. Everywhere else the key stays on.
 func (c *OpenAI) catalogueKey() keyUse {
 	if c.opts.Dialect == DialectOpenRouter {
 		return withoutKey
@@ -102,14 +91,13 @@ func (e modelEntry) toModelInfo() ModelInfo {
 	if e.RecipeOptions != nil {
 		m.CtxSize = e.RecipeOptions.CtxSize
 		args := ParseLlamaCppArgs(e.RecipeOptions.LlamaCppArgs)
-		// An explicit --ctx-size on the command line is what the backend was
-		// actually launched with and wins over the recipe's nominal value.
+		// An explicit --ctx-size on the command line wins over the recipe's
+		// nominal value.
 		if args.CtxSize > 0 {
 			m.CtxSize = args.CtxSize
 		}
-		// Left at 0 when --parallel is absent and ParallelAuto when it is auto:
-		// both mean "the server decides", which is a different statement from
-		// "one slot" and produces a different window.
+		// Both absent and auto mean "the server decides", a different window
+		// from "one slot".
 		m.Parallel = args.Parallel
 		m.KVUnified = args.UnifiedKV()
 		m.PerSlotLimit = args.PerSlotLimit
@@ -119,8 +107,7 @@ func (e modelEntry) toModelInfo() ModelInfo {
 
 	m.SupportsTools = slices.Contains(e.Labels, "tool-calling") ||
 		slices.Contains(e.SupportedParameters, "tools")
-	// A backend that advertises no capability metadata at all is assumed
-	// capable; refusing to talk to it would be worse than trying and failing.
+	// No capability metadata at all: assume capable rather than refuse.
 	if len(e.Labels) == 0 && len(e.SupportedParameters) == 0 {
 		m.SupportsTools = true
 	}
@@ -137,56 +124,38 @@ func sortModels(m []ModelInfo) {
 	})
 }
 
-// ---------------------------------------------------------------------------
-// slots
-// ---------------------------------------------------------------------------
-
-// slotEntry is one element of llama.cpp's GET /slots array. Field names and
-// the surrounding shape have both moved between releases, so everything is
-// optional and a missing field costs us a fallback rather than an error.
+// slotEntry is one element of llama.cpp's GET /slots array; field names and
+// shape vary between releases, so everything is optional.
 type slotEntry struct {
 	ID int `json:"id"`
-	// NCtx is the per-request window this slot actually has. It is the one
-	// number in the whole context chain that nothing has to infer.
+	// NCtx is the per-request window this slot actually has: observed, not
+	// inferred.
 	NCtx         int  `json:"n_ctx"`
 	IsProcessing bool `json:"is_processing"`
 
-	// Prompt-token counts: how full the slot currently is. Not yet surfaced,
-	// but this endpoint is the only place they exist and reading them here
-	// keeps the eventual dispatch decision (is there a slot with a warm prefix
-	// and room to spare?) from needing a second protocol.
 	NPromptTokens          int `json:"n_prompt_tokens"`
 	NPromptTokensProcessed int `json:"n_prompt_tokens_processed"`
 }
 
 // SlotsInfo is the aggregate of what GET /slots reported.
 type SlotsInfo struct {
-	// Count is the observed slot count -- the resolved answer to `--parallel
-	// auto`, which nothing else on the wire tells us.
+	// Count is the observed slot count, the resolved answer to --parallel auto.
 	Count int
 	Busy  int
-	// NCtx is the smallest per-slot window seen. Slots are normally uniform;
-	// taking the minimum means a heterogeneous server errs towards compacting
-	// early rather than towards a mid-turn overflow.
+	// NCtx is the smallest per-slot window seen; a heterogeneous server errs
+	// towards compacting early rather than a mid-turn overflow.
 	NCtx int
 	// MaxPromptTokens is the largest prompt currently resident in any slot.
 	MaxPromptTokens int
 }
 
-// slotsProbeTimeout bounds the /slots probe. It is enrichment on a path the
-// user is waiting on, and doWithRetry will happily spend several backoffs on a
-// server that answers 503; a slow no is the same as a no here.
+// slotsProbeTimeout bounds the /slots probe; a slow no is the same as a no on a
+// startup path.
 const slotsProbeTimeout = 3 * time.Second
 
 // Slots reads GET /slots, which llama.cpp exposes and most other backends do
-// not.
-//
-// Absence is the normal case, not a failure: the endpoint is off under
-// --no-slots, returns 501 on some builds, 404 on anything that is not
-// llama.cpp, and lemonade proxies some upstream endpoints but not others, so
-// reachability is a runtime discovery rather than a property of the configured
-// provider. Every one of those degrades to the next source in the context
-// chain, which is why callers ignore the error instead of surfacing it.
+// not. Absence is normal: the endpoint is off under --no-slots or returns
+// 501/404, and the context chain falls through, so callers ignore the error.
 func (c *OpenAI) Slots(ctx context.Context) (*SlotsInfo, error) {
 	ctx, cancel := context.WithTimeout(ctx, slotsProbeTimeout)
 	defer cancel()
@@ -196,8 +165,8 @@ func (c *OpenAI) Slots(ctx context.Context) (*SlotsInfo, error) {
 		return nil, err
 	}
 	if len(raw) == 0 {
-		// A well-formed empty array tells us nothing; treating it as "zero
-		// slots" would claim the server can serve nobody.
+		// An empty array is not zero slots; it would claim the server can
+		// serve nobody.
 		return nil, fmt.Errorf("/slots reported no slots")
 	}
 
@@ -214,13 +183,9 @@ func (c *OpenAI) Slots(ctx context.Context) (*SlotsInfo, error) {
 	return info, nil
 }
 
-// ---------------------------------------------------------------------------
-// lemonade
-// ---------------------------------------------------------------------------
-
-// Lemonade adds residency introspection to the generic client. On a server with
-// a single LLM slot, knowing which model is actually resident is the difference
-// between a working session and a silent model swap.
+// Lemonade adds residency introspection to the generic client; on a single-slot
+// server, knowing which model is resident separates a working session from a
+// silent swap.
 type Lemonade struct {
 	*OpenAI
 }
@@ -238,8 +203,7 @@ func (l *Lemonade) Models(ctx context.Context) ([]ModelInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Mark what is actually resident. A health failure is not fatal here: the
-	// model list is still useful without residency information.
+	// Mark what is resident; a health failure still leaves a useful model list.
 	resident := -1
 	if h, err := l.Health(ctx); err == nil && h.ModelLoaded != "" {
 		for i := range models {
@@ -251,14 +215,13 @@ func (l *Lemonade) Models(ctx context.Context) ([]ModelInfo, error) {
 	}
 
 	// Slots belong to the process serving the resident model, so they say
-	// nothing about the rest of the catalogue -- and without /health we do not
-	// know which entry that is. Best-effort, same as residency above.
+	// nothing about the rest of the catalogue.
 	if resident >= 0 {
 		if s, err := l.Slots(ctx); err == nil {
 			m := &models[resident]
 			m.Slots, m.SlotsBusy = s.Count, s.Busy
-			// An observed count resolves `--parallel auto`, the one case where
-			// the launch arguments genuinely cannot tell us the divisor.
+			// An observed count resolves `--parallel auto`, which the launch
+			// arguments cannot.
 			if m.Parallel < 1 {
 				m.Parallel = s.Count
 			}

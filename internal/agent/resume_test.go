@@ -28,9 +28,6 @@ func resumeAgent(t *testing.T, turns int) (*Agent, *scriptedClient) {
 	return a, client
 }
 
-// The plan is arithmetic. A swap that had to summarise first would stall on
-// the model being swapped away from, which is the one thing Phase 2 says must
-// not happen at swap time.
 func TestPlanResumeCallsNoModel(t *testing.T) {
 	a, client := resumeAgent(t, 40)
 	a.SetSummary("## Goal\nship it", 20)
@@ -49,10 +46,8 @@ func TestPlanResumeFitsWhenThereIsRoomToAnswer(t *testing.T) {
 	if p := a.PlanResume(262144); !p.Fits {
 		t.Errorf("a short session in a wide window should fit: %+v", p)
 	}
-	// Room to sit in is not room to answer in: a window the transcript exactly
-	// fills is a request that cannot produce anything.
-	// Doubled because the reserve is clamped to half a window this small, so
-	// half of whatever is asked for is what the session actually gets.
+	// Doubled: the reserve is clamped to half a window this small, so half of
+	// what is asked for is what the session gets.
 	tight := 2 * (a.TranscriptTokens() + minOutputTokens/2)
 	if room := a.usableIn(tight) - a.TranscriptTokens(); room >= minOutputTokens {
 		t.Fatalf("the fixture leaves %d tokens spare, which is not tight", room)
@@ -66,8 +61,7 @@ func TestPlanResumeFitsWhenThereIsRoomToAnswer(t *testing.T) {
 	}
 }
 
-// The two options have to differ in the way the user is told they do:
-// the checkpoint costs room and covers the past, the transcript keeps more
+// The checkpoint costs room and covers the past; the transcript keeps more
 // recent messages and covers nothing.
 func TestPlanResumeSeparatesTheTwoWays(t *testing.T) {
 	a, _ := resumeAgent(t, 60)
@@ -129,9 +123,6 @@ func TestResumeFromTranscriptDropsTheCheckpoint(t *testing.T) {
 	}
 }
 
-// A preference about one window must not outlive it: carried into a wider
-// model it would keep auto-compaction switched off for a session with room for
-// it again.
 func TestModelChangeClearsTheTranscriptPreference(t *testing.T) {
 	a, _ := resumeAgent(t, 60)
 	a.SetSummary("## Goal\nship it", 40)
@@ -143,8 +134,6 @@ func TestModelChangeClearsTheTranscriptPreference(t *testing.T) {
 	}
 }
 
-// Having chosen the transcript, the session must not then summarise behind the
-// user's back -- that is the model call the choice existed to avoid.
 func TestTranscriptChoiceSuppressesAutoSummarising(t *testing.T) {
 	client := &scriptedClient{turns: []scriptedTurn{{text: "carrying on"}}}
 	exec := tool.NewLocalExecutor(tool.NewState(t.TempDir()))
@@ -157,8 +146,7 @@ func TestTranscriptChoiceSuppressesAutoSummarising(t *testing.T) {
 	if err := a.Run(context.Background(), "go on"); err != nil {
 		t.Fatal(err)
 	}
-	// One request: the turn itself. A second would be the summarisation the
-	// user declined.
+	// One request: the turn itself. A second would be an unasked-for summary.
 	if n := len(client.requests()); n != 1 {
 		t.Errorf("%d requests, want 1 -- the extra one is a summary nobody asked for", n)
 	}
@@ -207,9 +195,6 @@ func containsCheckpoint(msgs []provider.Message) bool {
 	return false
 }
 
-// The idle checkpoint runs on a timer with nobody watching, so the test that
-// keeps it from burning a model call every two minutes on an untouched
-// session is the only thing standing between the feature and a nuisance.
 func TestCheckpointWorthwhileIsFalseOnAColdSession(t *testing.T) {
 	client := &scriptedClient{}
 	a := New(client, "m", toolExecutor(t), &collectSink{}, Options{ContextLimit: 262144})
@@ -230,8 +215,7 @@ func TestCheckpointWorthwhileIsFalseWhenNothingHasHappenedSince(t *testing.T) {
 		t.Fatal("a session with no checkpoint at all is worth checkpointing")
 	}
 
-	// Stand in for the checkpoint the last idle period wrote, covering exactly
-	// what one written now would cover.
+	// Stand in for a checkpoint covering exactly what one written now would.
 	a.SetSummary("## Goal\nship it", a.checkpointThrough(SpeculativeSummaryMaxTokens))
 
 	if a.CheckpointWorthwhile(SpeculativeSummaryMaxTokens) {

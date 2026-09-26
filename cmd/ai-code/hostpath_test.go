@@ -11,13 +11,9 @@ import (
 	"ai-code/internal/tool"
 )
 
-// Nothing about the host may reach a model whose tools run in a container.
-//
-// The reported symptom was a request to edit AGENTS.md failing: the model had
-// been handed the file's path on the host, while every tool it has runs
-// inside the container where that path does not exist. The disclosure and the
-// broken edit are the same bug -- a path that names nothing the model can act
-// on.
+// Nothing about the host may reach a model whose tools run in a container: a
+// host path names nothing the tools can act on, and disclosing it is the same
+// defect as the failed edit it causes.
 func TestNoHostPathsReachTheModelInAContainer(t *testing.T) {
 	// A host layout with a username in it, and instruction files at both the
 	// project root and a nested directory.
@@ -61,15 +57,15 @@ func TestNoHostPathsReachTheModelInAContainer(t *testing.T) {
 	app.rebuildSystemPrompt("")
 	got := app.agent.System()
 
-	// The whole point: no fragment of this machine's layout survives. The
-	// project basename is not in this list -- it legitimately appears inside
-	// the container path, which is the answer rather than the leak.
+	// No fragment of the host layout may reach the prompt. The project
+	// basename is absent because it appears inside the container path, which
+	// is the answer rather than the leak.
 	for _, leak := range []string{home, project, nested, "someone"} {
 		if strings.Contains(got, leak) {
 			t.Errorf("system prompt leaks the host path %q:\n%s", leak, got)
 		}
 	}
-	// And the instructions still arrive, named where the tools can reach them.
+	// The instructions still arrive, named where the tools can reach them.
 	for _, want := range []string{
 		"Use tabs.",
 		"No allocations in the hot path.",

@@ -107,10 +107,8 @@ func TestEmptyEnterSubmitsNothing(t *testing.T) {
 	}
 }
 
-// Ctrl-C has to mean both things, and the order matters: with text on the line
-// it clears, which is what a prompt does, and on an empty line it cancels,
-// which is what ai-code has always documented. Cancelling straight away would
-// throw away a message without showing that it had.
+// Ctrl-C clears with text on the line and cancels on an empty one; cancelling
+// straight away would throw away a message without showing that it had.
 func TestCtrlCClearsTheLineFirstAndCancelsOnlyWhenEmpty(t *testing.T) {
 	st := newSteerTester()
 	st.type_("never mind")
@@ -175,7 +173,7 @@ func TestMultilineInputIsSummarisedOnThePromptLine(t *testing.T) {
 }
 
 // An escape sequence split across reads must not be typed into the buffer as
-// literal characters, which is the classic ";5D appears in your prompt" bug.
+// literal characters.
 func TestSplitEscapeSequencesAreNotInsertedAsText(t *testing.T) {
 	st := newSteerTester()
 	st.type_("abc def")
@@ -225,14 +223,9 @@ func TestHistoryKeysAreIgnoredWhileSteering(t *testing.T) {
 	}
 }
 
-// Tab completes a path while a turn is running, as it does at the prompt.
-//
-// It used to do nothing whatever. Steering handles a fixed set of control
-// characters and lets the rest fall through to "any other control: ignored
-// rather than inserted" -- and Tab is byte 9, so it was swallowed there
-// silently. Completion had been left out of the Steerer deliberately, on the
-// grounds that it needs the screen, but only the ambiguous-match listing
-// does: extending the word touches nothing but the buffer.
+// Tab completes a path while a turn is running, as it does at the prompt. Only
+// the ambiguous-match listing needs the screen; extending the word touches
+// nothing but the buffer.
 func TestTabCompletesWhileSteering(t *testing.T) {
 	st := newSteerTester()
 	st.Completions = func(line string) (int, []string) {

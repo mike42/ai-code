@@ -11,11 +11,9 @@ import (
 	"ai-code/internal/tool"
 )
 
-// runExecutorDaemon serves the tool executor over stdin/stdout as JSON-lines.
-//
-// The far side of a DevcontainerExecutor: the same binary inside the sandbox,
-// answering one Request per line with one Result per line. It builds the full
-// tool set, so every tool runs against the sandbox's filesystem.
+// runExecutorDaemon serves the tool executor over stdin/stdout as JSON-lines,
+// the daemon side of a DevcontainerExecutor. It builds the full tool set, so
+// every tool runs against the sandbox's filesystem.
 func runExecutorDaemon(cwd string) error {
 	cfg, err := config.Load(cwd)
 	if err != nil {
@@ -41,8 +39,8 @@ func runExecutorDaemon(cwd string) error {
 		}
 		res, err := exec.Execute(context.Background(), req)
 		if err != nil {
-			// Transport-level failure inside the daemon; surface it as a result
-			// so the agent loop can recover rather than hang.
+			// Transport-level failure: report it as a result so the agent
+			// loop can recover rather than hang.
 			res = tool.Errorf("executor failed: %v", err)
 		}
 		if err := enc.Encode(res); err != nil {

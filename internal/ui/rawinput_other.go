@@ -4,11 +4,8 @@ package ui
 
 import "errors"
 
-// Steering needs character-at-a-time input with output processing left intact,
-// which is a termios operation. The Windows console equivalent belongs with the
-// rest of the Windows port rather than ahead of it, so steering is simply off
-// here: the turn runs, the status line shows, and input is taken at the prompt
-// as before.
+// rawInput is unsupported here: steering needs termios, and the Windows console
+// equivalent belongs with the rest of the Windows port.
 func rawInput(fd int) (func(), error) {
 	return nil, errors.New("steering is not supported on this platform yet")
 }

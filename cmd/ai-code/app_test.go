@@ -2,14 +2,8 @@ package main
 
 import "testing"
 
-// /verbose and /quiet must not wait for a turn boundary.
-//
-// A slash command typed mid-turn is queued until the loop reaches a point
-// where the conversation can safely change, which is after the next round of
-// tool results. For a command that alters the conversation that is right. For
-// these two it is useless: they change only how output is drawn, and on a
-// model thinking at a few tokens a second the next boundary is minutes away
-// -- by which time the thinking the user turned verbose on to read is over.
+// /verbose and /quiet change only how output is drawn; every other command
+// waits for a turn boundary.
 func TestRenderOnlyCommandsDoNotWaitForATurnBoundary(t *testing.T) {
 	for _, line := range []string{"/verbose", "/quiet", "  /verbose  "} {
 		if !renderOnlyCommand(line) {

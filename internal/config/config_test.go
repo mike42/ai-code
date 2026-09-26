@@ -38,9 +38,9 @@ func setupLayers(t *testing.T, userTOML, projectTOML string) *Config {
 	return cfg
 }
 
+// A project file that sets one key must not wipe out the provider definitions
+// in the home config.
 func TestProjectLayerDoesNotDiscardUserProviders(t *testing.T) {
-	// The failure this guards against: a project file that sets one key wiping
-	// out the provider definitions the user has in their home config.
 	cfg := setupLayers(t,
 		`
 default_provider = "home"
@@ -76,7 +76,7 @@ default_mode = "research"
 
 func TestProjectLayerMergesIntoExistingProvider(t *testing.T) {
 	// A project overriding just the model must keep the URL, class and TLS
-	// settings from the user layer.
+	// settings from the user config.
 	cfg := setupLayers(t,
 		`
 [provider.home]

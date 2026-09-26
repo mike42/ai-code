@@ -9,32 +9,21 @@ import (
 	"ai-code/internal/provider"
 )
 
-// scriptedClient replays a fixed sequence of assistant turns.
-//
-// It exists so the loop, cancellation and message-shape handling can be tested
-// deterministically. The parts of this system that must never be flaky --
-// message validation, interrupt repair, tool dispatch ordering -- are exactly
-// the parts a live model would make flaky.
+// scriptedClient replays a fixed sequence of assistant turns, so the loop,
+// cancellation and message shapes are tested deterministically.
 type scriptedClient struct {
 	mu    sync.Mutex
 	turns []scriptedTurn
 	n     int
 	seen  [][]provider.Message
-	// reqs keeps the whole request, not just the messages: max_tokens and the
-	// thinking level are computed per turn, so they can only be checked against
-	// what actually went on the wire.
+	// reqs keeps the whole request: max_tokens and the thinking level are
+	// computed per turn.
 	reqs []provider.Request
 	// charsPerToken, when set, makes the client report usage computed from the
-	// request it was actually given, at this density. A canned usage figure
-	// cannot exercise the running token count, because the count's whole job is
-	// to predict the next prompt_tokens from the conversation it can see -- and
-	// against numbers unrelated to the messages, any prediction looks wrong.
+	// request it was given, at this density.
 	charsPerToken float64
-	// tokenizer, when set, counts a request instead of charsPerToken. It
-	// exists so a test can make the server disagree with the harness's own
-	// character approximation, which is the only way to exercise calibration
-	// honestly: a fake that counts exactly the way the agent estimates proves
-	// the agent agrees with itself.
+	// tokenizer, when set, counts a request instead of charsPerToken, so the
+	// backend can disagree with the agent's own estimate.
 	tokenizer func(provider.Request) int
 	onStream  func()
 	// refuseOver, when set, rejects any request whose counted size exceeds it,
@@ -42,21 +31,13 @@ type scriptedClient struct {
 	refuseOver int
 
 	// workerTurns, when set, is the script for requests carrying the worker
-	// system prompt, with its own counter.
-	//
-	// Workers run beside the parent rather than inside its turn, so both draw
-	// from this client at once and a single sequence would hand whichever
-	// goroutine arrived first whatever came next. Two scripts make the test
-	// about what each agent was sent rather than about who won the race.
+	// system prompt, with its own counter; workers run beside the parent.
 	workerTurns []scriptedTurn
 	workerN     int
-	// onWorkerStream runs when a worker request is served, off the lock, so a
-	// test can hold a worker open without reaching into these fields from
-	// another goroutine.
+	// onWorkerStream runs when a worker request is served, off the lock.
 	onWorkerStream func()
 }
 
-// isWorkerRequest reports whether this request belongs to a worker.
 func isWorkerRequest(req provider.Request) bool {
 	for _, m := range req.Messages {
 		if m.Role == provider.RoleSystem && strings.Contains(m.Content, "worker agent") {
@@ -100,8 +81,8 @@ func (c *scriptedClient) Models(ctx context.Context) ([]provider.ModelInfo, erro
 
 func (c *scriptedClient) Stream(ctx context.Context, req provider.Request) (provider.Stream, error) {
 	c.mu.Lock()
-	// Refused before anything is recorded or the script advances: a request
-	// the server rejected never produced a turn.
+	// Refused before anything is recorded or the script advances: a rejected
+	// request produced no turn.
 	if c.refuseOver > 0 && c.requestTokens(req) > c.refuseOver {
 		c.mu.Unlock()
 		return nil, &provider.APIError{Status: 400,
@@ -140,10 +121,8 @@ func (c *scriptedClient) Stream(ctx context.Context, req provider.Request) (prov
 	if ratio > 0 || c.tokenizer != nil {
 		t.usage.PromptTokens = c.requestTokens(req)
 		if t.usage.CompletionTokens == 0 {
-			// Measured the same way as the prompt. A server counts the tool
-			// call it generated; a fake that counts only the text credits the
-			// assistant message with far fewer tokens than it will cost as part
-			// of the next prompt, which looks exactly like an estimator bug.
+			// Measured the same way as the prompt: a server counts the tool
+			// call it generated.
 			den := ratio
 			if den <= 0 {
 				den = 4

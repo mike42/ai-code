@@ -12,35 +12,19 @@ import (
 )
 
 // checkpointProbeTimeout bounds the health check that decides whether the
-// backend is free enough for a checkpoint.
-//
-// Not a limit on generation, which is never bounded by wall clock here: it
-// bounds a liveness question whose answer stops being useful the moment it is
-// slow, because a server that cannot say whether it is busy within a few
-// seconds is busy. Same reasoning as the /slots probe.
+// backend is free: a server slow to answer counts as busy.
 const checkpointProbeTimeout = 3 * time.Second
 
-// startIdleCheckpoint arranges for the session to be summarised if the prompt
-// is left untouched, and returns the function that calls that off.
-//
-// The summary replaces nothing and is read only if a later window turns out
-// to be too narrow for the real messages. Writing it while idle keeps the
-// server's prefix cache warm for it, and puts the cost somewhere other than
-// in front of a waiting user.
-//
-// The returned stop function waits for the goroutine, because the caller
-// touches the agent the checkpoint is writing to. The keystroke has already
-// cancelled it by then, so the wait is not perceptible.
+// startIdleCheckpoint summarises the session if the prompt is left untouched,
+// and returns the stop function, which waits for the goroutine before the
+// caller touches the agent.
 func (a *App) startIdleCheckpoint(ctx context.Context, editor *ui.Editor) func() {
 	if !a.watchEnabled(editor) {
 		return func() {}
 	}
 
-	// Two lifetimes, because a keystroke means two different things to the
-	// two jobs here. It aborts the speculative summary -- that is a model
-	// call nobody asked for and the person is back. It must not stop the
-	// watch: a window part-way through typing still has to answer another
-	// window's swap, or that swap waits for a session that will never reply.
+	// Two lifetimes: a keystroke ends the summary but keeps the swap watch
+	// running.
 	watch, stopWatch := context.WithCancel(ctx)
 	work, stopWork := context.WithCancel(watch)
 	done := make(chan struct{})
@@ -58,32 +42,22 @@ func (a *App) startIdleCheckpoint(ctx context.Context, editor *ui.Editor) func()
 	}
 }
 
-// watchEnabled reports whether this session takes part at all. The swap
-// watch and the speculative checkpoint share a goroutine, so turning the
-// checkpoint off with agent.auto_checkpoint leaves the watch running.
+// watchEnabled reports whether this session takes part.
 func (a *App) watchEnabled(editor *ui.Editor) bool {
-	// A piped session has no prompt to watch and no keystroke to abort with,
-	// so anything started here could only collide with the next line of the
-	// script.
+	// A piped session has no prompt to watch.
 	return editor != nil && editor.IsTTY()
 }
 
-// watchWhileIdle runs for as long as the prompt is up.
-//
-// Two clocks and two lifetimes. The speculative checkpoint is lazy work
-// nobody asked for, bounded by `work`, which a keystroke ends. The watch for
-// another window's swap is not optional and is bounded by `watch`, which
-// ends only when the line is submitted: a window blocked on this session
-// needs an answer whether or not someone is typing here.
+// watchWhileIdle runs for as long as the prompt is up. The checkpoint is bounded
+// by work, which a keystroke ends; the swap watch is bounded by watch, which
+// ends only when the line is submitted.
 func (a *App) watchWhileIdle(watch, work context.Context, idle time.Duration, editor *ui.Editor) {
 	due := time.Now().Add(idle)
 	written := false
 
 	for {
 		a.prepareForSwap(watch, editor)
-		// The shared intent first: a local file saying what this user last
-		// asked for. The server is consulted only about changes nobody here
-		// asked for, and consulting it is optional.
+		// The shared intent first: a local file, no server call.
 		if !a.adoptIntended(editor) {
 			a.adoptModelChange(watch, editor)
 		}
@@ -113,19 +87,14 @@ func (a *App) speculativeCheckpoint(ctx context.Context) {
 		return
 	}
 	if _, err := a.agent.Summarise(ctx, agent.SpeculativeSummaryMaxTokens); err != nil {
-		// Silent: nobody asked for this summary, the next idle period retries,
-		// and a failure that matters is reported by the path that needs one.
+		// Silent: the next idle period retries; a real failure is reported where needed.
 		return
 	}
 	a.recordCheckpoint()
 }
 
-// backendFree reports whether a summary can be written without taking the
-// model away from something else.
-//
-// Unknown counts as free: most backends expose nothing to ask, and refusing to
-// checkpoint on every one of them would mean the feature only ever worked on
-// lemonade.
+// backendFree reports whether a summary can be written without taking the model
+// away; unknown counts as free.
 func (a *App) backendFree(ctx context.Context) bool {
 	in, ok := a.client.(provider.Introspector)
 	if !ok {
@@ -139,20 +108,14 @@ func (a *App) backendFree(ctx context.Context) bool {
 		return true
 	}
 	if h.ModelLoaded != "" && h.ModelLoaded != a.model.ID {
-		// Someone else's model is resident. Sending anything now would evict it
-		// and load ours back, and a swap per turn between two instances is
-		// exactly the thrash a checkpoint exists to soften. Causing it for a
-		// summary nobody asked for would be self-defeating.
+		// Someone else's model is resident: a send now would evict it.
 		return false
 	}
 	return !h.Busy && !h.Streaming
 }
 
-// recordCheckpoint persists the standby summary the agent is holding, so a
-// /restart or a --resume starts with it instead of making a new one.
-//
-// Safe to call after anything that might have produced one: it appends only
-// when the agent holds something different from what is on disk.
+// recordCheckpoint persists the standby summary so a /restart or a --resume
+// starts with it. It appends only when the summary differs from the last.
 func (a *App) recordCheckpoint() {
 	if a.sess == nil {
 		return

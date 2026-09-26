@@ -20,9 +20,8 @@ import (
 	"time"
 )
 
-// TLSOptions covers the cases that make self-hosted backends painful in other
-// harnesses: a private CA, a self-signed certificate, or mutual TLS. All three
-// are first-class configuration here rather than something to work around.
+// TLSOptions covers the cases that make self-hosted backends painful: a
+// private CA, a self-signed certificate, or mutual TLS.
 type TLSOptions struct {
 	// Insecure disables certificate verification entirely. Blunt, sometimes
 	// exactly what a LAN service needs, and never hidden behind a rebuild.
@@ -37,8 +36,7 @@ type TLSOptions struct {
 }
 
 // RetryPolicy governs transient failure handling. Retries happen only before
-// any part of a response has been observed, so a retry never re-runs tools and
-// never duplicates output.
+// any part of a response has been observed, so no retry duplicates output.
 type RetryPolicy struct {
 	MaxAttempts int
 	BaseDelay   time.Duration
@@ -49,17 +47,13 @@ func DefaultRetryPolicy() RetryPolicy {
 	return RetryPolicy{MaxAttempts: 4, BaseDelay: 500 * time.Millisecond, MaxDelay: 15 * time.Second}
 }
 
-// Dialect selects which of the two incompatible reasoning wire formats this
-// endpoint speaks. It is configuration rather than something sniffed from the
-// base URL at request time, because an OpenRouter-compatible gateway can live
-// at any hostname and getting it wrong is silent: llama.cpp forwards the whole
-// request JSON to the template, so a `reasoning` object it does not understand
-// is passed through and ignored instead of rejected.
 // DefaultConnectTimeout bounds establishing a connection -- DNS, TCP and TLS.
-// A server that is not there should fail quickly; a server that is there is
-// allowed to take as long as it takes.
+// A server that is there may take as long as it takes.
 const DefaultConnectTimeout = 30 * time.Second
 
+// Dialect selects which of the two incompatible reasoning wire formats an
+// endpoint speaks. Configured rather than sniffed, because getting it wrong is
+// silent: an unrecognised `reasoning` object is passed through and ignored.
 type Dialect string
 
 const (
@@ -71,9 +65,7 @@ const (
 	DialectOpenRouter Dialect = "openrouter"
 )
 
-// keyUse says whether one request carries the API key. It is a named type
-// rather than a bare bool because the call sites are what decide it, and
-// `true` at a call site does not say what it is true about.
+// keyUse says whether one request carries the API key.
 type keyUse bool
 
 const (
@@ -92,15 +84,13 @@ type Options struct {
 	Retry   RetryPolicy
 	// Dialect is the reasoning wire format; zero value is the OpenAI one.
 	Dialect Dialect
-	// SendReasoning controls whether prior assistant reasoning is replayed on
-	// later turns. Off by default: most backends neither need nor want it, and
-	// it is pure context cost.
+	// SendReasoning replays prior assistant reasoning on later turns; off by
+	// default as pure context cost.
 	SendReasoning bool
 }
 
-// OpenAI is the generic OpenAI-compatible client. It is the base for every
-// backend ai-code speaks to; richer backends embed it and add their own
-// introspection (see Lemonade).
+// OpenAI is the generic OpenAI-compatible client; richer backends embed it and
+// add their own introspection (see Lemonade).
 type OpenAI struct {
 	opts Options
 	http *http.Client
@@ -121,20 +111,8 @@ func NewOpenAI(opts Options) (*OpenAI, error) {
 	if err != nil {
 		return nil, fmt.Errorf("provider %q: %w", opts.Name, err)
 	}
-	// Bound reaching the server, never producing the answer.
-	//
-	// This used to be an http.Client.Timeout of 30 minutes, under a comment
-	// saying per-request cancellation is the context's job -- but that deadline
-	// covers reading the streamed body too, so it was a wall-clock cap on
-	// generation wearing a connection timeout's clothes. A model at one or two
-	// tokens a second, which is an ordinary speed for a large local model on a
-	// busy box, hits it during a genuinely healthy turn and loses the work. The
-	// user's context already cancels on Ctrl-C, and the token cap already bounds
-	// the output; a timer adds nothing except a way to fail a slow success.
-	//
-	// No ResponseHeaderTimeout either: llama.cpp may hold the headers through a
-	// long prompt prefill, which is exactly when a large session is most
-	// valuable and least interruptible.
+	// Bound connection setup only. Generation is bounded by the caller's context
+	// and the token cap; a slow turn must not be failed by a timer.
 	tr.DialContext = (&net.Dialer{Timeout: opts.Timeout, KeepAlive: 30 * time.Second}).DialContext
 	tr.TLSHandshakeTimeout = opts.Timeout
 	return &OpenAI{opts: opts, http: &http.Client{Transport: tr}}, nil
@@ -196,10 +174,6 @@ func buildTransport(t TLSOptions) (*http.Transport, error) {
 func (c *OpenAI) Name() string    { return c.opts.Name }
 func (c *OpenAI) Class() Class    { return c.opts.Class }
 func (c *OpenAI) BaseURL() string { return c.opts.BaseURL }
-
-// ---------------------------------------------------------------------------
-// Wire types
-// ---------------------------------------------------------------------------
 
 type wireMessage struct {
 	Role             string         `json:"role"`
@@ -268,9 +242,8 @@ func (c *OpenAI) encode(req Request) wireRequest {
 	}
 	for _, m := range req.Messages {
 		wm := wireMessage{Role: string(m.Role), Name: m.Name, ToolCallID: m.ToolCallID}
-		// An assistant message that carries only tool calls must still send
-		// content; some servers reject a missing field and others reject an
-		// empty string, so null is the interoperable choice.
+		// Some servers reject a missing content field, others an empty string;
+		// null is the interoperable choice.
 		if m.Content == "" && m.Role == RoleAssistant {
 			wm.Content = nil
 		} else {
@@ -306,9 +279,8 @@ func (c *OpenAI) encode(req Request) wireRequest {
 }
 
 func (c *OpenAI) encodeEffort(w *wireRequest, req Request) {
-	// chat_template_kwargs is the caller's escape hatch for modes the
-	// reasoning_effort ladder cannot name, so it rides along independently of
-	// the effort level and is never synthesised here.
+	// chat_template_kwargs is the caller's escape hatch, sent independently of
+	// the effort level and never synthesised here.
 	w.ChatTemplateKwa = req.TemplateKwargs
 
 	if req.Effort == EffortUnset {
@@ -327,10 +299,6 @@ func (c *OpenAI) encodeEffort(w *wireRequest, req Request) {
 	w.ReasoningEffort = string(req.Effort)
 }
 
-// ---------------------------------------------------------------------------
-// Streaming
-// ---------------------------------------------------------------------------
-
 func (c *OpenAI) Stream(ctx context.Context, req Request) (Stream, error) {
 	body, err := json.Marshal(c.encode(req))
 	if err != nil {
@@ -345,9 +313,7 @@ func (c *OpenAI) Stream(ctx context.Context, req Request) (Stream, error) {
 }
 
 // doWithRetry retries transient failures with exponential backoff and jitter,
-// honouring Retry-After when the server supplies it. It only ever retries
-// before the response body has been read, so a retry cannot duplicate output or
-// re-run a tool.
+// honouring Retry-After; it never retries after the response body is read.
 func (c *OpenAI) doWithRetry(ctx context.Context, method, path string, body []byte, key keyUse) (*http.Response, error) {
 	var lastErr error
 	for attempt := range c.opts.Retry.MaxAttempts {
@@ -408,9 +374,8 @@ func retryable(status int) bool {
 	return false
 }
 
-// APIError carries the server's own message, which for local backends is
-// usually the most actionable thing available (a model that is not loaded, a
-// context overflow, a bad tool schema).
+// APIError carries the server's own message, usually the most actionable thing
+// a local backend offers (a model that is not loaded, a context overflow).
 type APIError struct {
 	Status     int
 	Message    string
@@ -461,22 +426,14 @@ func (c *OpenAI) backoff(attempt int, lastErr error) time.Duration {
 	}
 	d := c.opts.Retry.BaseDelay * time.Duration(1<<uint(attempt-1))
 	d = min(d, c.opts.Retry.MaxDelay)
-	// Full jitter: without it, several sessions that back off together stay
-	// synchronised and keep colliding on a single-slot server.
+	// Jitter, so sessions that back off together do not stay synchronised on a
+	// single-slot server.
 	return time.Duration(rand.Int63n(int64(d)) + int64(d)/2)
 }
 
 // IsContextOverflow reports whether an error is the backend refusing a request
-// for being longer than the model's window.
-//
-// Best-effort and deliberately so: the OpenAI-compatible surface has no error
-// code for this, so every server spells it differently in a free-text message
-// under HTTP 400. Matching text is the only thing available, and getting it
-// wrong in either direction is cheap -- a miss leaves the error to surface as
-// it does today, and a false positive costs one makeRoom and one retry.
-//
-// The strings are the ones llama.cpp, vLLM, Ollama and the OpenAI and
-// OpenRouter gateways actually emit.
+// for being longer than the model's window. Best-effort: the API has no error
+// code for this, so every server spells it differently in free text under 400.
 func IsContextOverflow(err error) bool {
 	var api *APIError
 	if !errors.As(err, &api) || api.Status != http.StatusBadRequest {

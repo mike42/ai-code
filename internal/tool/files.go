@@ -71,7 +71,7 @@ func countLines(b []byte) int {
 }
 
 // looksBinary reports whether content should not be handed to the model as
-// text. A NUL byte or invalid UTF-8 in the first few KB is decisive enough.
+// text: a NUL byte or invalid UTF-8 in the first few KB is decisive enough.
 func looksBinary(b []byte) bool {
 	probe := b
 	if len(probe) > 8000 {
@@ -85,11 +85,8 @@ func looksBinary(b []byte) bool {
 	return !utf8.Valid(probe)
 }
 
-// checkStale reports whether a file has changed since a tool last read it.
-//
-// This is the guard against the model editing a version of a file that no
-// longer exists -- because a build step rewrote it, because the user edited it,
-// or because an earlier tool call in the same turn changed it.
+// checkStale reports whether a file changed since a tool last read it, the
+// guard against editing content that no longer exists.
 func checkStale(st *State, path string, current []byte) *Result {
 	prev, ok := st.Stamp(path)
 	if !ok {

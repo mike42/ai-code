@@ -16,9 +16,8 @@ import (
 )
 
 // TestMain lets the test binary re-exec itself as a peer that registers and
-// then blocks. A child holding the lock is the only way to test liveness
-// honestly: flock is per open file description, so a lock taken in this
-// process would be invisible to a check made from the same process.
+// blocks. flock is per open file description, so a child holding the lock is
+// the only way to test liveness honestly.
 func TestMain(m *testing.M) {
 	if dir := os.Getenv("AI_CODE_TEST_SETINTENT_DIR"); dir != "" {
 		_ = Decide(dir, func() { _ = SetIntent(dir, "written-elsewhere") })
@@ -94,8 +93,8 @@ func TestAPeerIsVisibleToOtherInstances(t *testing.T) {
 	}
 }
 
-// The reason liveness is a lock and not a heartbeat: a killed process frees
-// its entry at once, with no timeout to wait out and no pid to misidentify.
+// Liveness is a lock, not a heartbeat: a killed process frees its entry at
+// once, with no timeout to wait out and no pid to misidentify.
 func TestAKilledPeerFreesItsEntryImmediately(t *testing.T) {
 	dir := t.TempDir()
 	peer := startPeer(t, dir, "big-model", true)
@@ -117,7 +116,7 @@ func TestAKilledPeerFreesItsEntryImmediately(t *testing.T) {
 		t.Errorf("took %v to notice; it should be immediate", elapsed)
 	}
 
-	// And it tidies up after itself, so the directory does not accumulate.
+	// It tidies up after itself, so the directory does not accumulate.
 	entries, _ := os.ReadDir(dir)
 	for _, e := range entries {
 		if pid, err := strconv.Atoi(filepath.Base(e.Name()[:len(e.Name())-len(filepath.Ext(e.Name()))])); err == nil {
@@ -143,8 +142,7 @@ func TestAWorkingSessionIsWhatASwapWaitsFor(t *testing.T) {
 	}
 }
 
-// The bug this guards: passing the wrong pid made a session list itself, so
-// a swap waited for itself to park and hung with no error.
+// A session must not list itself, or a swap waits for itself to park.
 func TestSelfIsNotAPeer(t *testing.T) {
 	dir := t.TempDir()
 	reg, err := Register(dir, Peer{Model: "mine"})
@@ -194,13 +192,8 @@ func TestRegisterFailsGracefullyOnAnUnusableDirectory(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Announcing a swap
-// ---------------------------------------------------------------------------
-
-// The announcement is the point of coordinating at all: a session has to learn
-// about a swap while the model is still loaded, because writing a summary
-// needs the model.
+// The announcement must reach a session while the model is still loaded,
+// because writing a summary needs the model.
 func TestAPeerSeesTheAnnouncementBeforeTheModelGoes(t *testing.T) {
 	dir := t.TempDir()
 	reg, err := Register(dir, Peer{Model: "big-model"})
@@ -404,16 +397,8 @@ func TestASessionIsNeverAmongItsOwnPeers(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// the decision lock
-// ---------------------------------------------------------------------------
-
-// The race the announcement alone cannot close: a swap reads the list of
-// sessions to wait for while a session marks itself working. Interleaved,
-// the swap loads with a request already on its way to the model it is
-// unloading, and the server loads that model straight back.
-//
-// Both sides decide under this lock, so there is no interleaving to have.
+// The announcement alone cannot close the race: a swap reads the session list
+// while a session marks itself working, so both sides decide under the lock.
 func TestDecideSerialisesConcurrentDeciders(t *testing.T) {
 	dir := t.TempDir()
 
@@ -516,9 +501,6 @@ func TestDecideStillRunsTheWorkWithoutLiveness(t *testing.T) {
 	}
 }
 
-// A session that has never run a turn has never had a state to publish. Its
-// silence is not a claim on the model, and treating it as one makes every
-// swap around it wait for an answer that will not come.
 func TestASessionThatHasNeverRunATurnIsNotWaitedFor(t *testing.T) {
 	dir := t.TempDir()
 	startPeerState(t, dir, "big-model", false, "")
@@ -557,13 +539,8 @@ func TestOnlyActiveStatesAreWaitedFor(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// what is loaded
-// ---------------------------------------------------------------------------
-
-// The server stays the authority on what is loaded. This is a record of
-// what the user asked for, shared between their own windows, which is the
-// more useful thing while a load is still in flight.
+// The server stays the authority on what is loaded; this records the intended
+// model for the other windows while a load is in flight.
 func TestTheIntentIsReadableWithoutAskingAnyone(t *testing.T) {
 	dir := t.TempDir()
 
@@ -591,8 +568,8 @@ func TestTheIntentIsReadableWithoutAskingAnyone(t *testing.T) {
 	}
 }
 
-// A record written by one process is readable by another, which is the whole
-// point: the windows are separate processes sharing a filesystem.
+// The windows are separate processes sharing a filesystem, so a record written
+// by one must be readable by another.
 func TestAnotherProcessSeesTheIntent(t *testing.T) {
 	dir := t.TempDir()
 	cmd := exec.Command(os.Args[0])
@@ -610,15 +587,6 @@ func TestAnotherProcessSeesTheIntent(t *testing.T) {
 	}
 }
 
-// The window between an announcement and the load finishing is the one a
-// request must not be sent into: the weights have not moved yet, so the
-// server answers by loading whatever the request names -- either the
-// outgoing model coming back, or the incoming one arriving before the
-// sessions on the old one have saved themselves.
-//
-// A session holds on the announcement existing, not on which model it
-// happens to be on, because the intent is published before the load and it
-// may already have adopted the incoming one.
 func TestAnAnnouncementHoldsEveryOtherSession(t *testing.T) {
 	dir := t.TempDir()
 	reg, err := Register(dir, Peer{Model: "old-model"})
@@ -653,13 +621,6 @@ func TestAnAnnouncementHoldsEveryOtherSession(t *testing.T) {
 	}
 }
 
-// An empty path for the shared directory must take no part in anything.
-//
-// filepath.Join("", "x") is the relative path "x", so every read and write
-// would land in whatever directory the process is running in. A session that
-// could not work out where the shared directory is has to opt out, not scatter
-// files through the user's project -- which is exactly what it did, leaving
-// intent.json in the source tree.
 func TestAnEmptyDirectoryPathTouchesNothing(t *testing.T) {
 	dir := t.TempDir()
 	wd, err := os.Getwd()

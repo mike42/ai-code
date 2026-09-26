@@ -77,11 +77,8 @@ func (a *App) cmdProvider(ctx context.Context, args string) error {
 		return fmt.Errorf("no provider named %q; configured: %s",
 			args, strings.Join(a.cfg.ProviderNames(), ", "))
 	}
-	// Both gates run before a client exists, because building one and asking
-	// it for its catalogue is a network call to the provider being considered.
-	// Asking afterwards repairs neither case: in a .nocloud tree the call is
-	// the contact the marker forbids, and in front of the confirmation it
-	// makes "Nothing was sent" untrue.
+	// Both gates run before a client exists: building one and asking for its
+	// catalogue is a network call to the provider being considered.
 	class, err := provider.ParseClass(pc.Class)
 	if err != nil {
 		return fmt.Errorf("provider %q: %w", args, err)
@@ -109,29 +106,18 @@ func (a *App) cmdProvider(ctx context.Context, args string) error {
 	return a.switchTo(ctx, client, args, pc, model, confirmed)
 }
 
-// errCloudForbiddenHere is what a .nocloud tree answers. No amount of
-// confirmation changes what the marker promises.
+// errCloudForbiddenHere is what a .nocloud tree answers.
 var errCloudForbiddenHere = errors.New(
 	"a .nocloud file is present, so this session is restricted to on-premises providers")
 
-// switchTo moves the live session onto a different model or provider.
-//
-// Moving an in-progress session to a cloud provider transmits everything it
-// contains -- source, command output, whatever the model has been shown -- to a
-// third party. That is a decision with compliance and privacy consequences, so
-// it is confirmed explicitly and the confirmation states what would actually be
-// sent. Moving to an on-premises provider asks nothing: the whole point of
-// running your own is not being interrogated about it.
-// confirmed says the caller already put the move to the user and was told to
-// go ahead, which is what a caller that had to ask before it could build a
-// client does.
+// switchTo moves the live session onto a different model or provider. A move
+// to a cloud provider is confirmed explicitly, with the payload stated;
+// confirmed says the caller already asked and was told to go ahead.
 func (a *App) switchTo(ctx context.Context, client provider.Client, name string, pc config.Provider, model provider.ModelInfo, confirmed bool) error {
 	style := render.NewStyle(a.screen.Color())
 
-	// In a .nocloud tree, cloud providers are not merely confirmed away -- they
-	// are unavailable. No amount of confirmation changes what the marker
-	// promises, and the marker exists precisely so an internal code-base can
-	// never end up on a cloud model even by explicit choice.
+	// In a .nocloud tree a cloud provider is unavailable, not merely confirmed
+	// away.
 	if a.noCloud && client.Class() == provider.ClassCloud {
 		return errCloudForbiddenHere
 	}
@@ -149,15 +135,11 @@ func (a *App) switchTo(ctx context.Context, client provider.Client, name string,
 	newLimit, source := contextLimitFor(model, a.cfg.Agent.ContextOverride)
 	oldLimit := a.agent.Window()
 	used := a.contextState().Projected
-	// Both halves are computed before anything is reassigned: the choice below
-	// may be to stay put, and there is no undoing a swap that has happened.
+	// Computed before anything is reassigned: the choice below may be to stay put.
 	sameModel := model.ID == a.agent.Model() && name == a.providerName
 	plan := a.agent.PlanResume(newLimit)
 
-	// A smaller window is the case that bites, and the only one worth
-	// interrupting for. A wider one changes nothing the session was already
-	// doing, and a window it still fits in needs no decision -- a dialog after
-	// every /model would be worse than the problem it warns about.
+	// Only a narrower window that no longer fits is worth interrupting for.
 	narrower := newLimit > 0 && oldLimit > 0 && newLimit < oldLimit
 	fromTranscript := false
 	if narrower && !plan.Fits {
@@ -171,10 +153,8 @@ func (a *App) switchTo(ctx context.Context, client provider.Client, name string,
 		}
 	}
 
-	// Everything above could still decide not to swap. From here it happens,
-	// so this is the point to tell the other windows and then actually load
-	// the weights -- in that order, because the load is the eviction they
-	// are being warned about.
+	// From here the swap happens: announce to peers, then load the weights,
+	// because the load is the eviction they are warned about.
 	a.announceSwap(ctx, client, model, newLimit)
 
 	a.client = client
@@ -186,16 +166,14 @@ func (a *App) switchTo(ctx context.Context, client provider.Client, name string,
 	a.peers.SetModel(name, model.ID)
 	a.agent.SetResumeFromTranscript(fromTranscript)
 
-	// The scrollback now says this, so it is what a later change is measured
-	// against.
+	// The scrollback now says this, so a later change is measured against it.
 	a.knownModel = model.ID
 	a.out(fmt.Sprintf("Now using %s on %s (%s, %s ctx — %s).",
 		style.Bold(model.ID), name, client.Class(), compactInt(newLimit), style.Dim(source)))
 
 	switch {
 	case narrower && !plan.Fits:
-		// The choice already stated its own numbers; repeating them here
-		// would read as a second decision to make.
+		// The choice already stated its own numbers.
 	case !plan.Fits:
 		p := plan.Checkpoint
 		if !p.Available {
@@ -210,10 +188,7 @@ func (a *App) switchTo(ctx context.Context, client provider.Client, name string,
 			used*100/newLimit))
 	}
 
-	// Coming back to the model the session stopped on is not a change of
-	// anything -- the window is what it was -- so the interrupted turn can
-	// carry on without a question that has one answer. Both halves matter:
-	// picking up a finished session would send a request nobody asked for.
+	// Same model with an unfinished turn: resume it without asking.
 	if sameModel && a.agent.StoppedMidTurn() {
 		a.out(style.Dim("Same model, and the last turn did not finish. Resuming it."), "")
 		return a.runTurn(ctx, "")
@@ -222,13 +197,8 @@ func (a *App) switchTo(ctx context.Context, client provider.Client, name string,
 }
 
 // chooseResume asks how to carry on in a window the session no longer fits.
-//
-// It states what each way costs rather than naming it, because the names are
-// interchangeable to anyone who has not read the assembly code and the numbers
-// are not: how much room is left to work in, and how much of the session stops
-// being sent, are the whole of the decision. No option summarises on the spot
-// -- that would be a model call, on the model being left behind, at the moment
-// the user is waiting to get on with something else.
+// Options are stated as costs -- room left to work in, messages no longer
+// sent -- not by name. No option summarises on the spot.
 func (a *App) chooseResume(model provider.ModelInfo, newLimit int, plan agent.ResumeChoice) string {
 	style := render.NewStyle(a.screen.Color())
 
@@ -269,8 +239,8 @@ func (a *App) chooseResume(model provider.ModelInfo, newLimit int, plan agent.Re
 		"     you type again.",
 		"")
 
-	// The keys offered are the keys that work. Listing c when there is no
-	// checkpoint invites an answer that silently becomes something else.
+	// Only offer keys that work: listing c without a checkpoint invites a wrong
+	// answer.
 	valid := "ctw"
 	if !plan.Checkpoint.Available {
 		valid = "tw"
@@ -279,14 +249,12 @@ func (a *App) chooseResume(model provider.ModelInfo, newLimit int, plan agent.Re
 		style.Dim("The transcript is never deleted; it comes back whole on a wider model."),
 		style.Dim(fmt.Sprintf("[%s] ", strings.Join(strings.Split(valid, ""), "/"))))
 	a.out(lines...)
-	// Anything unreadable or unrecognised stays put, for the reason readYesNo
-	// does: the answer that changes nothing is the one that cannot be wrong.
+	// Anything unrecognised falls back to the answer that changes nothing.
 	return readChoice(valid, "w")
 }
 
-// lossLine says what a checkpoint does not cover, which is the one thing about
-// it that is easy to assume away: a checkpoint written five turns ago speaks
-// for the session as it was five turns ago, and nothing speaks for the rest.
+// lossLine says how many messages are newer than the checkpoint, which nothing
+// covers.
 func lossLine(c agent.ResumePlan) string {
 	if c.Unrepresented == 0 {
 		return "     instead, and the summary covers all of them."
@@ -295,9 +263,8 @@ func lossLine(c agent.ResumePlan) string {
 		c.Unrepresented)
 }
 
-// tokenCount keeps a figure someone is about to make a decision on at one
-// decimal place. compactInt rounds 3.6k down to 3k, and on a window this
-// narrow that is a sixth of the room being misreported.
+// tokenCount keeps one decimal place, which compactInt rounding would hide on
+// a narrow window.
 func tokenCount(n int) string {
 	if n >= 1000 {
 		return fmt.Sprintf("%.1fk", float64(n)/1000)
@@ -305,9 +272,9 @@ func tokenCount(n int) string {
 	return fmt.Sprint(n)
 }
 
-// model is the model being moved to, and "" when the provider has not been
-// asked which one that is -- which is the case whenever asking would itself
-// be the first contact with it.
+// confirmCloudSwitch asks before moving a live session to a cloud provider.
+// model is the model being moved to, or "" when the provider has not been asked
+// because asking would itself be the first contact with it.
 func (a *App) confirmCloudSwitch(name string, class provider.Class, model string) bool {
 	style := render.NewStyle(a.screen.Color())
 	msgs := a.agent.Messages()
@@ -362,8 +329,8 @@ func readChoice(valid, fallback string) string {
 	return fallback
 }
 
-// readYesNo reads a single confirmation line. Deliberately requires an explicit
-// "y": the default on an ambiguous answer is not to send anything.
+// readYesNo reads a single confirmation line, and requires an explicit "y": an
+// ambiguous answer sends nothing.
 func readYesNo() bool {
 	r := bufio.NewReader(os.Stdin)
 	line, err := r.ReadString('\n')
