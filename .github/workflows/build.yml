@@ -1,0 +1,162 @@
+name: Build
+
+# A vX.Y.Z tag publishes a GitHub Release; branch and pull-request builds
+# upload workflow artifacts only. The version stamped into the binary is the
+# tag (v prefix stripped) on a tag build, and
+# 0.0.0-dev.<run number>.<short sha> everywhere else.
+#
+# Linux only for now: see the TODO on the build matrix.
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      # The devcontainer example test is podman-only (it runs the example's
+      # --userns=keep-id), so CI never invokes it.
+      - name: Test
+        run: go test ./... -count=1 -skip '^TestDockerfileDevcontainerRunsTools$'
+
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # TODO: non-Linux builds are not usable yet. Uncomment darwin/windows
+        # only once they have been fixed and smoke-tested on those platforms,
+        # so a broken download never reaches users.
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          # - goos: darwin
+          #   goarch: amd64
+          # - goos: darwin
+          #   goarch: arm64
+          # - goos: windows
+          #   goarch: amd64
+          # - goos: windows
+          #   goarch: arm64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.0.0-dev.${GITHUB_RUN_NUMBER}.g$(git rev-parse --short=7 HEAD)"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "version: ${version}"
+
+      - name: Build
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # install.sh's build, cross-compiled and with the version stamped
+          # into main.version.
+          binary="ai-code"
+          if [ "${GOOS}" = "windows" ]; then
+            binary="ai-code.exe"
+          fi
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X main.version=${VERSION}" \
+            -o "dist/${binary}" ./cmd/ai-code
+
+      - name: Smoke test
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: test "$(./dist/ai-code --version)" = "ai-code ${VERSION}"
+
+      - name: Package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="ai-code_${VERSION}_${GOOS}_${GOARCH}"
+          if [ "${GOOS}" = "windows" ]; then
+            (cd dist && zip -q "${name}.zip" ai-code.exe)
+          else
+            tar -C dist -czf "dist/${name}.tar.gz" ai-code
+          fi
+          {
+            echo "### ${name}"
+            echo '```'
+            sha256sum "dist/${name}."*
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ai-code_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          shopt -s nullglob
+          sha256sum -- *.tar.gz *.zip > checksums.txt
+          cat checksums.txt
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true
