@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"io"
 	"strings"
 	"sync"
@@ -65,24 +64,6 @@ func (s *textStream) Usage() provider.Usage           { return provider.Usage{} 
 func (s *textStream) StopReason() provider.StopReason { return provider.StopEnd }
 func (s *textStream) Close() error                    { return nil }
 
-// health is an Introspector whose answers the checkpoint has to respect.
-type health struct {
-	countingClient
-	h      provider.Health
-	models []provider.ModelInfo
-}
-
-func (c *health) Models(context.Context) ([]provider.ModelInfo, error) {
-	c.mu.Lock()
-	c.countingClient.models++
-	c.mu.Unlock()
-	return c.models, nil
-}
-
-func (c *health) Health(context.Context) (*provider.Health, error) { return &c.h, nil }
-func (c *health) Load(context.Context, string) error               { return nil }
-func (c *health) Unload(context.Context, string) error             { return nil }
-
 // The checkpoint must be gone by the time the prompt returns; everything
 // after it touches the same agent.
 func TestIdleCheckpointAbortsOnCancellation(t *testing.T) {
@@ -95,7 +76,7 @@ func TestIdleCheckpointAbortsOnCancellation(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		a.watchWhileIdle(ctx, ctx, 0, nil)
+		a.idleCheckpoint(ctx, 0)
 	}()
 
 	select {
@@ -140,7 +121,7 @@ func TestIdleCheckpointWaitsOutTheInterval(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		a.watchWhileIdle(ctx, ctx, time.Hour, nil)
+		a.idleCheckpoint(ctx, time.Hour)
 	}()
 	cancel()
 	<-done
@@ -163,48 +144,48 @@ func TestIdleCheckpointSkipsAColdSession(t *testing.T) {
 	}
 }
 
-// The invariant is "cause no load", not "send nothing": the session adopts
-// the resident model, so nothing it sends can evict that model.
+// A summary sent while another instance's model is loaded would load this
+// one's back over it.
 func TestIdleCheckpointNeverSendsForAModelThatIsNotLoaded(t *testing.T) {
-	a, _ := swapApp(t, 262144, 200000)
-	client := &health{h: provider.Health{ModelLoaded: "someone-elses-model", Ready: true}}
-	a.client = client
-	a.agent.SetClient(client)
-
-	runIdle(t, a, 0)
-
-	if a.model.ID != "someone-elses-model" {
-		t.Fatalf("session still wants %q; a request would load it back over the resident model",
-			a.model.ID)
-	}
-	if got := a.agent.Model(); got != "someone-elses-model" {
-		t.Errorf("the agent would send %q, not the resident model", got)
-	}
-}
-
-func TestIdleCheckpointSkipsWhileTheModelIsBusy(t *testing.T) {
-	a, _ := swapApp(t, 262144, 200000)
-	client := &health{h: provider.Health{ModelLoaded: "wide-model", Busy: true}}
-	a.client = client
-	a.agent.SetClient(client)
+	a, client := swapApp(t, 262144, 200000)
+	other := sharedApps(t, a)
+	other.Done(testServer, "someone-elses-model")
+	until(t, a.share.bus, "the load to be heard", func() bool { return a.share.bus.Loaded() != "" })
 
 	runIdle(t, a, 0)
 
 	if streams, _ := client.calls(); streams != 0 {
-		t.Errorf("checkpointed while the model was busy (%d calls)", streams)
+		t.Errorf("checkpointed over another instance's model (%d calls)", streams)
+	}
+	if a.model.ID != "wide-model" {
+		t.Errorf("the session moved itself onto %q", a.model.ID)
+	}
+}
+
+func TestIdleCheckpointSkipsWhileAnotherInstanceIsWorking(t *testing.T) {
+	a, client := swapApp(t, 262144, 200000)
+	other := sharedApps(t, a)
+	other.Set(func(p *coord.Peer) { p.State = coord.StateWorking })
+	until(t, a.share.bus, "the other instance's state", func() bool {
+		peers := a.share.bus.Peers()
+		return len(peers) == 1 && peers[0].State == coord.StateWorking
+	})
+
+	runIdle(t, a, 0)
+
+	if streams, _ := client.calls(); streams != 0 {
+		t.Errorf("checkpointed while another instance was using the model (%d calls)", streams)
 	}
 }
 
 func TestIdleCheckpointRunsWhenTheBackendIsFree(t *testing.T) {
-	a, _ := swapApp(t, 262144, 200000)
-	client := &health{h: provider.Health{ModelLoaded: "wide-model", Ready: true}}
-	a.client = client
-	a.agent.SetClient(client)
+	a, client := swapApp(t, 262144, 200000)
+	sharedApps(t, a)
 
 	runIdle(t, a, 0)
 
 	if streams, _ := client.calls(); streams == 0 {
-		t.Error("a free backend holding our own model should have been checkpointed")
+		t.Error("an idle server should have been used for the checkpoint")
 	}
 }
 
@@ -248,9 +229,7 @@ func TestCheckpointIsPersistedOnceAndRestored(t *testing.T) {
 	}
 }
 
-// Checkpointing and the swap watch share a goroutine, so turning the
-// checkpoint off must not stop a window answering swap announcements.
-func TestTurningTheCheckpointOffLeavesTheSwapWatchRunning(t *testing.T) {
+func TestTurningTheCheckpointOffSendsNothing(t *testing.T) {
 	a, _ := swapApp(t, 262144, 200000)
 	d := config.Defaults()
 	off := false
@@ -267,234 +246,8 @@ func TestTurningTheCheckpointOffLeavesTheSwapWatchRunning(t *testing.T) {
 	}
 }
 
-// runIdle runs the idle loop until it acts, then cancels and joins it. The
-// loop keeps watching for swap announcements after the checkpoint is done.
-// Progress is watched through the client, so joining makes the agent read safe.
+// runIdle runs the idle checkpoint to completion.
 func runIdle(t *testing.T, a *App, idle time.Duration) {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		a.watchWhileIdle(ctx, ctx, idle, nil)
-	}()
-
-	if counter, ok := a.client.(interface{ calls() (int, int) }); ok {
-		// In-memory fakes do the work at once; the wait is for the scheduler.
-		for range 200 {
-			if streams, _ := counter.calls(); streams > 0 {
-				break
-			}
-			time.Sleep(time.Millisecond)
-		}
-	}
-
-	cancel()
-	<-done
-}
-
-// A prompt typed before another window swapped must adopt the loaded model,
-// not reload its own and evict the other window's.
-func TestASendAdoptsTheLoadedModelInsteadOfReloadingItsOwn(t *testing.T) {
-	a, _ := swapApp(t, 262144, 0)
-	client := &health{h: provider.Health{ModelLoaded: "someone-elses-model", Ready: true}}
-	client.models = []provider.ModelInfo{{ID: "someone-elses-model", ContextWindow: 65536}}
-	a.client = client
-	a.agent.SetClient(client)
-
-	if a.model.ID == "someone-elses-model" {
-		t.Fatal("setup: the session should start on a different model")
-	}
-	captureOut(t, func() { a.adoptModelChange(context.Background(), nil) })
-
-	if a.model.ID != "someone-elses-model" {
-		t.Errorf("the session still wants %q; sending would evict the other window",
-			a.model.ID)
-	}
-	if got := a.agent.Model(); got != "someone-elses-model" {
-		t.Errorf("the agent would still send %q", got)
-	}
-}
-
-// The report line shows the difference between what the scrollback says and
-// what is loaded.
-func TestModelChangeIsReportedAgainstWhatTheScrollbackSays(t *testing.T) {
-	newApp := func(t *testing.T, known string, loaded string) (*App, *health) {
-		t.Helper()
-		a, _ := swapApp(t, 262144, 0)
-		a.model = provider.ModelInfo{ID: known, ContextWindow: 262144}
-		a.knownModel = known
-		c := &health{h: provider.Health{ModelLoaded: loaded, Ready: true}}
-		c.models = []provider.ModelInfo{
-			{ID: known, ContextWindow: 262144},
-			{ID: loaded, ContextWindow: 65536},
-		}
-		a.client = c
-		a.agent.SetClient(c)
-		return a, c
-	}
-
-	t.Run("a session that has sent nothing still reports, because its banner claimed a model", func(t *testing.T) {
-		a, _ := newApp(t, "banner-model", "other-model")
-		out := captureOut(t, func() { a.adoptModelChange(context.Background(), nil) })
-		if !strings.Contains(out, "other-model") {
-			t.Errorf("no report on a session that had only shown a banner:\n%s", out)
-		}
-	})
-
-	t.Run("no difference, no report", func(t *testing.T) {
-		a, _ := newApp(t, "same-model", "same-model")
-		out := captureOut(t, func() { a.adoptModelChange(context.Background(), nil) })
-		if n := len(nonBlank(out)); n != 0 {
-			t.Errorf("reported %d lines with nothing changed:\n%s", n, out)
-		}
-	})
-
-	// At a live prompt the line is a replaceable header, so nothing is
-	// committed and the scrollback still names the starting model.
-	t.Run("away and back at a prompt leaves nothing to say", func(t *testing.T) {
-		a, _ := newApp(t, "home-model", "other-model")
-
-		a.model = provider.ModelInfo{ID: "other-model"}
-		if a.modelChangeLine() == "" {
-			t.Error("no line while on a model the scrollback does not name")
-		}
-
-		a.model = provider.ModelInfo{ID: "home-model"}
-		if got := a.modelChangeLine(); got != "" {
-			t.Errorf("returning to the model the scrollback names gave %q", got)
-		}
-	})
-
-	// A committed line becomes what the scrollback says, so a change back
-	// from there is a real difference.
-	t.Run("a committed line becomes what the scrollback says", func(t *testing.T) {
-		a, c := newApp(t, "home-model", "other-model")
-		captureOut(t, func() { a.adoptModelChange(context.Background(), nil) })
-		if a.knownModel != "other-model" {
-			t.Fatalf("after committing, the scrollback says %q", a.knownModel)
-		}
-
-		c.h.ModelLoaded = "home-model"
-		back := captureOut(t, func() { a.adoptModelChange(context.Background(), nil) })
-		if !strings.Contains(back, "was other-model") {
-			t.Errorf("a change back was not measured against the committed line:\n%s", back)
-		}
-	})
-
-	t.Run("one line per difference, not per change", func(t *testing.T) {
-		a, c := newApp(t, "home-model", "a-model")
-		out := captureOut(t, func() {
-			a.adoptModelChange(context.Background(), nil)
-			c.h.ModelLoaded = "b-model"
-			c.models = append(c.models, provider.ModelInfo{ID: "b-model", ContextWindow: 65536})
-			a.adoptModelChange(context.Background(), nil)
-		})
-		// Each difference commits and is measured against the last thing
-		// said, never against the start.
-		if strings.Count(out, "was home-model") > 1 {
-			t.Errorf("a later change was measured against the original model:\n%s", out)
-		}
-	})
-}
-
-// The idle watch must adopt a change before anything is typed or sent; the
-// pre-send guard would otherwise cover for a regression here.
-func TestTheIdleWatchAdoptsWithoutWaitingForASend(t *testing.T) {
-	a, _ := swapApp(t, 262144, 0)
-	client := &health{h: provider.Health{ModelLoaded: "big-model", Ready: true}}
-	client.models = []provider.ModelInfo{{ID: "big-model", ContextWindow: 262144}}
-	a.client = client
-	a.agent.SetClient(client)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		a.watchWhileIdle(ctx, ctx, time.Hour, nil)
-	}()
-	for range 200 {
-		if _, models := client.calls(); models > 0 {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-	cancel()
-	<-done
-
-	if a.model.ID != "big-model" {
-		t.Errorf("the idle watch left the session on %q; nothing was typed or sent",
-			a.model.ID)
-	}
-	if streams, _ := client.calls(); streams != 0 {
-		t.Errorf("adopting took %d model calls, want none", streams)
-	}
-}
-
-// deadClient fails every call, standing in for a server busy loading a large
-// model.
-type deadClient struct{ countingClient }
-
-func (c *deadClient) Health(context.Context) (*provider.Health, error) {
-	return nil, errors.New("timeout")
-}
-func (c *deadClient) Load(context.Context, string) error   { return errors.New("timeout") }
-func (c *deadClient) Unload(context.Context, string) error { return errors.New("timeout") }
-func (c *deadClient) Models(context.Context) ([]provider.ModelInfo, error) {
-	c.mu.Lock()
-	c.countingClient.models++
-	c.mu.Unlock()
-	return nil, errors.New("timeout")
-}
-
-// A window learns the intended model from the coordination file and adopts it
-// even with the server unreachable.
-func TestASessionAdoptsWithTheServerCompletelyUnreachable(t *testing.T) {
-	dir := t.TempDir()
-	a, _ := swapApp(t, 262144, 0)
-	a.coordDir = dir
-	a.knownModel = "old-model"
-	a.model = provider.ModelInfo{ID: "old-model", ContextWindow: 262144}
-	a.client = &deadClient{}
-	a.agent.SetClient(a.client)
-	a.agent.SetModel("old-model", 262144, 0)
-
-	// Another window asked for something else.
-	if err := coord.SetIntent(dir, "new-model"); err != nil {
-		t.Fatal(err)
-	}
-
-	out := captureOut(t, func() {
-		if !a.adoptIntended(nil) {
-			t.Error("the session did not follow the user's stated intent")
-		}
-	})
-
-	if a.model.ID != "new-model" {
-		t.Errorf("session still wants %q; its next request would load it back", a.model.ID)
-	}
-	if got := a.agent.Model(); got != "new-model" {
-		t.Errorf("the agent would send %q", got)
-	}
-	if !strings.Contains(out, "new-model") {
-		t.Errorf("the change was not reported:\n%s", out)
-	}
-	// With no catalogue the new window is unknown, so the one in force
-	// stands rather than collapsing to a default.
-	if got := a.agent.ContextState().Window; got != 262144 {
-		t.Errorf("context limit = %d, want the previous window kept", got)
-	}
-}
-
-func TestNoRecordedIntentMeansNoChange(t *testing.T) {
-	a, _ := swapApp(t, 262144, 0)
-	a.coordDir = t.TempDir()
-	before := a.model.ID
-
-	if a.adoptIntended(nil) {
-		t.Error("adopted something with nothing asked for")
-	}
-	if a.model.ID != before {
-		t.Errorf("session moved to %q with nothing asked for", a.model.ID)
-	}
+	a.idleCheckpoint(context.Background(), idle)
 }

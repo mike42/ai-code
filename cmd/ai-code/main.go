@@ -534,21 +534,18 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 		providerName:   providerName,
 		providerCfg:    pc,
 		model:          model,
-		// The banner is about to say this, so a later change is measured
-		// against it.
-		knownModel:  model.ID,
-		modeName:    modeName,
-		exec:        exe,
-		toolState:   toolState,
-		screen:      screen,
-		interactive: interactive,
-		verbosity:   verbosity,
-		env:         env,
-		limitSource: limitSource,
-		noCloud:     nocloud,
-		gate:        gate,
-		rt:          rt,
-		flags:       f,
+		modeName:       modeName,
+		exec:           exe,
+		toolState:      toolState,
+		screen:         screen,
+		interactive:    interactive,
+		verbosity:      verbosity,
+		env:            env,
+		limitSource:    limitSource,
+		noCloud:        nocloud,
+		gate:           gate,
+		rt:             rt,
+		flags:          f,
 	}
 	gate.found = app.remoteNoCloud
 
@@ -568,6 +565,19 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 	// The renderer is the only event sink; messages reach the transcript from
 	// the agent's message list, which holds exactly what was sent. The App is a
 	// second consumer of the stream, for the prompt marker's context figure.
+	// An instance that cannot reach the others runs as if alone.
+	joined := time.Now().UnixNano()
+	if bus, err := coord.Join(coord.DefaultDir(), coord.Peer{
+		Cwd: workspace, Server: serverKey(client, pc), Model: model.ID,
+	}); err == nil {
+		defer bus.Close()
+		app.share = newModelShare(bus, joined)
+		client = app.share.wrap(client)
+		app.client = client
+	} else {
+		coord.Trace("not coordinated: %v", err)
+	}
+
 	app.agent = agent.New(client, model.ID, exe,
 		agent.MultiSink{sink, agent.SinkFunc(app.noteContext)}, agent.Options{
 			MaxIterations:   cfg.Agent.MaxIterations,
@@ -595,18 +605,9 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 	defer app.workers.Cancel()
 	// The loop boundary is the only place a long agentic run can be stopped
 	// from outside.
-	app.agent.SetTurnBoundary(app.stopForSwap)
-
-	// A failed registration is not worth reporting: the session works without it.
-	app.coordDir = coord.DefaultDir()
-	if reg, err := coord.Register(app.coordDir, coord.Peer{
-		Session:  sessionID(app),
-		Provider: providerName,
-		Model:    model.ID,
-		Cwd:      workspace,
-	}); err == nil {
-		app.peers = reg
-		defer reg.Close()
+	app.agent.SetTurnBoundary(app.atBoundary)
+	if app.share != nil {
+		go app.answerSwaps(ctx)
 	}
 	app.rebuildSystemPrompt(mode.Prompt)
 	if len(app.resumed) > 0 {
@@ -818,12 +819,4 @@ func cmdModels(f *flags, cwd string, nocloud bool) error {
 		}
 	}
 	return nil
-}
-
-// sessionID is the session's id when it is being recorded, and "" otherwise.
-func sessionID(a *App) string {
-	if a.sess == nil {
-		return ""
-	}
-	return a.sess.Meta.ID
 }

@@ -80,10 +80,6 @@ type Editor struct {
 	lastCursor  int
 	lastWidth   int
 
-	// header is the replaceable line above the prompt; see SetHeader.
-	header      string
-	headerDrawn bool
-
 	// paintMu serialises painting: the read loop paints after each key, and
 	// Refresh paints from whichever goroutine noticed the prompt is wrong;
 	// interleaved escape sequences corrupt the line.
@@ -698,45 +694,6 @@ func (e *Editor) Refresh(prompt string) {
 		return
 	}
 	e.paint(prompt)
-}
-
-// SetHeader puts one replaceable line directly above the prompt. While the
-// prompt is up it is rewritten in place, so a model that changes leaves one
-// line; on submit it becomes scrollback, above the exchange it describes.
-func (e *Editor) SetHeader(text, prompt string) {
-	if !e.isTTY() {
-		return
-	}
-	e.paintMu.Lock()
-	defer e.paintMu.Unlock()
-	if text == e.header {
-		return
-	}
-
-	var b strings.Builder
-	if e.headerDrawn {
-		// Back up over the prompt line onto the header and overwrite it; the
-		// line cannot be removed once drawn, so returning to the original
-		// model blanks it.
-		b.WriteString("\r\x1b[2K\x1b[1A")
-	}
-	b.WriteString("\r\x1b[2K")
-	b.WriteString(text)
-	b.WriteString("\r\n")
-	fmt.Fprint(e.out, b.String())
-
-	e.header, e.headerDrawn = text, true
-	e.live = prompt
-	e.invalidate()
-	e.paint(prompt)
-}
-
-// ForgetHeader stops the line above from being rewritten; it now belongs to the
-// exchange below it.
-func (e *Editor) ForgetHeader() {
-	e.paintMu.Lock()
-	defer e.paintMu.Unlock()
-	e.header, e.headerDrawn = "", false
 }
 
 // EmitAbove puts lines into the scrollback above the prompt and repaints it

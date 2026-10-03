@@ -13,7 +13,6 @@ import (
 
 	"ai-code/internal/agent"
 	"ai-code/internal/config"
-	"ai-code/internal/coord"
 	"ai-code/internal/prompt"
 	"ai-code/internal/provider"
 	"ai-code/internal/render"
@@ -107,19 +106,20 @@ type App struct {
 	// turnErr is an errQuit or restart raised at the turn boundary.
 	turnErr error
 
-	// knownModel is the model the scrollback last said this session was on.
-	knownModel string
-
 	// pendingInput seeds the next prompt.
 	pendingInput string
 
 	// flags is what this process was launched with, for /restart.
 	flags *flags
 
-	// peers is this window's registration and coordDir the directory windows
-	// share; both may be nil or empty.
-	peers    *coord.Registration
-	coordDir string
+	// share is this instance's part in taking turns on a shared model server;
+	// nil when it runs alone.
+	share *modelShare
+	// agentMu is held by whatever drives the agent: the main loop while it
+	// handles input, or a summary written for another instance's swap.
+	agentMu sync.Mutex
+	// lastRoundModel is the model the last run was sent to; guarded by agentMu.
+	lastRoundModel string
 }
 
 func (a *App) openSession(f *flags) error {
@@ -245,14 +245,15 @@ func (a *App) runTurn(parent context.Context, input string) error {
 		a.turnMu.Unlock()
 	}()
 
-	// Take what is loaded and declare this session working on it, under the swap lock.
-	a.claimModel(ctx)
-
-	a.peers.SetBusy(true)
-	defer func() {
-		a.peers.SetBusy(false)
-		a.peers.SetState(coord.StateFree)
-	}()
+	if err := a.claim(ctx); err != nil {
+		if ctx.Err() != nil {
+			a.note("Not sent.")
+			return nil
+		}
+		return err
+	}
+	defer a.finishRun()
+	a.lastRoundModel = a.agent.Model()
 
 	stopSteering := a.startSteering(cancel)
 
@@ -262,7 +263,11 @@ func (a *App) runTurn(parent context.Context, input string) error {
 		defer a.interactive.SetBusy(false)
 	}
 
-	err := a.agent.Run(ctx, input)
+	err := a.agent.Run(holding(ctx), input)
+	a.lastRoundModel = a.agent.Model()
+	if line := a.displacedNote(); line != "" {
+		a.note(line)
+	}
 
 	a.pendingInput = stopSteering()
 
@@ -280,8 +285,13 @@ func (a *App) runTurn(parent context.Context, input string) error {
 	a.recordNew()
 	a.recordCheckpoint()
 
-	// The turn is over, so the message list is complete and a summary can be written.
-	a.prepareForSwap(parent, nil)
+	// Still holding the model: a swap that arrived during the turn gets its
+	// summary while the model it needs is loaded.
+	if s := a.share; s != nil {
+		if against := s.against(s.bus.Self().Model); len(against) > 0 {
+			a.summariseForSwap(parent, against[0], a.note)
+		}
+	}
 
 	// A /quit or /restart typed during the turn could not act from inside it.
 	if a.turnErr != nil {
@@ -427,7 +437,9 @@ func (a *App) repl(ctx context.Context, cancel context.CancelFunc, opening strin
 		// Built before the background work starts: it reads state that work writes.
 		prompt := a.promptString()
 		stopIdle := a.startIdleCheckpoint(ctx, editor)
+		a.setPrompting(true)
 		line, err := editor.ReadLine(prompt)
+		a.setPrompting(false)
 		stopIdle()
 
 		switch {
@@ -441,10 +453,6 @@ func (a *App) repl(ctx context.Context, cancel context.CancelFunc, opening strin
 		case err != nil:
 			return err
 		}
-
-		// The header now describes the exchange below it and becomes scrollback.
-		editor.ForgetHeader()
-		a.knownModel = a.model.ID
 
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -475,11 +483,20 @@ func (a *App) reportError(err error) {
 }
 
 func (a *App) handleInput(ctx context.Context, line string) error {
+	a.agentMu.Lock()
+	defer a.agentMu.Unlock()
 	if strings.HasPrefix(line, "/") {
 		return a.command(ctx, line)
 	}
 
 	a.echoTypedPrompt(line)
+	if err := a.beforeSend(ctx); err != nil {
+		if ctx.Err() == nil && errors.Is(err, context.Canceled) {
+			a.note("Not sent.")
+			return nil
+		}
+		return err
+	}
 	return a.runTurn(ctx, line)
 }
 

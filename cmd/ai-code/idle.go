@@ -6,40 +6,44 @@ import (
 	"time"
 
 	"ai-code/internal/agent"
-	"ai-code/internal/provider"
+	"ai-code/internal/coord"
 	"ai-code/internal/session"
 	"ai-code/internal/ui"
 )
 
-// checkpointProbeTimeout bounds the health check that decides whether the
-// backend is free: a server slow to answer counts as busy.
-const checkpointProbeTimeout = 3 * time.Second
-
 // startIdleCheckpoint summarises the session if the prompt is left untouched,
-// and returns the stop function, which waits for the goroutine before the
-// caller touches the agent.
+// so a later model swap finds the summary already written. It returns the stop
+// function, which waits for the goroutine before the caller touches the agent.
 func (a *App) startIdleCheckpoint(ctx context.Context, editor *ui.Editor) func() {
 	if !a.watchEnabled(editor) {
 		return func() {}
 	}
 
-	// Two lifetimes: a keystroke ends the summary but keeps the swap watch
-	// running.
-	watch, stopWatch := context.WithCancel(ctx)
-	work, stopWork := context.WithCancel(watch)
+	work, stop := context.WithCancel(ctx)
 	done := make(chan struct{})
-
-	editor.OnActivity = stopWork
+	editor.OnActivity = stop
 	go func() {
 		defer close(done)
-		a.watchWhileIdle(watch, work, a.cfg.Agent.AutoCheckpointIdleDelay.Duration, editor)
+		a.idleCheckpoint(work, a.cfg.Agent.AutoCheckpointIdleDelay.Duration)
 	}()
 
 	return func() {
-		stopWatch()
+		stop()
 		<-done
 		editor.OnActivity = nil
 	}
+}
+
+// idleCheckpoint waits out the idle delay, then writes the summary.
+func (a *App) idleCheckpoint(ctx context.Context, delay time.Duration) {
+	idle := time.NewTimer(delay)
+	defer idle.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-idle.C:
+	}
+	a.speculativeCheckpoint(ctx)
 }
 
 // watchEnabled reports whether this session takes part.
@@ -48,42 +52,19 @@ func (a *App) watchEnabled(editor *ui.Editor) bool {
 	return editor != nil && editor.IsTTY()
 }
 
-// watchWhileIdle runs for as long as the prompt is up. The checkpoint is bounded
-// by work, which a keystroke ends; the swap watch is bounded by watch, which
-// ends only when the line is submitted.
-func (a *App) watchWhileIdle(watch, work context.Context, idle time.Duration, editor *ui.Editor) {
-	due := time.Now().Add(idle)
-	written := false
-
-	for {
-		a.prepareForSwap(watch, editor)
-		// The shared intent first: a local file, no server call.
-		if !a.adoptIntended(editor) {
-			a.adoptModelChange(watch, editor)
-		}
-
-		if !written && work.Err() == nil && !time.Now().Before(due) {
-			written = true
-			a.speculativeCheckpoint(work)
-		}
-
-		select {
-		case <-watch.Done():
-			return
-		case <-time.After(swapPollInterval):
-		}
-	}
-}
-
 // speculativeCheckpoint writes the summary nobody asked for.
 func (a *App) speculativeCheckpoint(ctx context.Context) {
 	if a.cfg.Agent.AutoCheckpoint != nil && !*a.cfg.Agent.AutoCheckpoint {
 		return
 	}
-	if !a.agent.CheckpointWorthwhile(agent.SpeculativeSummaryMaxTokens) {
+	if !a.agentMu.TryLock() {
 		return
 	}
-	if !a.backendFree(ctx) {
+	defer a.agentMu.Unlock()
+	if !a.modelIsWarm() || !a.agent.CheckpointWorthwhile(agent.SpeculativeSummaryMaxTokens) {
+		return
+	}
+	if !a.backendFree() {
 		return
 	}
 	if _, err := a.agent.Summarise(ctx, agent.SpeculativeSummaryMaxTokens); err != nil {
@@ -93,25 +74,26 @@ func (a *App) speculativeCheckpoint(ctx context.Context) {
 	a.recordCheckpoint()
 }
 
-// backendFree reports whether a summary can be written without taking the model
-// away; unknown counts as free.
-func (a *App) backendFree(ctx context.Context) bool {
-	in, ok := a.client.(provider.Introspector)
-	if !ok {
+// backendFree reports whether a summary can be written without taking the
+// model from another instance or queueing behind one.
+func (a *App) backendFree() bool {
+	s := a.share
+	if s == nil || s.bus.Self().Server == "" {
 		return true
 	}
-	ctx, cancel := context.WithTimeout(ctx, checkpointProbeTimeout)
-	defer cancel()
-
-	h, err := in.Health(ctx)
-	if err != nil {
-		return true
-	}
-	if h.ModelLoaded != "" && h.ModelLoaded != a.model.ID {
-		// Someone else's model is resident: a send now would evict it.
+	self := s.bus.Self()
+	if len(s.bus.Pending()) > 0 {
 		return false
 	}
-	return !h.Busy && !h.Streaming
+	if l := s.bus.Loaded(); l != "" && l != self.Model {
+		return false
+	}
+	for _, p := range s.bus.Peers() {
+		if p.State == coord.StateWorking || p.State == coord.StateSummarising {
+			return false
+		}
+	}
+	return true
 }
 
 // recordCheckpoint persists the standby summary so a /restart or a --resume

@@ -112,6 +112,7 @@ func (a *App) cmdProvider(ctx context.Context, args string) error {
 	if a.gate != nil {
 		client = a.gate.wrap(client)
 	}
+	client = a.share.wrap(client)
 	model, err := resolveModel(ctx, client, "", pc.DefaultModel)
 	if err != nil {
 		return err
@@ -166,9 +167,10 @@ func (a *App) switchTo(ctx context.Context, client provider.Client, name string,
 		}
 	}
 
-	// From here the swap happens: announce to peers, then load the weights,
-	// because the load is the eviction they are warned about.
-	a.announceSwap(ctx, client, model, newLimit)
+	// From here the swap happens: the other instances make way, then the
+	// weights load, because the load is the eviction they make way for.
+	server := serverKey(client, pc)
+	a.swapTo(ctx, client, server, model, newLimit)
 
 	a.client = client
 	a.providerName = name
@@ -176,11 +178,11 @@ func (a *App) switchTo(ctx context.Context, client provider.Client, name string,
 	a.model = model
 	a.agent.SetClient(client)
 	a.agent.SetModel(model.ID, newLimit, model.MaxOutputTokens)
-	a.peers.SetModel(name, model.ID)
+	if a.share != nil {
+		a.share.chose(server, model.ID)
+	}
 	a.agent.SetResumeFromTranscript(fromTranscript)
 
-	// The scrollback now says this, so a later change is measured against it.
-	a.knownModel = model.ID
 	a.out(fmt.Sprintf("Now using %s on %s (%s, %s ctx — %s).",
 		style.Bold(model.ID), name, client.Class(), compactInt(newLimit), style.Dim(source)))
 

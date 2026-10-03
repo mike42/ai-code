@@ -69,8 +69,7 @@ func (a *App) refreshWorkerLine() {
 	}
 }
 
-// workerMarker is what the prompt says about workers running behind it. It is
-// on the prompt, not the header, which the model-change notice owns.
+// workerMarker is what the prompt says about workers running behind it.
 func (a *App) workerMarker() string {
 	if a.workers == nil {
 		return ""

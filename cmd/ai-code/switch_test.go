@@ -94,6 +94,10 @@ func swapApp(t *testing.T, oldLimit, sessionChars int) (*App, *countingClient) {
 			ReserveTokens: cfg.Agent.CompactReserveTokens,
 		})
 	app.agent.SetMessages(conversation(sessionChars))
+	if sessionChars > 0 {
+		// The conversation's last round ran on this model.
+		app.lastRoundModel = "wide-model"
+	}
 	return app, client
 }
 

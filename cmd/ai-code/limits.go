@@ -167,6 +167,8 @@ func (a *App) runPrint(ctx context.Context, opening string, lim *limitTimers) er
 }
 
 func (a *App) printTurns(ctx context.Context, opening string, lim *limitTimers) error {
+	a.agentMu.Lock()
+	defer a.agentMu.Unlock()
 	err := a.runTurn(ctx, opening)
 	if err == nil && !lim.wasInterrupted() {
 		err = a.drainWorkers(ctx)
