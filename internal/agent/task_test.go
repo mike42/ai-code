@@ -107,6 +107,23 @@ func TestTaskToolIsAbsentOnACloudProvider(t *testing.T) {
 	}
 }
 
+func TestDisabledTaskToolIsAbsentAndRefused(t *testing.T) {
+	a, tasks := attached(t, &scriptedClient{})
+	tasks.Disable()
+	if hasTool(a.exec.Definitions(), "task") {
+		t.Error("the task tool is in the schema after Disable")
+	}
+	res, err := tasks.Execute(context.Background(), tool.Request{
+		Name: "task", Args: json.RawMessage(`{"description":"x","prompt":"y"}`),
+	})
+	if err != nil || !res.IsError {
+		t.Errorf("a disabled task tool ran: %+v, %v", res, err)
+	}
+	if n := tasks.Pool().Busy(); n != 0 {
+		t.Errorf("%d workers started", n)
+	}
+}
+
 func TestTaskToolRefusesToRunOnCloudEvenIfNamed(t *testing.T) {
 	a, tasks := attached(t, &cloudClient{})
 	_ = a
@@ -189,8 +206,10 @@ func TestAChildStartsWithNoConversation(t *testing.T) {
 }
 
 // The tool returns before the worker has done anything; the report arrives
-// afterwards through the steering queue.
+// afterwards through the steering queue. The worker is held until the turn
+// ends; TestAReportThatArrivesMidTurnIsAnsweredInIt covers the other order.
 func TestTheWorkerReportArrivesAfterTheTurn(t *testing.T) {
+	release := make(chan struct{})
 	client := &scriptedClient{
 		turns: []scriptedTurn{
 			{calls: []provider.ToolCall{taskCall("where is the retry backoff")}},
@@ -201,11 +220,13 @@ func TestTheWorkerReportArrivesAfterTheTurn(t *testing.T) {
 			{text: "internal/provider/openai.go:88 sets it.", stop: provider.StopEnd},
 		},
 	}
+	client.onWorkerStream = func() { <-release }
 	a, tasks := attached(t, client)
 
 	if err := a.Run(context.Background(), "find the backoff"); err != nil {
 		t.Fatal(err)
 	}
+	close(release)
 
 	var result string
 	for _, m := range a.Messages() {
@@ -240,7 +261,49 @@ func TestTheWorkerReportArrivesAfterTheTurn(t *testing.T) {
 
 // A worker that failed still reports, because a parent told nothing waits for
 // an answer that is never coming.
+// A worker that finishes while the turn that started it is still running is
+// reported in that turn: folded in at the next boundary, once, and answered.
+func TestAReportThatArrivesMidTurnIsAnsweredInIt(t *testing.T) {
+	client := &scriptedClient{
+		turns: []scriptedTurn{
+			{calls: []provider.ToolCall{taskCall("where is the retry backoff")}},
+			{text: "openai.go:88 it is.", stop: provider.StopEnd},
+		},
+		workerTurns: []scriptedTurn{{text: "internal/provider/openai.go:88 sets it.", stop: provider.StopEnd}},
+	}
+	a, tasks := attached(t, client)
+	// Hold the parent's second request until the worker has reported.
+	calls := 0
+	client.onParentStream = func() {
+		calls++
+		if calls == 2 {
+			tasks.Pool().Wait()
+		}
+	}
+
+	if err := a.Run(context.Background(), "find the backoff"); err != nil {
+		t.Fatal(err)
+	}
+	if q := a.TakeSteering(); len(q) != 0 {
+		t.Fatalf("%d reports still queued after the turn that should have answered them", len(q))
+	}
+	msgs := a.Messages()
+	reports := 0
+	for i, m := range msgs {
+		if m.Role == provider.RoleUser && strings.Contains(m.Content, "<worker-report") {
+			reports++
+			if i == len(msgs)-1 {
+				t.Error("the report is the last message: the model never answered it")
+			}
+		}
+	}
+	if reports != 1 {
+		t.Errorf("the report appears %d times in the conversation, want once", reports)
+	}
+}
+
 func TestAFailedWorkerStillReports(t *testing.T) {
+	release := make(chan struct{})
 	client := &scriptedClient{
 		turns: []scriptedTurn{
 			{calls: []provider.ToolCall{taskCall("look")}},
@@ -248,10 +311,14 @@ func TestAFailedWorkerStillReports(t *testing.T) {
 		},
 		workerTurns: []scriptedTurn{{text: "", stop: provider.StopEnd}},
 	}
+	// Held until the turn is over, so the report is read from the queue
+	// rather than having been folded into the turn already.
+	client.onWorkerStream = func() { <-release }
 	a, tasks := attached(t, client)
 	if err := a.Run(context.Background(), "go"); err != nil {
 		t.Fatal(err)
 	}
+	close(release)
 	tasks.Pool().Wait()
 
 	queued := a.TakeSteering()

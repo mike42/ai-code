@@ -83,6 +83,11 @@ func (p *Plain) Emit(e agent.Event) {
 			display = e.ToolName
 		}
 		fmt.Fprintf(p.w, "[tool] %s\n", display)
+		if show := strings.TrimRight(e.ToolResult.Show, "\n"); show != "" {
+			for _, l := range strings.Split(show, "\n") {
+				fmt.Fprintf(p.w, "       %s\n", l)
+			}
+		}
 		if e.ToolResult.IsError || p.verbose {
 			for _, l := range strings.Split(strings.TrimRight(e.ToolResult.Content, "\n"), "\n") {
 				fmt.Fprintf(p.w, "       %s\n", l)

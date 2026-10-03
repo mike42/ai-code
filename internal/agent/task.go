@@ -95,9 +95,18 @@ Do not use it for something you can finish in one or two tool calls.`
 type TaskExecutor struct {
 	inner tool.Executor
 
-	mu     sync.Mutex
-	parent *Agent
-	pool   *Workers
+	mu       sync.Mutex
+	parent   *Agent
+	pool     *Workers
+	disabled bool
+}
+
+// Disable removes the task tool for the whole session, for a caller that
+// decides itself how many agents run at once.
+func (t *TaskExecutor) Disable() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.disabled = true
 }
 
 func NewTaskExecutor(inner tool.Executor) *TaskExecutor {
@@ -137,8 +146,10 @@ func (t *TaskExecutor) agent() *Agent {
 // cloud provider: a worker's prompt and codebase must not reach a third party
 // on the model's initiative. Absent from the schema rather than refused.
 func (t *TaskExecutor) available() bool {
-	a := t.agent()
-	return a != nil && a.client != nil && a.client.Class() != provider.ClassCloud
+	t.mu.Lock()
+	a, disabled := t.parent, t.disabled
+	t.mu.Unlock()
+	return !disabled && a != nil && a.client != nil && a.client.Class() != provider.ClassCloud
 }
 
 func (t *TaskExecutor) Definitions() []tool.Definition {

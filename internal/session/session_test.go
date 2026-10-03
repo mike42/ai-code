@@ -55,7 +55,6 @@ func TestRoundTripThroughReplay(t *testing.T) {
 			t.Errorf("message %d = %+v, want %+v", i, got[i], want[i])
 		}
 	}
-	// Tool call structure must survive, or a resumed session is unsendable.
 	if len(got[1].ToolCalls) != 1 || got[1].ToolCalls[0].ID != "t1" {
 		t.Errorf("tool calls did not survive the round trip: %+v", got[1].ToolCalls)
 	}
@@ -65,7 +64,6 @@ func TestRoundTripThroughReplay(t *testing.T) {
 }
 
 func TestATruncatedFinalLineDoesNotLoseTheSession(t *testing.T) {
-	// A crash mid-write should cost the last entry, not the whole transcript.
 	tempRoot(t)
 	project := "/p"
 
@@ -97,8 +95,6 @@ func TestATruncatedFinalLineDoesNotLoseTheSession(t *testing.T) {
 }
 
 func TestCompactionResetsReplayedContext(t *testing.T) {
-	// After a compaction the replayed conversation must match what was in
-	// context when the session was live, not the full pre-compaction history.
 	tempRoot(t)
 	s, err := Create(Meta{Project: "/p"})
 	if err != nil {
@@ -119,7 +115,6 @@ func TestCompactionResetsReplayedContext(t *testing.T) {
 		t.Errorf("replayed %+v, want only the post-compaction message", msgs)
 	}
 
-	// The pre-compaction history must still be on disk.
 	raw, _ := os.ReadFile(s.Path())
 	if !strings.Contains(string(raw), "old one") {
 		t.Error("compaction removed history from the file; it should only shorten context")
@@ -152,8 +147,6 @@ func TestListIsNewestFirstWithPreviews(t *testing.T) {
 }
 
 func TestSessionsAreOwnerReadableOnly(t *testing.T) {
-	// A transcript contains whatever the model was shown: source, config, and
-	// anything a command printed.
 	tempRoot(t)
 	s, err := Create(Meta{Project: "/p"})
 	if err != nil {
@@ -179,7 +172,6 @@ func TestDifferentProjectsAreKeptApart(t *testing.T) {
 		}
 		s.Close()
 	}
-	// Same basename, different paths: the directory names must not collide.
 	entries, err := os.ReadDir(filepath.Join(root, "sessions"))
 	if err != nil {
 		t.Fatal(err)
@@ -202,7 +194,6 @@ func TestIDsSortChronologically(t *testing.T) {
 	a := NewID()
 	b := NewID()
 	if a >= b && a[:15] == b[:15] {
-		// Same second: only the random suffix differs, which is fine.
 		return
 	}
 	if a > b {
@@ -210,9 +201,6 @@ func TestIDsSortChronologically(t *testing.T) {
 	}
 }
 
-// Command history has to survive a /restart. It cannot be rebuilt from the
-// transcript: slash commands never become messages, and Messages() discards
-// everything before a compaction entry.
 func TestInputsSurviveCompactionAndIncludeCommands(t *testing.T) {
 	entries := []Entry{
 		{Type: EntryInput, Input: "first prompt"},
@@ -239,7 +227,6 @@ func TestInputsSurviveCompactionAndIncludeCommands(t *testing.T) {
 }
 
 func TestInputsFallBackToUserMessagesForOlderSessions(t *testing.T) {
-	// Sessions written before EntryInput existed still have their prompts.
 	entries := []Entry{
 		{Type: EntryMessage, Message: &provider.Message{Role: provider.RoleUser, Content: "old prompt"}},
 		{Type: EntryMessage, Message: &provider.Message{Role: provider.RoleAssistant, Content: "a reply"}},
@@ -249,8 +236,6 @@ func TestInputsFallBackToUserMessagesForOlderSessions(t *testing.T) {
 
 	got := Inputs(entries)
 	if len(got) != 1 || got[0] != "old prompt" {
-		// The checkpoint is ai-code's wrapper, not something anyone typed, and
-		// offering it as history would be baffling.
 		t.Errorf("Inputs() = %q, want just the typed prompt", got)
 	}
 }
@@ -298,9 +283,7 @@ func TestCheckpointTakesTheLastOneRecorded(t *testing.T) {
 }
 
 func TestCompactionClearsTheStandbyCheckpoint(t *testing.T) {
-	// A /compact folds its summary into the message list as the first message,
-	// which Messages replays. Returning it as a standby summary as well would
-	// put the same text in front of the model twice.
+	// Legacy /compact summary is already replayed as the first message.
 	entries := []Entry{
 		{Type: EntryCheckpoint, Summary: "standby", SummarisedThrough: 2},
 		{Type: EntryCompaction, Summary: "compacted"},
@@ -332,5 +315,43 @@ func TestCheckpointSurvivesAnOnDiskRoundTrip(t *testing.T) {
 	}
 	if msgs := Messages(entries); len(msgs) != 2 {
 		t.Errorf("after reopening: %d messages, want 2", len(msgs))
+	}
+}
+
+func TestWorkspaceDirSeparatesWorkingDirectories(t *testing.T) {
+	t.Setenv("AI_CODE_DATA_DIR", t.TempDir())
+	a, _ := WorkspaceDir("ssh://agent@mac/Users/agent/a")
+	b, _ := WorkspaceDir("ssh://agent@mac/Users/agent/b")
+	local, _ := WorkspaceDir("/Users/agent/a")
+	if a == b || a == local {
+		t.Errorf("two working directories share notes: %s %s %s", a, b, local)
+	}
+	again, _ := WorkspaceDir("ssh://agent@mac/Users/agent/a")
+	if again != a {
+		t.Errorf("the same working directory moved: %s then %s", a, again)
+	}
+}
+
+func TestStateDirHoldsSessionsAndNotes(t *testing.T) {
+	t.Setenv("AI_CODE_DATA_DIR", t.TempDir())
+	dir := t.TempDir()
+	if err := SetStateDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { stateDir = "" }()
+
+	s, err := Create(Meta{Project: "/some/project"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if _, err := os.Stat(filepath.Join(dir, "sessions", s.Meta.ID+".jsonl")); err != nil {
+		t.Errorf("session not under --state-dir: %v", err)
+	}
+	if latest, err := Latest("/elsewhere"); err != nil || latest.ID != s.Meta.ID {
+		t.Errorf("-c does not find it: %+v, %v", latest, err)
+	}
+	if w, _ := WorkspaceDir("/any"); w != dir {
+		t.Errorf("notes go to %s, want %s", w, dir)
 	}
 }

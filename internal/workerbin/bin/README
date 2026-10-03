@@ -1,0 +1,3 @@
+Built workers go here, as ai-code-worker-GOOS-GOARCH.gz, and are embedded in
+ai-code. build.sh puts them here before it builds ai-code. They are not
+committed.

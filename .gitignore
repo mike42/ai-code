@@ -1,3 +1,4 @@
 /ai-code
 /dist/
 *.test
+/internal/workerbin/bin/ai-code-worker-*

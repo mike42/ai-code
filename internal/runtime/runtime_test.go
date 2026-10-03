@@ -20,6 +20,9 @@ func TestParseFlag(t *testing.T) {
 		{"ssh://buildvm", KindSSH, false},
 		{"ssh://user@vm:2222", KindSSH, false},
 		{"ssh://", "", true},
+		{"ssh://agent:secret@vm", "", true},
+		{"ssh://vm:notaport", "", true},
+		{"ssh://vm/work?x=1", "", true},
 		{"bogus", "", true},
 	}
 	for _, tc := range tests {
@@ -80,7 +83,6 @@ func TestResolveNoRuntimeWithoutConfig(t *testing.T) {
 
 func TestResolveHostIsExplicit(t *testing.T) {
 	dir := t.TempDir()
-	// Even with a devcontainer present, an explicit host is honoured.
 	dc := filepath.Join(dir, ".devcontainer")
 	if err := os.MkdirAll(dc, 0o755); err != nil {
 		t.Fatal(err)
@@ -149,7 +151,6 @@ func TestExplicitDevcontainerFlagStillResolvesTheImage(t *testing.T) {
 	if explicit.Image != want {
 		t.Errorf("explicit --runtime devcontainer gave image %q, want %q", explicit.Image, want)
 	}
-	// The two routes must agree; a restart takes the explicit one.
 	if explicit.Image != implicit.Image {
 		t.Errorf("explicit gave %q but implicit gave %q", explicit.Image, implicit.Image)
 	}
@@ -182,8 +183,45 @@ func TestDockerfileConfigIsABuildNotAMissingImage(t *testing.T) {
 	if got := rt.Config.Dockerfile(); got != "Dockerfile" {
 		t.Errorf("Dockerfile() = %q, want %q", got, "Dockerfile")
 	}
-	// The banner must not claim the image is missing: it is going to be built.
 	if got := rt.Describe(); strings.Contains(got, "no image") {
 		t.Errorf("Describe() = %q, want it to describe the build", got)
+	}
+}
+
+func TestParseSSHSplitsDestinationAndDirectory(t *testing.T) {
+	tests := []struct {
+		in                    string
+		user, host, port, dir string
+		remote, flag          string
+	}{
+		{"ssh://buildvm", "", "buildvm", "", "", "buildvm", "ssh://buildvm"},
+		{"ssh://agent@vm:2222/home/agent/work/", "agent", "vm", "2222", "/home/agent/work",
+			"agent@vm:2222", "ssh://agent@vm:2222/home/agent/work"},
+		{"ssh://agent@vm/", "agent", "vm", "", "", "agent@vm", "ssh://agent@vm"},
+		{"ssh://[::1]:22/srv", "", "::1", "22", "/srv", "[::1]:22", "ssh://[::1]:22/srv"},
+	}
+	for _, tc := range tests {
+		r, err := ParseFlag(tc.in)
+		if err != nil {
+			t.Fatalf("ParseFlag(%q): %v", tc.in, err)
+		}
+		got := []string{r.SSHUser, r.SSHHost, r.SSHPort, r.SSHDir, r.Remote, r.FlagValue()}
+		want := []string{tc.user, tc.host, tc.port, tc.dir, tc.remote, tc.flag}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Errorf("ParseFlag(%q) = %q, want %q", tc.in, got, want)
+				break
+			}
+		}
+	}
+}
+
+func TestResolveAcceptsSSH(t *testing.T) {
+	r, err := Resolve("ssh://agent@vm/work", t.TempDir())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if r.Kind != KindSSH || r.SSHDir != "/work" {
+		t.Errorf("Resolve = %+v", r)
 	}
 }

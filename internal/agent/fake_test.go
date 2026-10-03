@@ -36,6 +36,9 @@ type scriptedClient struct {
 	workerN     int
 	// onWorkerStream runs when a worker request is served, off the lock.
 	onWorkerStream func()
+	// onParentStream runs when a request that is not a worker's is served,
+	// off the lock, so a test can hold the parent at a known point.
+	onParentStream func()
 }
 
 func isWorkerRequest(req provider.Request) bool {
@@ -111,11 +114,15 @@ func (c *scriptedClient) Stream(ctx context.Context, req provider.Request) (prov
 	}
 	hook := c.onStream
 	workerHook := c.onWorkerStream
+	parentHook := c.onParentStream
 	ratio := c.charsPerToken
 	c.mu.Unlock()
 
 	if workerHook != nil && isWorkerRequest(req) {
 		workerHook()
+	}
+	if parentHook != nil && !isWorkerRequest(req) {
+		parentHook()
 	}
 
 	if ratio > 0 || c.tokenizer != nil {

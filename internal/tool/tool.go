@@ -17,6 +17,9 @@ type Request struct {
 	CallID string          `json:"call_id"`
 	Name   string          `json:"name"`
 	Args   json.RawMessage `json:"args"`
+	// Cancel, on a request sent while CallID is still running in an executor
+	// daemon, stops that call. It carries no tool to run.
+	Cancel bool `json:"cancel,omitempty"`
 }
 
 // Result is the outcome. A tool that fails returns a Result with IsError set
@@ -29,6 +32,11 @@ type Result struct {
 	// Display is a one-line summary for the renderer, so the terminal can show
 	// "Read internal/agent/loop.go (142 lines)" instead of the full payload.
 	Display string `json:"display,omitempty"`
+
+	// Show is markdown for the person watching, rendered in full beneath the
+	// Display line at every verbosity. It never reaches the model, which
+	// already has Content.
+	Show string `json:"show,omitempty"`
 
 	// Interrupted marks a result the tool itself produced in response to
 	// cancellation. The agent wraps cancelled results but skips that when this
@@ -210,6 +218,9 @@ func (e *LocalExecutor) Execute(ctx context.Context, req Request) (Result, error
 	return res, nil
 }
 
+// State is the working state the tools act on.
+func (e *LocalExecutor) State() *State { return e.state }
+
 // IsReadOnly reports whether a named tool is safe to run concurrently.
 func (e *LocalExecutor) IsReadOnly(name string) bool {
 	t, ok := e.tools[name]
@@ -265,3 +276,15 @@ func (e *LocalExecutor) Fork() (Executor, error) {
 	}
 	return NewLocalExecutor(NewState(e.state.Cwd()), tools...), nil
 }
+
+// Unavailable is an executor error saying the place tools run cannot be used
+// at all: the remote machine cannot be reached, the container will not start,
+// there is no worker for its platform. Nothing the model does can change
+// that, so a run that meets it stops rather than handing the model an error
+// to retry against.
+type Unavailable struct {
+	Err error
+}
+
+func (e *Unavailable) Error() string { return e.Err.Error() }
+func (e *Unavailable) Unwrap() error { return e.Err }

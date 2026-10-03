@@ -18,6 +18,7 @@ type Interactive struct {
 	screen *Screen
 	style  Style
 	md     *Markdown
+	theme  string
 
 	showStatus bool
 	warnPct    int
@@ -109,6 +110,7 @@ func NewInteractive(s *Screen, opts InteractiveOptions) *Interactive {
 		reasonMode: opts.Reasoning,
 		verbose:    opts.Verbose,
 		steerMark:  opts.SteerPrompt,
+		theme:      opts.Theme,
 		stop:       make(chan struct{}),
 		done:       make(chan struct{}),
 	}
@@ -486,6 +488,9 @@ func (r *Interactive) commitToolResult(e agent.Event) {
 	// The glyph sits on ai-code's own line, never on model content or code, so
 	// a selection of the output never picks up a gutter.
 	r.screen.Commit(glyph + " " + display)
+	if res.Show != "" {
+		r.commitPanel(res.Show)
+	}
 
 	r.mu.Lock()
 	verbose := r.verbose
@@ -502,6 +507,20 @@ func (r *Interactive) commitToolResult(e agent.Event) {
 			r.screen.Commit("  " + r.style.Dim(line))
 		}
 	}
+}
+
+// commitPanel renders a tool's markdown for the user, indented under its
+// summary line. It gets a renderer of its own so it cannot disturb the state of
+// the one the model's text is streaming through.
+func (r *Interactive) commitPanel(text string) {
+	md := NewMarkdown(
+		func(line string) { r.screen.Commit("  " + line) },
+		nil,
+		r.style, r.screen.Color(), r.theme,
+		func() int { return max(r.screen.Width()-2, 1) },
+	)
+	md.Write(strings.TrimRight(text, "\n") + "\n")
+	md.Flush()
 }
 
 func contentLines(s string) []string {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"ai-code/internal/agent"
+	"ai-code/internal/worker"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14,7 +15,6 @@ import (
 	"ai-code/internal/config"
 	"ai-code/internal/provider"
 	"ai-code/internal/session"
-	"ai-code/internal/tool"
 )
 
 func buildClient(name string, p config.Provider) (provider.Client, error) {
@@ -57,28 +57,21 @@ func buildClient(name string, p config.Provider) (provider.Client, error) {
 	}
 }
 
-// buildTools assembles the tool set. The executor sorts by name, so the
-// advertised list is deterministic and the provider's prompt cache is not
-// invalidated by map iteration. window is the detected context window, or 0.
-func buildTools(cfg *config.Config, cwd string, window int) (*tool.LocalExecutor, *tool.State) {
-	st := tool.NewState(cwd)
+// toolSettings are sent to the worker; the remote machine's own configuration is
+// never read.
+func toolSettings(cfg *config.Config, window int) worker.Settings {
 	maxOutput := cfg.Tools.Bash.MaxOutputBytes
 	if maxOutput <= 0 {
 		maxOutput = agent.BudgetFor(window).MaxToolResultBytes()
 	}
-	return tool.NewLocalExecutor(st,
-		&tool.BashTool{
-			Timeout:        cfg.Tools.Bash.Timeout.Duration,
-			MaxOutputBytes: maxOutput,
-			Shell:          cfg.Tools.Bash.Shell,
-		},
-		&tool.ReadTool{MaxBytes: cfg.Tools.Read.MaxBytes, MaxLines: cfg.Tools.Read.MaxLines},
-		&tool.WriteTool{},
-		&tool.EditTool{},
-		&tool.GrepTool{MaxResults: cfg.Tools.Grep.MaxResults},
-		&tool.GlobTool{},
-		&tool.LsTool{},
-	), st
+	return worker.Settings{
+		BashTimeout:    cfg.Tools.Bash.Timeout.Duration,
+		BashMaxOutput:  maxOutput,
+		Shell:          cfg.Tools.Bash.Shell,
+		ReadMaxBytes:   cfg.Tools.Read.MaxBytes,
+		ReadMaxLines:   cfg.Tools.Read.MaxLines,
+		GrepMaxResults: cfg.Tools.Grep.MaxResults,
+	}
 }
 
 const modelCacheTTL = 6 * time.Hour

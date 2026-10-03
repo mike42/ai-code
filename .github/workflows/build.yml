@@ -88,18 +88,9 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         shell: bash
-        run: |
-          set -euo pipefail
-          # install.sh's build, cross-compiled and with the version stamped
-          # into main.version.
-          binary="ai-code"
-          if [ "${GOOS}" = "windows" ]; then
-            binary="ai-code.exe"
-          fi
-          mkdir -p dist
-          CGO_ENABLED=0 go build -trimpath \
-            -ldflags "-s -w -X main.version=${VERSION}" \
-            -o "dist/${binary}" ./cmd/ai-code
+        # build.sh embeds the workers for every remote platform; a plain
+        # go build would produce a binary that cannot run tools remotely.
+        run: OUT=dist ./build.sh
 
       - name: Smoke test
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'

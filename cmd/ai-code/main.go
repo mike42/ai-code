@@ -6,22 +6,24 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"ai-code/internal/agent"
 	"ai-code/internal/config"
 	"ai-code/internal/coord"
+	"ai-code/internal/hosttool"
 	"ai-code/internal/prompt"
 	"ai-code/internal/provider"
 	"ai-code/internal/render"
 	"ai-code/internal/runtime"
 	"ai-code/internal/session"
 	"ai-code/internal/tool"
+	"ai-code/internal/worker"
 )
 
 var version = "0.1.0-dev"
@@ -40,6 +42,13 @@ type flags struct {
 	noStatus     bool
 	help         bool
 	version      bool
+	enableTools  []string
+	disableTools []string
+	stateDir     string
+	sshConfig    string
+	limits       timeLimits
+	appendPrompt string
+	noCloud      bool
 	args         []string
 }
 
@@ -47,6 +56,11 @@ func main() {
 	if err := run(); err != nil {
 		if errors.Is(err, errQuit) {
 			return
+		}
+		var status *exitStatus
+		if errors.As(err, &status) {
+			fmt.Fprintln(os.Stderr, "ai-code: "+status.msg)
+			os.Exit(status.code)
 		}
 		var restart *restartRequest
 		if errors.As(err, &restart) {
@@ -73,17 +87,15 @@ type restartRequest struct {
 func (r *restartRequest) Error() string { return "restart" }
 
 func run() error {
-	// Internal mode: serve the tool executor as a JSON-lines server on stdio
-	// inside a sandbox, checked before flag parsing.
-	if len(os.Args) > 2 && os.Args[1] == "--executor-daemon" {
-		if cwd, err := os.Getwd(); err == nil {
-			return runExecutorDaemon(cwd)
-		}
-	}
-
+	started := time.Now()
 	f, err := parseFlags(os.Args[1:])
 	if err != nil {
 		return err
+	}
+	if f.stateDir != "" {
+		if err := session.SetStateDir(f.stateDir); err != nil {
+			return err
+		}
 	}
 	if f.help {
 		fmt.Print(usage)
@@ -100,9 +112,11 @@ func run() error {
 	}
 
 	// A .nocloud file in the working directory or a parent marks the tree
-	// off-limits to cloud providers.
-	nocloud := config.NoCloud(cwd)
-	if nocloud {
+	// off-limits to cloud providers. A remote session reads nothing from the
+	// local directory, so for it only --no-cloud applies here.
+	remote := strings.HasPrefix(f.runtime, "ssh://")
+	nocloud := f.noCloud || (!remote && config.NoCloud(cwd))
+	if nocloud && !f.noCloud {
 		fmt.Fprintln(os.Stderr, "ai-code: .nocloud detected -- restricting to on-premises providers")
 	}
 
@@ -117,6 +131,9 @@ func run() error {
 		}
 	}
 
+	if remote {
+		cwd = ""
+	}
 	cfg, err := config.Load(cwd)
 	if err != nil {
 		return err
@@ -125,11 +142,11 @@ func run() error {
 	if nocloud {
 		cfg = cfg.OnPremisesOnly()
 		if len(cfg.Provider) == 0 {
-			return fmt.Errorf("a .nocloud file is present here, so this session is restricted to on-premises providers, " +
+			return fmt.Errorf("this session is restricted to on-premises providers (--no-cloud or a .nocloud file), " +
 				"but none are configured. Add a provider with class = \"on-premises\" and retry.")
 		}
 	}
-	return startSession(f, cfg, cwd, nocloud)
+	return startSession(f, cfg, cwd, nocloud, started)
 }
 
 const usage = `ai-code -- a coding agent for the terminal
@@ -148,7 +165,26 @@ Flags:
       --provider NAME  Use a configured provider
       --model NAME     Use a specific model
       --mode NAME      Start in a mode (build, research, review, or your own)
-      --runtime WHERE  Where tool commands run: devcontainer, ssh://HOST, or host
+      --runtime WHERE  Where tool commands run: devcontainer, host, or
+                       ssh://[USER@]HOST[:PORT][/DIR] (DIR: the remote working directory)
+      --ssh-config FILE  An ssh configuration file to use for --runtime ssh://
+      --enable-tools LIST   Turn on tools that are off by default (todo, status_update)
+      --disable-tools LIST  Turn off tools, e.g. task to stop the model starting sub-agents
+      --steer-after DURATION      With -p: at this time, ask the model to wrap up, using
+      --steer-prompt TEXT         this message or a general one. The turn carries on.
+      --interrupt-after DURATION  With -p: at this time, stop the turn and run one more
+      --interrupt-prompt TEXT     with this message; exits with status 2.
+      --exit-after DURATION       With -p: at this time, stop at once; exits with status 3.
+                                  A -p run whose tools have nowhere to run (the remote
+                                  machine is unreachable or unusable, the container will
+                                  not start) stops at once and exits with status 4.
+                                  Durations count from startup, e.g. 45m or 1h30m.
+      --no-cloud       Use on-premises providers only, as a .nocloud file does. With
+                       --runtime ssh://, a .nocloud in the remote working directory or
+                       any directory above it is checked before anything is sent
+      --append-system-prompt TEXT  Add TEXT to the system prompt, e.g. who this agent is
+      --state-dir DIR  Keep this session's transcript, todo list and status
+                       updates in DIR instead of under the data directory
       --no-status      Do not draw the status line
   -v, --verbose        Start verbose: full thinking, tool arguments and output
   -h, --help           This text
@@ -197,6 +233,42 @@ func parseFlags(args []string) (*flags, error) {
 			f.think, err = next()
 		case "--runtime":
 			f.runtime, err = next()
+		case "--ssh-config":
+			f.sshConfig, err = next()
+		case "--steer-after", "--interrupt-after", "--exit-after":
+			var v string
+			if v, err = next(); err == nil {
+				var d time.Duration
+				if d, err = parseLimit(a, v); err == nil {
+					switch a {
+					case "--steer-after":
+						f.limits.steerAfter = d
+					case "--interrupt-after":
+						f.limits.interruptAfter = d
+					default:
+						f.limits.exitAfter = d
+					}
+				}
+			}
+		case "--steer-prompt":
+			f.limits.steerPrompt, err = next()
+		case "--interrupt-prompt":
+			f.limits.interruptPrompt, err = next()
+		case "--state-dir":
+			f.stateDir, err = next()
+		case "--no-cloud":
+			f.noCloud = true
+		case "--append-system-prompt":
+			f.appendPrompt, err = next()
+		case "--enable-tools", "--disable-tools":
+			var v string
+			if v, err = next(); err == nil {
+				if a == "--enable-tools" {
+					f.enableTools = append(f.enableTools, splitToolList(v)...)
+				} else {
+					f.disableTools = append(f.disableTools, splitToolList(v)...)
+				}
+			}
 		default:
 			if strings.HasPrefix(a, "-") && len(a) > 1 {
 				return nil, fmt.Errorf("unknown flag %s (try --help)", a)
@@ -207,11 +279,14 @@ func parseFlags(args []string) (*flags, error) {
 			return nil, err
 		}
 	}
+	if err := f.limits.check(f.print); err != nil {
+		return nil, err
+	}
 	return f, nil
 }
 
 // startSession builds everything and hands off to the REPL or a single run.
-func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error {
+func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, started time.Time) error {
 	providerName := f.provider
 	if providerName == "" {
 		providerName = cfg.DefaultProvider
@@ -232,6 +307,12 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error 
 	if err != nil {
 		return err
 	}
+	// Every client the session uses is behind this, from its first contact
+	// with a provider. Nothing of the session reaches a model until it is
+	// known whether the tools' working directory forbids cloud providers --
+	// for a remote one, by asking it when the first request is sent.
+	gate := &cloudGate{static: nocloud, remote: strings.HasPrefix(f.runtime, "ssh://")}
+	client = gate.wrap(client)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -253,15 +334,19 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error 
 	}
 
 	// The project root (git root, or cwd) is what a devcontainer mounts and
-	// tools run against.
-	env := prompt.DetectEnv(cwd)
-	projectRoot := env.GitRoot
-	if projectRoot == "" {
-		projectRoot = cwd
+	// tools run against. An empty cwd is a remote session: no local project.
+	var env prompt.Env
+	var projectRoot, hostGitRoot string
+	if cwd != "" {
+		env = prompt.DetectEnv(cwd)
+		projectRoot = env.GitRoot
+		if projectRoot == "" {
+			projectRoot = cwd
+		}
+		// Kept before anything rewrites env for a container: AGENTS.md files
+		// are read off this machine's disk.
+		hostGitRoot = env.GitRoot
 	}
-	// Kept before anything rewrites env for a container: AGENTS.md files are
-	// read off this machine's disk.
-	hostGitRoot := env.GitRoot
 	// nil means the model's paths and this machine's are the same thing.
 	var showPath func(string) (string, bool)
 
@@ -276,18 +361,15 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error 
 	// starts a container on the first tool call.
 	var exe tool.Executor
 	var toolState *tool.State
+	var remoteExec *SSHExecutor
 	switch rt.Kind {
 	case runtime.KindDevcontainer:
-		binary, err := exec.LookPath(os.Args[0])
-		if err != nil {
-			return fmt.Errorf("could not find the ai-code binary to run in the container: %w", err)
-		}
 		// Expand ${...} references before anything reads the config;
 		// workspaceFolder is resolved here.
 		if rt.Config != nil {
 			rt.Config.SubstituteAll(projectRoot, devcontainerID(projectRoot))
 		}
-		dc := NewDevcontainerExecutor(rt.Config, rt.ConfigErr, projectRoot, cwd, binary)
+		dc := NewDevcontainerExecutor(rt.Config, rt.ConfigErr, projectRoot, cwd, toolSettings(cfg, limit))
 		exe = dc
 		defer dc.Close()
 
@@ -330,9 +412,51 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error 
 					strings.Join(missing, ", "))
 			}
 		}
-	default: // host
-		local, st := buildTools(cfg, cwd, limit)
-		exe, toolState = local, st
+	case runtime.KindSSH:
+		ssh := NewSSHExecutor(rt, f.sshConfig, toolSettings(cfg, limit))
+		remoteExec = ssh
+		exe = ssh
+		defer ssh.Close()
+
+		// Everything the model is told about its surroundings is about the
+		// remote machine, and nothing of this one is read to say it.
+		env = prompt.Env{Cwd: rt.SSHDir, Remote: rt.Remote}
+		if env.Cwd == "" {
+			env.Cwd = "~ (the remote user's home directory)"
+		}
+		showPath = func(string) (string, bool) { return "", false }
+	case runtime.KindHost:
+		local := worker.Tools(toolSettings(cfg, limit), cwd)
+		exe, toolState = local, local.State()
+	default:
+		return fmt.Errorf("no executor for runtime %q", rt.Kind)
+	}
+	if rt.Kind != runtime.KindSSH && f.sshConfig != "" {
+		return fmt.Errorf("--ssh-config applies only to --runtime ssh://")
+	}
+
+	// Which tools this session offers. The host-side ones keep their files per
+	// working directory -- the remote one, for ssh -- so that agents working
+	// in different places never read each other's.
+	known := []string{"task"}
+	for _, d := range exe.Definitions() {
+		known = append(known, d.Name)
+	}
+	offDefault := map[string]bool{}
+	for _, n := range hosttool.Names() {
+		known = append(known, n)
+		offDefault[n] = true
+	}
+	choice, err := resolveTools(known, offDefault, f.enableTools, f.disableTools)
+	if err != nil {
+		return err
+	}
+	exe = tool.Filter(exe, choice.allow)
+	workspace := cwd
+	sessionProject := projectRoot
+	if rt.Kind == runtime.KindSSH {
+		workspace = rt.FlagValue()
+		sessionProject = workspace
 	}
 
 	thinking, err := provider.ParseEffort(f.think)
@@ -347,7 +471,20 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error 
 	// The task tool sits outside the executor boundary because a worker needs
 	// the agent; dormant until Attach.
 	tasks := agent.NewTaskExecutor(exe)
+	if !choice.allow("task") {
+		tasks.Disable()
+	}
 	exe = tasks
+	var carried string
+	if hostTools := choice.among(hosttool.Names()); len(hostTools) > 0 {
+		notesDir, err := session.WorkspaceDir(workspace)
+		if err != nil {
+			return err
+		}
+		host := hosttool.Wrap(tasks, notesDir, hostTools)
+		carried = host.Carried()
+		exe = host
+	}
 
 	// Non-interactive output consumes the same event stream as the terminal.
 	screen := render.NewScreen(os.Stdout, cfg.UI.Color)
@@ -381,16 +518,22 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error 
 		sink, verbosity = interactive, interactive
 	}
 
+	if remoteExec != nil {
+		gate.check = remoteExec.NoCloud
+	}
+
 	app := &App{
-		cfg:          cfg,
-		cwd:          cwd,
-		projectRoot:  projectRoot,
-		hostGitRoot:  hostGitRoot,
-		showPath:     showPath,
-		client:       client,
-		providerName: providerName,
-		providerCfg:  pc,
-		model:        model,
+		cfg:            cfg,
+		cwd:            cwd,
+		projectRoot:    projectRoot,
+		sessionProject: sessionProject,
+		carried:        carried,
+		hostGitRoot:    hostGitRoot,
+		showPath:       showPath,
+		client:         client,
+		providerName:   providerName,
+		providerCfg:    pc,
+		model:          model,
 		// The banner is about to say this, so a later change is measured
 		// against it.
 		knownModel:  model.ID,
@@ -403,9 +546,11 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error 
 		env:         env,
 		limitSource: limitSource,
 		noCloud:     nocloud,
+		gate:        gate,
 		rt:          rt,
 		flags:       f,
 	}
+	gate.found = app.remoteNoCloud
 
 	// An executor that blocks for minutes on its first call reports through
 	// the renderer's own zone.
@@ -458,7 +603,7 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error 
 		Session:  sessionID(app),
 		Provider: providerName,
 		Model:    model.ID,
-		Cwd:      cwd,
+		Cwd:      workspace,
 	}); err == nil {
 		app.peers = reg
 		defer reg.Close()
@@ -480,10 +625,9 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool) error 
 		if opening == "" {
 			return errors.New("nothing to do: pass a prompt, or pipe one in")
 		}
-		if err := app.runTurn(ctx, opening); err != nil {
-			return err
-		}
-		return app.drainWorkers(ctx)
+		lim := app.startLimits(f.limits, started, saveTerminal(screen.ClearTransient))
+		defer lim.stop()
+		return app.runPrint(ctx, opening, lim)
 	}
 
 	return app.repl(ctx, cancel, opening)

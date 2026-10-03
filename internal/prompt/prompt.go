@@ -22,6 +22,10 @@ type Env struct {
 	GitBranch string
 	GitRoot   string
 	IsGitRepo bool
+	// Remote names the machine the tools run on when it is not this one and
+	// not a container on it. Its platform is not known until a tool has run
+	// there, and OS is then empty.
+	Remote string
 }
 
 type Options struct {
@@ -33,6 +37,11 @@ type Options struct {
 	Agents []AgentsFile
 	// ToolNames is used only for the summary line, in the advertised order.
 	ToolNames []string
+	// Carried is what an earlier run in this workspace left for this one. It
+	// is read once at startup, so it is as stable as the rest of the prompt.
+	Carried string
+	// Appended is text the caller gave for this session, added as it is.
+	Appended string
 }
 
 const base = `You are ai-code, a coding agent running in a terminal on a developer's machine.
@@ -97,6 +106,18 @@ func Build(o Options) string {
 		b.WriteString("\n")
 	}
 
+	if t := strings.TrimSpace(o.Appended); t != "" {
+		b.WriteString("\n## Instructions for this session\n\n")
+		b.WriteString(t)
+		b.WriteString("\n")
+	}
+
+	if c := strings.TrimSpace(o.Carried); c != "" {
+		b.WriteString("\n## From your previous run\n\n")
+		b.WriteString(c)
+		b.WriteString("\n")
+	}
+
 	if len(o.Agents) > 0 {
 		b.WriteString("\n## Project instructions\n\n")
 		b.WriteString("These come from AGENTS.md files in this project. They are the " +
@@ -120,8 +141,19 @@ func Build(o Options) string {
 
 func (e Env) describe() string {
 	var b strings.Builder
+	if e.Remote != "" {
+		fmt.Fprintf(&b, "Tools run on: %s, over SSH. Every file you read or write and every command you run is on that machine.\n", e.Remote)
+	}
 	fmt.Fprintf(&b, "Working directory: %s\n", e.Cwd)
-	fmt.Fprintf(&b, "Platform: %s/%s\n", e.OS, e.Arch)
+	if e.Remote != "" {
+		b.WriteString("Instructions for working there may be in an AGENTS.md in the working directory. " +
+			"Check for one before you start, and read it if it is there.\n")
+	}
+	if e.OS != "" {
+		fmt.Fprintf(&b, "Platform: %s/%s\n", e.OS, e.Arch)
+	} else {
+		b.WriteString("Platform: not known in advance; run uname if it matters\n")
+	}
 	if e.Shell != "" {
 		fmt.Fprintf(&b, "Shell: %s\n", e.Shell)
 	}

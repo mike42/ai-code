@@ -2,12 +2,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
-	"os"
 	"os/exec"
-	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +12,8 @@ import (
 	"ai-code/internal/agent"
 	"ai-code/internal/devcontainer"
 	"ai-code/internal/tool"
+	"ai-code/internal/worker"
+	"ai-code/internal/workerbin"
 )
 
 func TestDevcontainerExecutorEndToEnd(t *testing.T) {
@@ -23,12 +22,7 @@ func TestDevcontainerExecutorEndToEnd(t *testing.T) {
 		t.Skipf("no container engine: %v", err)
 	}
 
-	bin := filepath.Join(t.TempDir(), "ai-code")
-	cmd := exec.Command("go", "build", "-o", bin, "ai-code/cmd/ai-code")
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Skipf("could not build static binary: %v\n%s", err, out)
-	}
+	requireWorker(t)
 
 	image := "docker.io/library/python:3.12-slim"
 	if _, err := exec.Command(engine, "image", "exists", image).Output(); err != nil {
@@ -36,7 +30,7 @@ func TestDevcontainerExecutorEndToEnd(t *testing.T) {
 	}
 
 	cfg := &devcontainer.Config{Image: image, WorkspaceFolder: "/workspace"}
-	dc := NewDevcontainerExecutor(cfg, nil, ".", ".", bin)
+	dc := NewDevcontainerExecutor(cfg, nil, ".", ".", worker.Settings{})
 
 	dc.mu.Lock()
 	started := dc.cmd != nil
@@ -115,7 +109,7 @@ func TestFailureReapsTheContainerProcess(t *testing.T) {
 func TestTeardownLetsTheNextCallStartFresh(t *testing.T) {
 	e := &DevcontainerExecutor{
 		cmd:    exec.Command("true"),
-		enc:    json.NewEncoder(io.Discard),
+		client: &worker.Client{},
 		stderr: newCappedBuffer(stderrCap),
 	}
 	e.init = errors.New("stale")
@@ -124,9 +118,9 @@ func TestTeardownLetsTheNextCallStartFresh(t *testing.T) {
 
 	// start() returns early whenever any of these is set, so teardown must
 	// clear them all.
-	if e.cmd != nil || e.init != nil || e.enc != nil || e.dec != nil {
-		t.Errorf("teardown left state behind: cmd=%v init=%v enc=%v dec=%v",
-			e.cmd != nil, e.init != nil, e.enc != nil, e.dec != nil)
+	if e.cmd != nil || e.init != nil || e.client != nil {
+		t.Errorf("teardown left state behind: cmd=%v init=%v client=%v",
+			e.cmd != nil, e.init != nil, e.client != nil)
 	}
 }
 
@@ -134,13 +128,14 @@ func TestTeardownLetsTheNextCallStartFresh(t *testing.T) {
 // each phase is named as it starts.
 func TestDevcontainerStartupNamesItsPhases(t *testing.T) {
 	var notes []tool.Phase
-	e := NewDevcontainerExecutor(nil, nil, t.TempDir(), t.TempDir(), "ai-code")
+	e := NewDevcontainerExecutor(nil, nil, t.TempDir(), t.TempDir(), worker.Settings{})
 	e.SetProgress(func(p tool.Phase) { notes = append(notes, p) })
 
 	// Configuration that never loaded means no container work began, so no
-	// phases may be reported.
-	if _, err := e.Execute(context.Background(), tool.Request{Name: "bash"}); err != nil {
-		t.Fatalf("Execute returned a transport error: %v", err)
+	// phases may be reported, and the run ends as unavailable.
+	var unavailable *tool.Unavailable
+	if _, err := e.Execute(context.Background(), tool.Request{Name: "bash"}); !errors.As(err, &unavailable) {
+		t.Fatalf("Execute returned %v, want tool.Unavailable", err)
 	}
 	if len(notes) != 0 {
 		t.Errorf("phases announced for a startup that never began: %v", notes)
@@ -164,7 +159,7 @@ func TestDevcontainerStartupNamesItsPhases(t *testing.T) {
 // it reports progress, so the wrapper must pass SetProgress through.
 func TestProgressSurvivesTheTaskWrapper(t *testing.T) {
 	var notes []tool.Phase
-	inner := NewDevcontainerExecutor(nil, nil, t.TempDir(), t.TempDir(), "ai-code")
+	inner := NewDevcontainerExecutor(nil, nil, t.TempDir(), t.TempDir(), worker.Settings{})
 	wrapped := agent.NewTaskExecutor(inner)
 
 	pr, ok := tool.Executor(wrapped).(tool.ProgressReporter)
@@ -183,7 +178,7 @@ func TestProgressSurvivesTheTaskWrapper(t *testing.T) {
 // it cannot run while the container is still starting.
 func TestStartupSaysTheTimeoutIsNotRunning(t *testing.T) {
 	var notes []tool.Phase
-	e := NewDevcontainerExecutor(nil, nil, t.TempDir(), t.TempDir(), "ai-code")
+	e := NewDevcontainerExecutor(nil, nil, t.TempDir(), t.TempDir(), worker.Settings{})
 	e.SetProgress(func(p tool.Phase) { notes = append(notes, p) })
 	e.report("devcontainer: preparing the container with %s. The command has not started yet, "+
 		"so its timeout is not running.", "docker")
@@ -196,6 +191,16 @@ func TestStartupSaysTheTimeoutIsNotRunning(t *testing.T) {
 func TestDevcontainerProgressIsOptional(t *testing.T) {
 	var _ tool.ProgressReporter = (*DevcontainerExecutor)(nil)
 
-	e := NewDevcontainerExecutor(nil, nil, t.TempDir(), t.TempDir(), "ai-code")
+	e := NewDevcontainerExecutor(nil, nil, t.TempDir(), t.TempDir(), worker.Settings{})
 	e.report("devcontainer: starting a container from %s.", "example-image")
+}
+
+// requireWorker skips a test that starts a container when this build carries
+// no worker for one. Workers are embedded by build.sh; a plain go test of a
+// fresh checkout has none.
+func requireWorker(t *testing.T) {
+	t.Helper()
+	if _, err := workerbin.For("linux", goruntime.GOARCH); err != nil {
+		t.Skipf("%v (run ./build.sh once to embed them)", err)
+	}
 }

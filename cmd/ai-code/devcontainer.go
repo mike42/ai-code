@@ -1,11 +1,9 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -16,13 +14,14 @@ import (
 	"sync"
 	"time"
 
-	"ai-code/internal/config"
 	"ai-code/internal/devcontainer"
 	"ai-code/internal/tool"
+	"ai-code/internal/worker"
+	"ai-code/internal/workerbin"
 )
 
-// DevcontainerExecutor runs tools inside the project's devcontainer, launching
-// the same binary there in --executor-daemon mode over an attached pipe. The
+// DevcontainerExecutor runs tools inside the project's devcontainer, running
+// the worker for the image's platform there over an attached pipe. The
 // container starts on the first Execute call, not at startup.
 type DevcontainerExecutor struct {
 	// cfg is the parsed devcontainer.json.
@@ -32,8 +31,12 @@ type DevcontainerExecutor struct {
 	cfgErr error
 	// project is the host directory mounted into the container.
 	project string
-	// binary is the path to this ai-code binary on the host.
-	binary string
+	// settings are sent to every worker; catalog advertises the same tools
+	// before the container exists.
+	settings worker.Settings
+	catalog  *tool.LocalExecutor
+	// workerPath is the worker on this machine, mounted into the container.
+	workerPath string
 	// workdir is the container path the daemon starts in.
 	workdir string
 	// progress names each startup phase as it is reached.
@@ -45,11 +48,12 @@ type DevcontainerExecutor struct {
 	// second daemon inside it, so agents share a filesystem.
 	host *DevcontainerExecutor
 
-	mu   sync.Mutex
-	cmd  *exec.Cmd
-	enc  *json.Encoder
-	dec  *json.Decoder
-	init error
+	mu     sync.Mutex
+	cmd    *exec.Cmd
+	client *worker.Client
+	init   error
+	// answered: a worker that fails before its first answer is broken.
+	answered bool
 	// cid is the container this executor started, from --cidfile; engine is the
 	// command that started it, and forks exec into cid.
 	cid    string
@@ -82,12 +86,9 @@ func (b *cappedBuffer) String() string { return string(b.buf) }
 
 // NewDevcontainerExecutor wires up a lazily-started devcontainer executor.
 // project is the mount source; cwd is the launch directory.
-func NewDevcontainerExecutor(cfg *devcontainer.Config, cfgErr error, project, cwd, binary string) *DevcontainerExecutor {
-	// The mount source must be absolute or the engine resolves it against its own cwd.
-	if abs, err := filepath.Abs(binary); err == nil {
-		binary = abs
-	}
-	e := &DevcontainerExecutor{cfg: cfg, cfgErr: cfgErr, project: project, binary: binary}
+func NewDevcontainerExecutor(cfg *devcontainer.Config, cfgErr error, project, cwd string, settings worker.Settings) *DevcontainerExecutor {
+	e := &DevcontainerExecutor{cfg: cfg, cfgErr: cfgErr, project: project,
+		settings: settings, catalog: worker.Tools(settings, "")}
 	if cfg != nil {
 		e.workdir = mountCwd(project, cwd, cfg.WorkspaceFolder)
 	} else {
@@ -175,14 +176,18 @@ func (e *DevcontainerExecutor) start(ctx context.Context) error {
 		return err
 	}
 
-	argv := e.cfg.RunArgv(e.project, e.workdir, e.binary, binInContainer)
+	if e.workerPath, err = workerForImage(engine, image); err != nil {
+		e.init = err
+		return err
+	}
+	argv := e.cfg.RunArgv(e.project, e.workdir, e.workerPath, binInContainer)
 
 	// --cidfile after RunArgv binds the id to the container actually created;
 	// the name is fresh because the engine refuses an existing file.
 	cidfile := filepath.Join(os.TempDir(), fmt.Sprintf("ai-code-cid-%d-%d", os.Getpid(), time.Now().UnixNano()))
 	os.Remove(cidfile)
 	argv = append(argv, "--cidfile", cidfile)
-	argv = append(argv, image, "--executor-daemon", e.workdir)
+	argv = append(argv, image)
 	e.engine = engine
 
 	// The engine pulls a missing image during run, so only report a real pull.
@@ -228,13 +233,15 @@ func (e *DevcontainerExecutor) start(ctx context.Context) error {
 	}()
 
 	e.cmd = cmd
-	e.enc = json.NewEncoder(stdin)
-	e.dec = json.NewDecoder(bufio.NewReader(stdout))
+	if e.client, err = worker.NewClient(stdin, stdout, e.settings); err != nil {
+		e.init = fmt.Errorf("the worker in the container did not start: %w", err)
+		return e.init
+	}
 	e.cid = readCIDFile(cidfile)
 	return nil
 }
 
-// binInContainer is where this binary is mounted inside the container.
+// binInContainer is where the worker is mounted inside the container.
 const binInContainer = "/ai-code-bin"
 
 // readCIDFile waits briefly for the engine to record the container id, which
@@ -263,12 +270,13 @@ func (e *DevcontainerExecutor) Fork() (tool.Executor, error) {
 		host = e.host
 	}
 	return &DevcontainerExecutor{
-		cfg:     e.cfg,
-		cfgErr:  e.cfgErr,
-		project: e.project,
-		binary:  e.binary,
-		workdir: e.workdir,
-		host:    host,
+		cfg:      e.cfg,
+		cfgErr:   e.cfgErr,
+		project:  e.project,
+		settings: e.settings,
+		catalog:  e.catalog,
+		workdir:  e.workdir,
+		host:     host,
 	}, nil
 }
 
@@ -311,7 +319,7 @@ func (e *DevcontainerExecutor) startForked(ctx context.Context) error {
 	} else if e.cfg.RemoteUser != "" {
 		argv = append(argv, "--user", e.cfg.RemoteUser)
 	}
-	argv = append(argv, cid, binInContainer, "--executor-daemon", e.workdir)
+	argv = append(argv, cid, binInContainer)
 
 	cmd := exec.CommandContext(context.Background(), engine, argv...)
 	stdin, err := cmd.StdinPipe()
@@ -339,8 +347,10 @@ func (e *DevcontainerExecutor) startForked(ctx context.Context) error {
 	go func() { io.Copy(stderr, stderrPipe) }()
 
 	e.cmd = cmd
-	e.enc = json.NewEncoder(stdin)
-	e.dec = json.NewDecoder(bufio.NewReader(stdout))
+	if e.client, err = worker.NewClient(stdin, stdout, e.settings); err != nil {
+		e.init = fmt.Errorf("the worker shell in the container did not start: %w", err)
+		return e.init
+	}
 	return nil
 }
 
@@ -394,29 +404,37 @@ func (e *DevcontainerExecutor) Execute(ctx context.Context, req tool.Request) (t
 	defer e.mu.Unlock()
 
 	if err := e.start(ctx); err != nil {
-		return tool.Errorf("devcontainer unavailable: %v%s", err, e.stderrTail()), nil
+		if ctx.Err() != nil {
+			return tool.Errorf("devcontainer: interrupted while starting: %v", err), nil
+		}
+		return tool.Result{}, &tool.Unavailable{Err: fmt.Errorf("the devcontainer is unavailable: %v%s", err, e.stderrTail())}
 	}
 
-	if err := e.enc.Encode(req); err != nil {
+	res, err := e.client.Call(ctx, req)
+	if worker.IsUnsent(err) {
 		// Nothing was delivered, so re-running cannot double-execute.
 		first := e.failure("write", err)
 		e.teardown()
 		if err := e.start(ctx); err != nil {
-			return tool.Errorf("%s\n\nRestarting it failed too: %v%s", first, err, e.stderrTail()), nil
+			return tool.Result{}, &tool.Unavailable{Err: fmt.Errorf("%s\n\nRestarting it failed too: %v%s", first, err, e.stderrTail())}
 		}
-		if err := e.enc.Encode(req); err != nil {
-			return tool.Errorf("%s\n\nA freshly started container failed the same way: %v%s",
-				first, err, e.stderrTail()), nil
+		res, err = e.client.Call(ctx, req)
+		if worker.IsUnsent(err) {
+			return tool.Result{}, &tool.Unavailable{Err: fmt.Errorf("%s\n\nA freshly started container failed the same way: %v%s",
+				first, err, e.stderrTail())}
 		}
 	}
-
-	var res tool.Result
-	if err := e.dec.Decode(&res); err != nil {
+	if err != nil {
 		// Not retried: the request was delivered, so a write or edit may have run.
 		msg := e.failure("read", err)
+		answered := e.answered
 		e.teardown()
+		if !answered {
+			return tool.Result{}, &tool.Unavailable{Err: fmt.Errorf("the worker in the container stopped before it answered anything: %s", msg)}
+		}
 		return tool.Errorf("%s", msg), nil
 	}
+	e.answered = true
 	if !e.ready {
 		// The first reply is the first evidence the container daemon answers.
 		e.ready = true
@@ -444,26 +462,15 @@ func (e *DevcontainerExecutor) failure(op string, err error) string {
 func (e *DevcontainerExecutor) teardown() {
 	e.ready = false
 	e.cmd = nil
-	e.enc = nil
-	e.dec = nil
+	e.client = nil
 	e.init = nil
+	e.answered = false
 	e.stderr = nil
 }
 
-// Definitions advertises the same tools as the local executor, built locally.
-func (e *DevcontainerExecutor) Definitions() []tool.Definition {
-	cfg, err := config.Load(e.project)
-	if err != nil {
-		return nil
-	}
-	exec, _ := buildTools(cfg, e.project, 0)
-	return exec.Definitions()
-}
+func (e *DevcontainerExecutor) Definitions() []tool.Definition { return e.catalog.Definitions() }
 
-// IsReadOnly reports whether a tool is safe to run concurrently.
-func (e *DevcontainerExecutor) IsReadOnly(name string) bool {
-	return isReadOnlyLocally(e.project, name)
-}
+func (e *DevcontainerExecutor) IsReadOnly(name string) bool { return e.catalog.IsReadOnly(name) }
 
 // Close tears down the container.
 func (e *DevcontainerExecutor) Close() error {
@@ -501,14 +508,55 @@ func detectContainerEngine() (string, error) {
 	return "", fmt.Errorf("no container engine found (tried podman, docker)")
 }
 
-// isReadOnlyLocally mirrors the local executor's read-only map without a container.
-func isReadOnlyLocally(project, name string) bool {
-	cfg, err := config.Load(project)
+// workerForImage caches the worker for the image's platform, which is asked of
+// the engine rather than assumed to be this machine's, and returns its path.
+func workerForImage(engine, image string) (string, error) {
+	out, err := exec.Command(engine, "image", "inspect", "--format", "{{.Os}}/{{.Architecture}}", image).Output()
 	if err != nil {
-		return false
+		return "", fmt.Errorf("asking %s what platform %s is for: %w", filepath.Base(engine), image, err)
 	}
-	exec, _ := buildTools(cfg, project, 0)
-	return exec.IsReadOnly(name)
+	goos, goarch, ok := strings.Cut(strings.TrimSpace(string(out)), "/")
+	if !ok || goos == "" || goarch == "" {
+		return "", fmt.Errorf("%s reported the platform of %s as %q", filepath.Base(engine), image, strings.TrimSpace(string(out)))
+	}
+	bin, err := workerbin.For(goos, goarch)
+	if err != nil {
+		return "", fmt.Errorf("the image %s is %s/%s: %w", image, goos, goarch, err)
+	}
+	return cacheWorker(bin)
+}
+
+// cacheWorker writes bin to the cache, named by its content, and returns the path.
+func cacheWorker(bin []byte) (string, error) {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(bin)
+	path := filepath.Join(dir, "ai-code", "workers", "ai-code-worker-"+hex.EncodeToString(sum[:])[:16])
+	if fi, err := os.Stat(path); err == nil && fi.Size() == int64(len(bin)) {
+		return path, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".worker-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(bin); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if err := tmp.Chmod(0o755); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	return path, os.Rename(tmp.Name(), path)
 }
 
 // devcontainerID is the value of ${devcontainerId}: stable for a project, so

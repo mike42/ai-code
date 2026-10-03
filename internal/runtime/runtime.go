@@ -5,27 +5,24 @@ package runtime
 
 import (
 	"fmt"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"ai-code/internal/devcontainer"
 )
 
-// Kind identifies where tools execute.
 type Kind string
 
 const (
-	// KindDevcontainer runs tools inside the project's devcontainer.
 	KindDevcontainer Kind = "devcontainer"
-	// KindSSH runs tools on a remote machine, used as a sandbox.
-	KindSSH Kind = "ssh"
-	// KindHost runs tools directly on this machine, with no sandbox.
-	KindHost Kind = "host"
+	KindSSH          Kind = "ssh"
+	KindHost         Kind = "host"
 )
 
-// Runtime is a fully resolved execution environment. It is produced by Resolve
-// and is immutable for the life of a session.
 type Runtime struct {
 	Kind Kind
 
@@ -34,21 +31,23 @@ type Runtime struct {
 	// the build inputs in Config instead.
 	Image string
 
-	// Config is the parsed devcontainer.json, when Kind is KindDevcontainer.
 	Config *devcontainer.Config
 
 	// ConfigErr is set when a devcontainer.json was found but could not be
 	// parsed; Resolve still returns the runtime and the error surfaces later.
 	ConfigErr error
 
-	// SSH destination ("user@host:port"), when Kind is KindSSH.
 	Remote string
+	// Empty user or port is left to ssh config; empty Dir is the remote home.
+	SSHUser string
+	SSHHost string
+	SSHPort string
+	SSHDir  string
 
 	// Explicit records whether this runtime was chosen on the command line.
 	Explicit bool
 }
 
-// Describe returns a short human-readable label for the banner.
 func (r *Runtime) Describe() string {
 	switch r.Kind {
 	case KindDevcontainer:
@@ -60,10 +59,14 @@ func (r *Runtime) Describe() string {
 		}
 		return "devcontainer (no image configured)"
 	case KindSSH:
-		return "ssh://" + r.Remote
+		return r.sshURL()
 	default:
 		return "HOST - NO SANDBOX"
 	}
+}
+
+func (r *Runtime) sshURL() string {
+	return "ssh://" + r.Remote + r.SSHDir
 }
 
 // ShortLabel is a compact banner label: the sandbox kind is the signal.
@@ -72,29 +75,25 @@ func (r *Runtime) ShortLabel() string {
 	case KindDevcontainer:
 		return "devcontainer"
 	case KindSSH:
-		return "ssh://" + r.Remote
+		return r.sshURL()
 	default:
 		return "HOST - NO SANDBOX"
 	}
 }
 
-// Sandboxed reports whether this runtime provides isolation.
 func (r *Runtime) Sandboxed() bool { return r.Kind != KindHost }
 
-// flagValue returns the canonical --runtime value for this runtime.
 func (r *Runtime) flagValue() string {
 	switch r.Kind {
 	case KindDevcontainer:
 		return "devcontainer"
 	case KindSSH:
-		return "ssh://" + r.Remote
+		return r.sshURL()
 	default:
 		return "host"
 	}
 }
 
-// FlagValue returns the canonical --runtime value for this runtime, for
-// recording in a session transcript.
 func (r *Runtime) FlagValue() string { return r.flagValue() }
 
 // ErrNoRuntime is returned when no --runtime flag was given and no devcontainer
@@ -107,7 +106,8 @@ func (e ErrNoRuntime) Error() string {
 Refusing to run tools without knowing where. Choose one explicitly:
 
     ai-code --runtime devcontainer     (requires .devcontainer/devcontainer.json)
-    ai-code --runtime ssh://buildvm    (a VM or remote machine as the sandbox)
+    ai-code --runtime ssh://user@buildvm/home/user/work
+                                       (a VM or remote machine as the sandbox)
     ai-code --runtime host             (NO SANDBOX - run directly on this machine)
 `
 }
@@ -126,8 +126,6 @@ Create one of:
 or choose a different environment.`
 }
 
-// ParseFlag turns a --runtime value into a partial runtime. An empty value
-// means "not specified" and is resolved against the filesystem by Resolve.
 func ParseFlag(value string) (*Runtime, error) {
 	switch {
 	case value == "":
@@ -137,15 +135,46 @@ func ParseFlag(value string) (*Runtime, error) {
 	case value == "host":
 		return &Runtime{Kind: KindHost, Explicit: true}, nil
 	case strings.HasPrefix(value, "ssh://"):
-		dest := strings.TrimPrefix(value, "ssh://")
-		if dest == "" {
-			return nil, fmt.Errorf("--runtime ssh:// needs a host, e.g. ssh://buildvm")
-		}
-		return &Runtime{Kind: KindSSH, Remote: dest, Explicit: true}, nil
+		return parseSSH(value)
 	default:
 		return nil, fmt.Errorf(
-			"invalid --runtime %q: must be \"devcontainer\", \"ssh://HOST\", or \"host\"", value)
+			"invalid --runtime %q: must be \"devcontainer\", \"ssh://[USER@]HOST[:PORT][/DIR]\", or \"host\"", value)
 	}
+}
+
+// parseSSH reads ssh://[USER@]HOST[:PORT][/DIR], DIR absolute on the remote.
+func parseSSH(value string) (*Runtime, error) {
+	usage := "--runtime ssh:// takes [USER@]HOST[:PORT][/DIR], e.g. ssh://agent@buildvm/home/agent/work"
+	u, err := url.Parse(value)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %v", usage, err)
+	}
+	if u.Hostname() == "" {
+		return nil, fmt.Errorf("%s: no host given", usage)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("%s: %q has a query or fragment, which mean nothing here", usage, value)
+	}
+	if _, set := u.User.Password(); set {
+		return nil, fmt.Errorf("%s: a password does not belong in the URL; use a key or ssh's own configuration", usage)
+	}
+	r := &Runtime{Kind: KindSSH, Explicit: true, SSHHost: u.Hostname(), SSHPort: u.Port()}
+	if u.User != nil {
+		r.SSHUser = u.User.Username()
+	}
+	if r.SSHPort != "" {
+		if n, err := strconv.Atoi(r.SSHPort); err != nil || n < 1 || n > 65535 {
+			return nil, fmt.Errorf("%s: %q is not a port", usage, r.SSHPort)
+		}
+	}
+	if u.Path != "" && u.Path != "/" {
+		r.SSHDir = path.Clean(u.Path)
+	}
+	r.Remote = u.Host
+	if r.SSHUser != "" {
+		r.Remote = r.SSHUser + "@" + u.Host
+	}
+	return r, nil
 }
 
 // DevcontainerPath returns the path to a devcontainer configuration file in dir
@@ -184,28 +213,24 @@ func Resolve(flag string, cwd string) (*Runtime, error) {
 		return nil, err
 	}
 
-	dcPath := DevcontainerPath(cwd)
-	hasDC := dcPath != ""
-
 	if partial != nil {
 		switch partial.Kind {
 		case KindDevcontainer:
-			if !hasDC {
+			dcPath := DevcontainerPath(cwd)
+			if dcPath == "" {
 				return nil, ErrNoDevcontainer{}
 			}
 			// The configuration is read on the explicit path too: /restart
 			// re-execs with --runtime devcontainer.
 			loadInto(partial, dcPath)
 			return partial, nil
-		case KindSSH:
-			return nil, fmt.Errorf("--runtime ssh:// is not implemented yet; use devcontainer or host")
 		}
 		return partial, nil
 	}
 
 	// No flag given: the only acceptable implicit decision is the safe one, a
 	// configured devcontainer.
-	if hasDC {
+	if dcPath := DevcontainerPath(cwd); dcPath != "" {
 		rt := &Runtime{Kind: KindDevcontainer}
 		loadInto(rt, dcPath)
 		return rt, nil

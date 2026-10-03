@@ -59,7 +59,6 @@ type Entry struct {
 	Cut int `json:"cut,omitempty"`
 }
 
-// Meta is written once at the head of every session.
 type Meta struct {
 	ID         string    `json:"id"`
 	Started    time.Time `json:"started"`
@@ -79,7 +78,6 @@ type Session struct {
 	w    *bufio.Writer
 }
 
-// Root is the directory sessions live under.
 func Root() (string, error) {
 	if d := os.Getenv("AI_CODE_DATA_DIR"); d != "" {
 		return d, nil
@@ -109,11 +107,39 @@ func projectKey(project string) string {
 }
 
 func dirFor(project string) (string, error) {
+	if stateDir != "" {
+		return filepath.Join(stateDir, "sessions"), nil
+	}
 	root, err := Root()
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(root, "sessions", projectKey(project)), nil
+}
+
+var stateDir string
+
+// SetStateDir puts this process's sessions and workspace files under dir.
+func SetStateDir(dir string) error {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	stateDir = abs
+	return nil
+}
+
+// WorkspaceDir is per working directory (local path or ssh:// URL), so agents
+// in different directories never share files.
+func WorkspaceDir(where string) (string, error) {
+	if stateDir != "" {
+		return stateDir, nil
+	}
+	root, err := Root()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "workspaces", projectKey(where)), nil
 }
 
 // NewID returns a lexically sortable identifier: name order is time order.
@@ -123,7 +149,6 @@ func NewID() string {
 	return fmt.Sprintf("%s-%s", time.Now().UTC().Format("20060102T150405"), hex.EncodeToString(b[:]))
 }
 
-// Create starts a new session file.
 func Create(meta Meta) (*Session, error) {
 	if meta.ID == "" {
 		meta.ID = NewID()
@@ -155,7 +180,6 @@ func Create(meta Meta) (*Session, error) {
 	return s, nil
 }
 
-// Open reopens an existing session for appending.
 func Open(project, id string) (*Session, []Entry, error) {
 	dir, err := dirFor(project)
 	if err != nil {
@@ -207,8 +231,7 @@ func (s *Session) Close() error {
 	return nil
 }
 
-// readFile parses a transcript. A truncated final line is tolerated: a crash
-// mid-write should cost the last entry, not the whole session.
+// readFile tolerates a truncated final line from a crash mid-write.
 func readFile(path string) ([]Entry, Meta, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -232,7 +255,6 @@ func readFile(path string) ([]Entry, Meta, error) {
 		}
 		var e Entry
 		if err := json.Unmarshal(line, &e); err != nil {
-			// Almost certainly a partial final line from an interrupted write.
 			continue
 		}
 		if e.Type == EntryMeta && e.Meta != nil {
@@ -302,7 +324,6 @@ func Inputs(entries []Entry) []string {
 	return out
 }
 
-// Info summarises a session for listings.
 type Info struct {
 	ID       string
 	Path     string
@@ -315,7 +336,6 @@ type Info struct {
 	Size     int64
 }
 
-// List returns the sessions recorded for a project, newest first.
 func List(project string) ([]Info, error) {
 	dir, err := dirFor(project)
 	if err != nil {
@@ -368,7 +388,6 @@ func List(project string) ([]Info, error) {
 	return out, nil
 }
 
-// Latest returns the most recently modified session for a project.
 func Latest(project string) (*Info, error) {
 	all, err := List(project)
 	if err != nil {

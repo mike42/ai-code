@@ -42,6 +42,11 @@ type Options struct {
 }
 
 type Agent struct {
+	// unavailable is set by a tool call that found nowhere to run, and ends
+	// the run once that round of results is in. Calls run concurrently.
+	unavailableMu sync.Mutex
+	unavailable   *tool.Unavailable
+
 	client   provider.Client
 	model    string
 	exec     tool.Executor
@@ -410,6 +415,18 @@ func (a *Agent) Run(ctx context.Context, userInput string) error {
 		a.messages = append(a.messages, results...)
 		a.publish()
 
+		// The results are in, so the conversation is well formed, and there
+		// is nowhere for the tools to run. Another request would only hand
+		// the model an error it cannot do anything about.
+		a.unavailableMu.Lock()
+		unavailable := a.unavailable
+		a.unavailable = nil
+		a.unavailableMu.Unlock()
+		if unavailable != nil {
+			a.emit(Event{Kind: EvDone, Text: "unavailable", Context: ptr(a.ContextState())})
+			return unavailable
+		}
+
 		a.stuck.observe(raw)
 		if s := a.stuck.suggestion(); s != "" {
 			a.emit(Event{Kind: EvNotice, Level: LevelInfo, Text: s})
@@ -570,6 +587,14 @@ func (a *Agent) dispatch(ctx context.Context, calls []provider.ToolCall) ([]prov
 		res, err := a.exec.Execute(ctx, tool.Request{
 			CallID: tc.ID, Name: tc.Name, Args: []byte(tc.Args),
 		})
+		var unavailable *tool.Unavailable
+		if errors.As(err, &unavailable) {
+			a.unavailableMu.Lock()
+			if a.unavailable == nil {
+				a.unavailable = unavailable
+			}
+			a.unavailableMu.Unlock()
+		}
 		if err != nil {
 			// The executor failed, not the tool; it still has to become a
 			// tool result, because an unanswered call breaks the next request.

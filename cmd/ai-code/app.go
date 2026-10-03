@@ -25,9 +25,19 @@ import (
 
 // App holds the wiring for one interactive session.
 type App struct {
-	cfg          *config.Config
-	cwd          string
-	projectRoot  string
+	cfg *config.Config
+	// cwd is where ai-code was started, or empty when the tools run on
+	// another machine and this one's directory means nothing.
+	cwd         string
+	projectRoot string
+	// sessionProject is what sessions are filed under: the project root, or
+	// the ssh:// URL when the tools run on another machine.
+	sessionProject string
+	// carried is what a previous run in this workspace left for this one.
+	carried string
+
+	turnMu       sync.Mutex
+	turnCancel   context.CancelFunc
 	client       provider.Client
 	providerName string
 	providerCfg  config.Provider
@@ -37,6 +47,9 @@ type App struct {
 	// noCloud is true when a .nocloud file marks the tree; cloud providers are
 	// then unavailable.
 	noCloud bool
+	// gate holds every request until it is known whether this session may
+	// use a cloud provider at all. See cloudGate.
+	gate *cloudGate
 
 	// hostGitRoot is the repository root on this machine, where AGENTS.md is read.
 	hostGitRoot string
@@ -112,7 +125,7 @@ type App struct {
 func (a *App) openSession(f *flags) error {
 	id := f.resume
 	if f.continueLast && id == "" {
-		latest, err := session.Latest(a.projectRoot)
+		latest, err := session.Latest(a.sessionProject)
 		if err != nil {
 			return err
 		}
@@ -120,7 +133,7 @@ func (a *App) openSession(f *flags) error {
 	}
 
 	if id != "" {
-		s, entries, err := session.Open(a.projectRoot, id)
+		s, entries, err := session.Open(a.sessionProject, id)
 		if err != nil {
 			return err
 		}
@@ -131,7 +144,7 @@ func (a *App) openSession(f *flags) error {
 		a.resumedSummary, a.resumedThrough, a.resumedCut = session.Checkpoint(entries)
 		a.recordedSummary = a.resumedSummary
 
-		if s.Meta.Project != "" && s.Meta.Project != a.projectRoot {
+		if s.Meta.Project != "" && s.Meta.Project != a.sessionProject {
 			// A moved or renamed repository: say so rather than resume stale paths.
 			a.note(fmt.Sprintf("This session was recorded in %s, which is not where you are now. "+
 				"File paths in its history may be stale.", s.Meta.Project))
@@ -140,7 +153,7 @@ func (a *App) openSession(f *flags) error {
 	}
 
 	s, err := session.Create(session.Meta{
-		Project:  a.projectRoot,
+		Project:  a.sessionProject,
 		Provider: a.providerName,
 		Model:    a.model.ID,
 		Mode:     a.modeName,
@@ -223,6 +236,14 @@ func (a *App) runTurn(parent context.Context, input string) error {
 	restore := installInterrupt(cancel)
 	defer restore()
 	defer cancel()
+	a.turnMu.Lock()
+	a.turnCancel = cancel
+	a.turnMu.Unlock()
+	defer func() {
+		a.turnMu.Lock()
+		a.turnCancel = nil
+		a.turnMu.Unlock()
+	}()
 
 	// Take what is loaded and declare this session working on it, under the swap lock.
 	a.claimModel(ctx)
@@ -267,6 +288,15 @@ func (a *App) runTurn(parent context.Context, input string) error {
 		err, a.turnErr = a.turnErr, nil
 	}
 	return err
+}
+
+// cancelTurn stops the running turn, if any, as Ctrl-C would.
+func (a *App) cancelTurn() {
+	a.turnMu.Lock()
+	defer a.turnMu.Unlock()
+	if a.turnCancel != nil {
+		a.turnCancel()
+	}
 }
 
 // startSteering opens the terminal for input while the turn runs and returns a
@@ -469,6 +499,22 @@ func (a *App) echoTypedPrompt(text string) {
 	a.echoPrompt(text)
 }
 
+func (a *App) cloudForbidden() bool {
+	return a.noCloud || (a.gate != nil && a.gate.forbidsCloud())
+}
+
+func (a *App) remoteNoCloud(marker string) {
+	a.note(fmt.Sprintf("%s marks the remote working directory: this session is restricted to on-premises providers.", marker))
+}
+
+// where is the session's working directory, local or remote.
+func (a *App) where() string {
+	if a.cwd == "" && a.rt != nil {
+		return a.rt.FlagValue()
+	}
+	return a.cwd
+}
+
 // runtimeLabel is the canonical --runtime value for the session, fixed for its lifetime.
 func (a *App) runtimeLabel() string {
 	if a.rt == nil {
@@ -514,7 +560,7 @@ func (a *App) banner() {
 			style.Dim(ctx),
 			rtLine),
 		style.Dim(fmt.Sprintf("%s · /help for commands, Ctrl-G to open an editor",
-			a.cwd)),
+			a.where())),
 		"",
 	)
 }
@@ -746,13 +792,27 @@ func (a *App) rebuildSystemPrompt(modePrompt string) {
 		ModePrompt: modePrompt,
 		Agents:     a.projectInstructions(),
 		ToolNames:  prompt.SortedToolNames(names),
+		Carried:    a.carried,
+		Appended:   a.appendedPrompt(),
 	}))
+}
+
+func (a *App) appendedPrompt() string {
+	if a.flags == nil {
+		return ""
+	}
+	return a.flags.appendPrompt
 }
 
 // projectInstructions finds the AGENTS.md files for this session and names
 // them the way the model can use. Discovery walks this machine, bounded by the
 // host git root, not env.GitRoot, which holds the container's path.
 func (a *App) projectInstructions() []prompt.AgentsFile {
+	if a.cwd == "" {
+		// Nothing on this machine is the remote project's, so nothing here
+		// is read on its behalf. The prompt tells the model to look there.
+		return nil
+	}
 	files := prompt.DiscoverAgents(a.cwd, a.hostGitRoot)
 	if a.showPath == nil {
 		return files
@@ -814,6 +874,24 @@ func (a *App) restartArgv(binary string) []string {
 		argv = append(argv, "--think", string(e))
 	}
 	if a.flags != nil {
+		if len(a.flags.enableTools) > 0 {
+			argv = append(argv, "--enable-tools", strings.Join(a.flags.enableTools, ","))
+		}
+		if len(a.flags.disableTools) > 0 {
+			argv = append(argv, "--disable-tools", strings.Join(a.flags.disableTools, ","))
+		}
+		if a.flags.noCloud {
+			argv = append(argv, "--no-cloud")
+		}
+		if a.flags.appendPrompt != "" {
+			argv = append(argv, "--append-system-prompt", a.flags.appendPrompt)
+		}
+		if a.flags.stateDir != "" {
+			argv = append(argv, "--state-dir", a.flags.stateDir)
+		}
+		if a.flags.sshConfig != "" {
+			argv = append(argv, "--ssh-config", a.flags.sshConfig)
+		}
 		if a.flags.verbose {
 			argv = append(argv, "--verbose")
 		}
@@ -830,7 +908,7 @@ func isRestart(err error) bool {
 }
 
 func (a *App) cmdSessionList(ctx context.Context, args string) error {
-	list, err := session.List(a.projectRoot)
+	list, err := session.List(a.sessionProject)
 	if err != nil {
 		return err
 	}
@@ -895,7 +973,7 @@ func (a *App) setVerbose(on bool) error {
 func (a *App) cmdNew(ctx context.Context, args string) error {
 	a.closeSession()
 	s, err := session.Create(session.Meta{
-		Project: a.projectRoot, Provider: a.providerName,
+		Project: a.sessionProject, Provider: a.providerName,
 		Model: a.model.ID, Mode: a.modeName, Version: version,
 	})
 	if err != nil {

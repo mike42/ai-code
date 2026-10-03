@@ -17,6 +17,10 @@ import (
 func (a *App) complete(line string) (int, []string) {
 	name, argAt, arg, ok := commandContext(line)
 	if !ok {
+		if a.cwd == "" {
+			// This machine's paths are not the remote one's.
+			return 0, nil
+		}
 		return completePath(a.cwd, a.projectRoot, line)
 	}
 	if argAt < 0 {
@@ -65,7 +69,7 @@ func (a *App) modelCandidates(prefix string) []string {
 		return nil
 	}
 	// Under .nocloud a cloud model's name is never shown.
-	if a.noCloud && a.client.Class() == provider.ClassCloud {
+	if a.cloudForbidden() && a.client.Class() == provider.ClassCloud {
 		return nil
 	}
 	// Tab never reaches the network: only the on-disk catalogue is read, expiry ignored.

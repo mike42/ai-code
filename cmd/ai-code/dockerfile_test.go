@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,6 +11,7 @@ import (
 	"ai-code/internal/devcontainer"
 	"ai-code/internal/runtime"
 	"ai-code/internal/tool"
+	"ai-code/internal/worker"
 )
 
 // Unit tests over argv cannot prove the image really builds, the daemon starts
@@ -53,16 +53,9 @@ func TestDockerfileDevcontainerRunsTools(t *testing.T) {
 		t.Errorf("RunArgs = %v, want [--userns=keep-id]", rt.Config.RunArgs)
 	}
 
-	// The example's image is a different userspace from the one that built
-	// this test, so the binary must be static.
-	bin := filepath.Join(t.TempDir(), "ai-code")
-	build := exec.Command("go", "build", "-o", bin, "ai-code/cmd/ai-code")
-	build.Env = append(os.Environ(), "CGO_ENABLED=0")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Skipf("could not build static binary: %v\n%s", err, out)
-	}
+	requireWorker(t)
 
-	dc := NewDevcontainerExecutor(rt.Config, nil, example, example, bin)
+	dc := NewDevcontainerExecutor(rt.Config, nil, example, example, worker.Settings{})
 	defer dc.Close()
 
 	// Build and container start are deferred to the first tool call, never to

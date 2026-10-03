@@ -177,3 +177,40 @@ func TestPromptMentionsToolsAndMode(t *testing.T) {
 		t.Error("tool names are missing from the prompt")
 	}
 }
+
+func TestRemoteEnvironmentAndCarriedNotes(t *testing.T) {
+	out := Build(Options{
+		Env:     Env{Cwd: "/home/agent/work", Remote: "agent@buildvm"},
+		Carried: "Your last status update: parser done.",
+	})
+	for _, want := range []string{
+		"Tools run on: agent@buildvm, over SSH.",
+		"Working directory: /home/agent/work",
+		"Platform: not known in advance",
+		"Check for one before you start, and read it if it is there.",
+		"## From your previous run\n\nYour last status update: parser done.",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("prompt lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "Platform: /") {
+		t.Error("an unknown platform was printed as an empty one")
+	}
+	if strings.Contains(Build(Options{Env: Env{Cwd: "/x", OS: "linux", Arch: "amd64"}}), "previous run") {
+		t.Error("an empty carried section was printed")
+	}
+}
+
+func TestAppendedInstructions(t *testing.T) {
+	out := Build(Options{Env: Env{Cwd: "/w", OS: "linux", Arch: "amd64"}, Appended: "You are the reviewer."})
+	if !strings.Contains(out, "## Instructions for this session\n\nYou are the reviewer.\n") {
+		t.Errorf("appended text missing:\n%s", out)
+	}
+	if strings.Contains(Build(Options{Env: Env{Cwd: "/w"}}), "Instructions for this session") {
+		t.Error("an empty section was printed")
+	}
+	if strings.Contains(Build(Options{Env: Env{Cwd: "/w", OS: "linux"}}), "AGENTS.md in the working directory") {
+		t.Error("a local session was told to look for an AGENTS.md it has already been given")
+	}
+}

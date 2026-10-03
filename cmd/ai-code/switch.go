@@ -58,6 +58,9 @@ func (a *App) cmdProvider(ctx context.Context, args string) error {
 		lines := []string{""}
 		for _, name := range a.cfg.ProviderNames() {
 			p := a.cfg.Provider[name]
+			if a.cloudForbidden() && p.Class == string(provider.ClassCloud) {
+				continue
+			}
 			marker := "  "
 			if name == a.providerName {
 				marker = "* "
@@ -83,7 +86,14 @@ func (a *App) cmdProvider(ctx context.Context, args string) error {
 	if err != nil {
 		return fmt.Errorf("provider %q: %w", args, err)
 	}
-	if a.noCloud && class == provider.ClassCloud {
+	if class == provider.ClassCloud && a.gate != nil {
+		// Whether the remote working directory forbids this has to be known
+		// before the provider is contacted at all, catalogue included.
+		if err := a.gate.settle(ctx); err != nil {
+			return err
+		}
+	}
+	if a.cloudForbidden() && class == provider.ClassCloud {
 		return errCloudForbiddenHere
 	}
 	confirmed := false
@@ -99,6 +109,9 @@ func (a *App) cmdProvider(ctx context.Context, args string) error {
 	if err != nil {
 		return err
 	}
+	if a.gate != nil {
+		client = a.gate.wrap(client)
+	}
 	model, err := resolveModel(ctx, client, "", pc.DefaultModel)
 	if err != nil {
 		return err
@@ -108,7 +121,7 @@ func (a *App) cmdProvider(ctx context.Context, args string) error {
 
 // errCloudForbiddenHere is what a .nocloud tree answers.
 var errCloudForbiddenHere = errors.New(
-	"a .nocloud file is present, so this session is restricted to on-premises providers")
+	"--no-cloud or a .nocloud file applies, so this session is restricted to on-premises providers")
 
 // switchTo moves the live session onto a different model or provider. A move
 // to a cloud provider is confirmed explicitly, with the payload stated;
@@ -118,7 +131,7 @@ func (a *App) switchTo(ctx context.Context, client provider.Client, name string,
 
 	// In a .nocloud tree a cloud provider is unavailable, not merely confirmed
 	// away.
-	if a.noCloud && client.Class() == provider.ClassCloud {
+	if a.cloudForbidden() && client.Class() == provider.ClassCloud {
 		return errCloudForbiddenHere
 	}
 
