@@ -46,6 +46,7 @@ type flags struct {
 	disableTools []string
 	stateDir     string
 	sshConfig    string
+	imageModel   string
 	limits       timeLimits
 	appendPrompt string
 	noCloud      bool
@@ -170,6 +171,9 @@ Flags:
       --ssh-config FILE  An ssh configuration file to use for --runtime ssh://
       --enable-tools LIST   Turn on tools that are off by default (todo, status_update, notes)
       --disable-tools LIST  Turn off tools, e.g. task to stop the model starting sub-agents
+      --image-gen-model NAME  Offer a generate_image tool that draws with NAME, an image
+                       model on the same provider. Pictures are made from this machine
+                       and saved where the tools run, as the write tool saves files
       --steer-after DURATION      With -p: at this time, ask the model to wrap up, using
       --steer-prompt TEXT         this message or a general one. The turn carries on.
       --interrupt-after DURATION  With -p: at this time, stop the turn and run one more
@@ -235,6 +239,8 @@ func parseFlags(args []string) (*flags, error) {
 			f.runtime, err = next()
 		case "--ssh-config":
 			f.sshConfig, err = next()
+		case "--image-gen-model":
+			f.imageModel, err = next()
 		case "--steer-after", "--interrupt-after", "--exit-after":
 			var v string
 			if v, err = next(); err == nil {
@@ -485,6 +491,18 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 		carried = host.Carried()
 		exe = host
 	}
+	var app *App
+	if f.imageModel != "" {
+		if !choice.allow("write") {
+			return fmt.Errorf("--image-gen-model saves pictures with the write tool, which --disable-tools turns off")
+		}
+		if err := checkImageModel(ctx, client, providerName, f.imageModel); err != nil {
+			return err
+		}
+		exe = hosttool.WithImages(exe, f.imageModel, func(ctx context.Context) (provider.ImageGenerator, error) {
+			return app.imageGenerator(ctx)
+		})
+	}
 
 	// Non-interactive output consumes the same event stream as the terminal.
 	screen := render.NewScreen(os.Stdout, cfg.UI.Color)
@@ -522,7 +540,7 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 		gate.check = remoteExec.NoCloud
 	}
 
-	app := &App{
+	app = &App{
 		cfg:            cfg,
 		cwd:            cwd,
 		projectRoot:    projectRoot,

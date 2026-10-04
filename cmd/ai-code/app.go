@@ -909,6 +909,9 @@ func (a *App) restartArgv(binary string) []string {
 		if a.flags.sshConfig != "" {
 			argv = append(argv, "--ssh-config", a.flags.sshConfig)
 		}
+		if a.flags.imageModel != "" {
+			argv = append(argv, "--image-gen-model", a.flags.imageModel)
+		}
 		if a.flags.verbose {
 			argv = append(argv, "--verbose")
 		}

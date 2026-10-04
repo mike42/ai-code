@@ -71,6 +71,9 @@ type Message struct {
 	Name       string `json:"name,omitempty"`
 	IsError    bool   `json:"is_error,omitempty"`
 
+	// Images are sent with Content as one multi-part message.
+	Images []Image `json:"images,omitempty"`
+
 	// PromptTokens and Completion are what the backend reported for the request
 	// that produced this assistant message: tokens read and tokens generated.
 	// Zero elsewhere, and on any figure that failed the plausibility check.

@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	_ "embed"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -33,6 +34,9 @@ func (t *WriteTool) Schema() json.RawMessage {
 type writeArgs struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
+	// ContentBase64 carries binary contents, such as an image a host-side
+	// tool made. It is not in the schema: the model writes text.
+	ContentBase64 string `json:"content_base64"`
 }
 
 func (t *WriteTool) Run(ctx context.Context, st *State, raw json.RawMessage) Result {
@@ -44,6 +48,13 @@ func (t *WriteTool) Run(ctx context.Context, st *State, raw json.RawMessage) Res
 	if err != nil {
 		return Errorf("%v", err)
 	}
+	content := []byte(a.Content)
+	binary := a.ContentBase64 != ""
+	if binary {
+		if content, err = base64.StdEncoding.DecodeString(a.ContentBase64); err != nil {
+			return Errorf("content_base64 is not valid base64: %v", err)
+		}
+	}
 
 	existing, readErr := os.ReadFile(path)
 	isNew := os.IsNotExist(readErr)
@@ -52,9 +63,13 @@ func (t *WriteTool) Run(ctx context.Context, st *State, raw json.RawMessage) Res
 		if readErr != nil {
 			return Errorf("could not read the existing %s to check for changes: %v", rel(st, path), readErr)
 		}
-		// Overwriting destroys everything not in content; a prior read stops discarding unseen parts.
-		if r := checkStale(st, path, existing); r != nil {
-			return *r
+		// Overwriting destroys everything not in content; a prior read stops
+		// discarding unseen parts. A binary file cannot be read, so replacing
+		// one with another needs no read first.
+		if !binary || !looksBinary(existing) {
+			if r := checkStale(st, path, existing); r != nil {
+				return *r
+			}
 		}
 	}
 
@@ -63,16 +78,23 @@ func (t *WriteTool) Run(ctx context.Context, st *State, raw json.RawMessage) Res
 			return Errorf("could not create directory %s: %v", dir, err)
 		}
 	}
-	if err := writeFilePreservingMode(path, []byte(a.Content)); err != nil {
+	if err := writeFilePreservingMode(path, content); err != nil {
 		return Errorf("could not write %s: %v", rel(st, path), err)
 	}
 
-	stamp := stampFile(path, []byte(a.Content))
+	stamp := stampFile(path, content)
 	st.SetStamp(stamp)
 
 	verb := "Wrote"
 	if isNew {
 		verb = "Created"
+	}
+	if binary {
+		return Result{
+			Content: fmt.Sprintf("%s %s (%s).", verb, rel(st, path), humanBytes(len(content))),
+			Display: fmt.Sprintf("%s %s (%s)", verb, rel(st, path), humanBytes(len(content))),
+			Files:   []FileStamp{stamp},
+		}
 	}
 	summary := fmt.Sprintf("%s %s (%d lines, %s).",
 		verb, rel(st, path), stamp.Lines, humanBytes(len(a.Content)))

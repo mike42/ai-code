@@ -244,9 +244,12 @@ func (c *OpenAI) encode(req Request) wireRequest {
 		wm := wireMessage{Role: string(m.Role), Name: m.Name, ToolCallID: m.ToolCallID}
 		// Some servers reject a missing content field, others an empty string;
 		// null is the interoperable choice.
-		if m.Content == "" && m.Role == RoleAssistant {
+		switch {
+		case len(m.Images) > 0:
+			wm.Content = contentParts(m.Content, m.Images)
+		case m.Content == "" && m.Role == RoleAssistant:
 			wm.Content = nil
-		} else {
+		default:
 			wm.Content = m.Content
 		}
 		if c.opts.SendReasoning && m.Role == RoleAssistant {

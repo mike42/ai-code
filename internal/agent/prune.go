@@ -57,10 +57,11 @@ func (a *Agent) ClearOldOutput() Cleared {
 			protected += a.estimate(messageChars(*m))
 			continue
 		}
-		chars := len(m.Content)
-		m.Content = clearedNotice(chars)
+		before := messageChars(*m)
+		m.Content = clearedNotice(len(m.Content))
+		m.Images = nil
 		res.Results++
-		res.Tokens += a.estimate(chars - len(m.Content))
+		res.Tokens += a.estimate(before - messageChars(*m))
 	}
 
 	if res.Results > 0 {

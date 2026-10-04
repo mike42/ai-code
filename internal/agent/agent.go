@@ -624,6 +624,7 @@ func (a *Agent) dispatch(ctx context.Context, calls []provider.ToolCall) ([]prov
 			Name:       tc.Name,
 			Content:    res.Content,
 			IsError:    res.IsError,
+			Images:     messageImages(res.Images),
 		}
 		completed[i] = true
 		raw[i] = res
@@ -1083,7 +1084,18 @@ func messageChars(m provider.Message) int {
 	for _, tc := range m.ToolCalls {
 		n += len(tc.Name) + len(tc.Args) + len(tc.ID) + messageOverheadChars
 	}
+	for _, img := range m.Images {
+		n += img.Tokens() * int(defaultCharsPerToken)
+	}
 	return n
+}
+
+func messageImages(in []tool.Image) []provider.Image {
+	var out []provider.Image
+	for _, img := range in {
+		out = append(out, provider.Image{MIME: img.MIME, Data: img.Data, Width: img.Width, Height: img.Height})
+	}
+	return out
 }
 
 // pluralise handles the sibilant endings a bare "+s" gets wrong.

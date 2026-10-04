@@ -43,9 +43,19 @@ type Result struct {
 	// is set, since the tool has already said it.
 	Interrupted bool `json:"interrupted,omitempty"`
 
+	// Images are shown to the model with Content.
+	Images []Image `json:"images,omitempty"`
+
 	Cwd      string      `json:"cwd,omitempty"`
 	Files    []FileStamp `json:"files,omitempty"`
 	Duration string      `json:"duration,omitempty"`
+}
+
+type Image struct {
+	MIME   string `json:"mime"`
+	Data   []byte `json:"data"`
+	Width  int    `json:"width,omitempty"`
+	Height int    `json:"height,omitempty"`
 }
 
 // FileStamp identifies a file's content at the moment a tool saw it. The edit
