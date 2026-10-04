@@ -4,11 +4,21 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"ai-code/internal/worker"
 )
 
 func main() {
+	// --idle is the main process of a container kept between sessions; each
+	// session execs its own worker beside it.
+	if len(os.Args) > 1 && os.Args[1] == "--idle" {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGTERM, os.Interrupt)
+		<-ch
+		return
+	}
 	cwd, err := os.Getwd()
 	if err == nil {
 		err = worker.Serve(os.Stdin, os.Stdout, cwd)

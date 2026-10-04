@@ -168,7 +168,7 @@ Flags:
       --runtime WHERE  Where tool commands run: devcontainer, host, or
                        ssh://[USER@]HOST[:PORT][/DIR] (DIR: the remote working directory)
       --ssh-config FILE  An ssh configuration file to use for --runtime ssh://
-      --enable-tools LIST   Turn on tools that are off by default (todo, status_update)
+      --enable-tools LIST   Turn on tools that are off by default (todo, status_update, notes)
       --disable-tools LIST  Turn off tools, e.g. task to stop the model starting sub-agents
       --steer-after DURATION      With -p: at this time, ask the model to wrap up, using
       --steer-prompt TEXT         this message or a general one. The turn carries on.

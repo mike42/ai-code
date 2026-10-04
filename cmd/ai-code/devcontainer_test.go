@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os/exec"
+	"strconv"
 	goruntime "runtime"
 	"strings"
 	"testing"
@@ -30,7 +31,9 @@ func TestDevcontainerExecutorEndToEnd(t *testing.T) {
 	}
 
 	cfg := &devcontainer.Config{Image: image, WorkspaceFolder: "/workspace"}
-	dc := NewDevcontainerExecutor(cfg, nil, ".", ".", worker.Settings{})
+	project := t.TempDir()
+	removeOwn(t, engine, project)
+	dc := NewDevcontainerExecutor(cfg, nil, project, project, worker.Settings{})
 
 	dc.mu.Lock()
 	started := dc.cmd != nil
@@ -202,5 +205,82 @@ func requireWorker(t *testing.T) {
 	t.Helper()
 	if _, err := workerbin.For("linux", goruntime.GOARCH); err != nil {
 		t.Skipf("%v (run ./build.sh once to embed them)", err)
+	}
+}
+
+func keptTestSetup(t *testing.T) (engine, image string) {
+	t.Helper()
+	engine, err := detectContainerEngine()
+	if err != nil {
+		t.Skipf("no container engine: %v", err)
+	}
+	requireWorker(t)
+	image = "docker.io/library/python:3.12-slim"
+	if _, err := exec.Command(engine, "image", "exists", image).Output(); err != nil {
+		t.Skipf("image %s not present; run `%s pull %s` to enable this test", image, engine, image)
+	}
+	return engine, image
+}
+
+// removeOwn removes the one container this test's project maps to, by name.
+func removeOwn(t *testing.T, engine, project string) {
+	t.Cleanup(func() { exec.Command(engine, "rm", "-f", containerName(project)).Run() })
+}
+
+func bash(t *testing.T, e *DevcontainerExecutor, cmd string) string {
+	t.Helper()
+	res, err := e.Execute(context.Background(), tool.Request{CallID: "1", Name: "bash",
+		Args: []byte(`{"command":` + strconv.Quote(cmd) + `}`)})
+	if err != nil {
+		t.Fatalf("Execute(%q): %v", cmd, err)
+	}
+	return res.Content
+}
+
+// What a session installs outside the workspace is still there in the next
+// session; a changed configuration starts over in a new container.
+func TestContainerIsKeptBetweenSessions(t *testing.T) {
+	engine, image := keptTestSetup(t)
+	project := t.TempDir()
+	removeOwn(t, engine, project)
+	cfg := func(env string) *devcontainer.Config {
+		return &devcontainer.Config{Image: image, WorkspaceFolder: "/workspace", ContainerEnv: map[string]string{"V": env}}
+	}
+
+	first := NewDevcontainerExecutor(cfg("1"), nil, project, project, worker.Settings{})
+	bash(t, first, "echo installed > /opt/marker")
+	first.Close()
+
+	second := NewDevcontainerExecutor(cfg("1"), nil, project, project, worker.Settings{})
+	if out := bash(t, second, "cat /opt/marker 2>&1 || echo missing"); !strings.Contains(out, "installed") {
+		t.Fatalf("the next session lost what the last one put in /opt: %q", out)
+	}
+	second.Close()
+
+	changed := NewDevcontainerExecutor(cfg("2"), nil, project, project, worker.Settings{})
+	defer changed.Close()
+	if out := bash(t, changed, "cat /opt/marker 2>&1 || echo missing"); !strings.Contains(out, "missing") {
+		t.Fatalf("a changed configuration reused the old container: %q", out)
+	}
+}
+
+// A container that happens to have the name ai-code would use, but that
+// ai-code did not make, is refused rather than replaced.
+func TestForeignContainerWithTheSameNameIsLeftAlone(t *testing.T) {
+	engine, image := keptTestSetup(t)
+	project := t.TempDir()
+	removeOwn(t, engine, project)
+	if out, err := exec.Command(engine, "create", "--name", containerName(project), image, "true").CombinedOutput(); err != nil {
+		t.Fatalf("creating the stand-in container: %v %s", err, out)
+	}
+	e := NewDevcontainerExecutor(&devcontainer.Config{Image: image, WorkspaceFolder: "/workspace"}, nil, project, project, worker.Settings{})
+	defer e.Close()
+	_, err := e.Execute(context.Background(), tool.Request{CallID: "1", Name: "bash", Args: []byte(`{"command":"true"}`)})
+	var unavailable *tool.Unavailable
+	if !errors.As(err, &unavailable) || !strings.Contains(err.Error(), "not made by ai-code") {
+		t.Fatalf("Execute = %v, want a refusal naming the foreign container", err)
+	}
+	if _, _, exists := inspectKept(engine, containerName(project)); !exists {
+		t.Fatal("the foreign container was removed")
 	}
 }

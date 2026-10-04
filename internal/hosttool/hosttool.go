@@ -16,9 +16,10 @@ import (
 const (
 	TodoName   = "todo"
 	StatusName = "status_update"
+	NotesName  = "notes"
 )
 
-func Names() []string { return []string{StatusName, TodoName} }
+func Names() []string { return []string{StatusName, TodoName, NotesName} }
 
 type Executor struct {
 	inner   tool.Executor
@@ -43,6 +44,9 @@ func (e *Executor) Definitions() []tool.Definition {
 	if e.enabled[TodoName] {
 		defs = append(defs, tool.Definition{Name: TodoName, Description: todoDescription, Schema: todoSchema})
 	}
+	if e.enabled[NotesName] {
+		defs = append(defs, tool.Definition{Name: NotesName, Description: notesDescription, Schema: notesSchema})
+	}
 	return defs
 }
 
@@ -57,6 +61,8 @@ func (e *Executor) Execute(ctx context.Context, req tool.Request) (tool.Result, 
 		res = e.todo(req.Args)
 	case StatusName:
 		res = e.status(req.Args)
+	case NotesName:
+		res = e.notes(req.Args)
 	}
 	res.Duration = e.now().Sub(start).Round(time.Millisecond).String()
 	return res, nil
@@ -105,6 +111,15 @@ func (e *Executor) Carried() string {
 	if e.enabled[TodoName] {
 		if list, err := e.loadTodos(); err == nil && len(list.Items) > 0 {
 			parts = append(parts, "Your todo list, as you left it:\n\n"+todoText(list.Items))
+		}
+	}
+	if e.enabled[NotesName] {
+		if list := e.noteList(); len(list) > 0 {
+			names := make([]string, len(list))
+			for i, n := range list {
+				names[i] = n.name
+			}
+			parts = append(parts, "Your private notes (read them with the notes tool): "+strings.Join(names, ", "))
 		}
 	}
 	return strings.Join(parts, "\n\n")

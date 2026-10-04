@@ -119,7 +119,7 @@ func TestStatusKeepsHistoryAndLatest(t *testing.T) {
 	}
 }
 
-func TestWorkersGetNeitherTool(t *testing.T) {
+func TestWorkersGetNoHostTool(t *testing.T) {
 	e := newExec(t, t.TempDir(), TodoName, StatusName)
 	forked, err := e.Fork()
 	if err != nil {
@@ -127,5 +127,55 @@ func TestWorkersGetNeitherTool(t *testing.T) {
 	}
 	if hasDef(forked, TodoName) || hasDef(e.Unwrapped(), StatusName) {
 		t.Error("a worker's executor still has a host tool")
+	}
+}
+
+func TestNotesPersistOutsideTheWorkspace(t *testing.T) {
+	dir := t.TempDir()
+	e := newExec(t, dir, NotesName)
+	if res := call(t, e, NotesName, `{"action":"list"}`); res.IsError || res.Content != "No notes yet." {
+		t.Fatalf("%+v", res)
+	}
+	if res := call(t, e, NotesName, `{"action":"write","name":"api-keys","content":"TOKEN=abc"}`); res.IsError {
+		t.Fatal(res.Content)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "notes", "api-keys"))
+	if err != nil || string(b) != "TOKEN=abc" {
+		t.Fatalf("file %q %v", b, err)
+	}
+
+	next := newExec(t, dir, NotesName)
+	if res := call(t, next, NotesName, `{"action":"read","name":"api-keys"}`); res.Content != "TOKEN=abc" {
+		t.Errorf("reading the note in a new run gave: %+v", res)
+	}
+	c := next.Carried()
+	if !strings.Contains(c, "api-keys") {
+		t.Errorf("a new run is not told the note api-keys exists: %q", c)
+	}
+	if strings.Contains(c, "TOKEN") {
+		t.Errorf("a new run is shown what is inside a note; it should only see the note's name: %q", c)
+	}
+	if res := call(t, next, NotesName, `{"action":"delete","name":"api-keys"}`); res.IsError {
+		t.Fatal(res.Content)
+	}
+	if res := call(t, next, NotesName, `{"action":"read","name":"api-keys"}`); !res.IsError {
+		t.Error("a deleted note was read")
+	}
+}
+
+func TestNotesRefuseNamesThatLeaveTheirFolder(t *testing.T) {
+	dir := t.TempDir()
+	e := newExec(t, dir, NotesName)
+	for _, name := range []string{"../escape", "a/b", ".hidden", "", "..", `a\b`} {
+		args, _ := json.Marshal(map[string]string{"action": "write", "name": name, "content": "x"})
+		if res := call(t, e, NotesName, string(args)); !res.IsError {
+			t.Errorf("a note could be saved under the name %q", name)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(dir), "escape")); err == nil {
+		t.Error("a note was written outside the notes folder")
+	}
+	if res := call(t, e, NotesName, `{"action":"write","name":"x"}`); !res.IsError {
+		t.Error("write without content was accepted")
 	}
 }

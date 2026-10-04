@@ -55,6 +55,7 @@ func TestDockerfileDevcontainerRunsTools(t *testing.T) {
 
 	requireWorker(t)
 
+	removeOwn(t, engine, example)
 	dc := NewDevcontainerExecutor(rt.Config, nil, example, example, worker.Settings{})
 	defer dc.Close()
 

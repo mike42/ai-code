@@ -139,14 +139,15 @@ func TestRunArgvCarriesRunArgsAndUser(t *testing.T) {
 		t.Fatalf("Parse: %v", err)
 	}
 	c.SubstituteAll("/home/dev/proj", "id")
-	argv := strings.Join(c.RunArgv("/home/dev/proj", "/workspace", "/host/ai-code", "/ai-code-bin"), " ")
+	argv := strings.Join(c.RunArgv("/home/dev/proj", "/workspace", "/host/workers", "/ai-code-workers", "/ai-code-workers/w1", "ai-code-x"), " ")
 
 	for _, want := range []string{
 		"--userns=keep-id",
 		"--user ubuntu",
 		"-e A=1 -e B=2", // sorted, so the command line is stable
-		"--entrypoint /ai-code-bin",
-		"-v /host/ai-code:/ai-code-bin:ro",
+		"--entrypoint /ai-code-workers/w1",
+		"-v /host/workers:/ai-code-workers:ro",
+		"run -d --name ai-code-x",
 	} {
 		if !strings.Contains(argv, want) {
 			t.Errorf("RunArgv() = %q\n  missing %q", argv, want)
@@ -159,15 +160,15 @@ func TestRunArgvCarriesRunArgsAndUser(t *testing.T) {
 func TestEntrypointIsOverridden(t *testing.T) {
 	c, _ := Parse([]byte(`{"image": "x", "workspaceFolder": "/w"}`), "/p/.devcontainer/devcontainer.json")
 	c.SubstituteAll("/home/dev/proj", "id")
-	argv := c.RunArgv("/home/dev/proj", "/w", "/host/ai-code", "/ai-code-bin")
+	argv := c.RunArgv("/home/dev/proj", "/w", "/host/workers", "/ai-code-workers", "/ai-code-workers/w1", "ai-code-x")
 	found := false
 	for i, a := range argv {
-		if a == "--entrypoint" && i+1 < len(argv) && argv[i+1] == "/ai-code-bin" {
+		if a == "--entrypoint" && i+1 < len(argv) && argv[i+1] == "/ai-code-workers/w1" {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("RunArgv() = %v, want --entrypoint /ai-code-bin", argv)
+		t.Errorf("RunArgv() = %v, want --entrypoint /ai-code-workers/w1", argv)
 	}
 }
 
@@ -228,7 +229,7 @@ func TestHostPathsDoNotReachContainerEnvironment(t *testing.T) {
 
 	// And nothing in the launch arguments carries the host path except that
 	// mount, which cannot work any other way.
-	argv := c.RunArgv("/home/someone/proj", "/workspaces/app", "/host/ai-code", "/ai-code-bin")
+	argv := c.RunArgv("/home/someone/proj", "/workspaces/app", "/host/workers", "/ai-code-workers", "/ai-code-workers/w1", "ai-code-x")
 	for i, a := range argv {
 		if !strings.Contains(a, "/home/someone") {
 			continue

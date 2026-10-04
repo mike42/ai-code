@@ -66,18 +66,22 @@ func HaveImage(engine, tag string) bool {
 	return cmd.Run() == nil
 }
 
-// RunArgv assembles the engine arguments that start a container for this
+// RunArgv assembles the engine arguments that create a container for this
 // configuration, short of the image name and the command to run in it.
-// hostBinary is mounted at containerBinary and is the daemon inside.
-func (c *Config) RunArgv(localWorkspaceFolder, workdir, hostBinary, containerBinary string) []string {
-	argv := []string{"run", "--rm", "-i"}
+// The container is kept between sessions: it is created detached under name,
+// with entrypoint (a worker in idle mode) as its main process, and each session
+// execs its own worker in it. hostWorkers is the directory of worker binaries,
+// mounted whole so that a newer ai-code's worker is visible without recreating
+// the container.
+func (c *Config) RunArgv(localWorkspaceFolder, workdir, hostWorkers, containerWorkers, entrypoint, name string) []string {
+	argv := []string{"run", "-d", "--name", name}
 
 	argv = append(argv, "--mount", c.WorkspaceMountSpec(localWorkspaceFolder))
 	for _, m := range c.Mounts {
 		argv = append(argv, "--mount", m.String())
 	}
-	// Read-only bind: the host path does not exist inside, and nothing there can rewrite it.
-	argv = append(argv, "-v", hostBinary+":"+containerBinary+":ro")
+	// Read-only bind: nothing in the container can rewrite the workers.
+	argv = append(argv, "-v", hostWorkers+":"+containerWorkers+":ro")
 
 	argv = append(argv, "-w", workdir)
 
@@ -112,8 +116,8 @@ func (c *Config) RunArgv(localWorkspaceFolder, workdir, hostBinary, containerBin
 	// runArgs last, so a project can override anything decided above.
 	argv = append(argv, c.RunArgs...)
 
-	// The image's own ENTRYPOINT must not wrap the daemon.
-	argv = append(argv, "--entrypoint", containerBinary)
+	// The image's own ENTRYPOINT must not wrap the worker.
+	argv = append(argv, "--entrypoint", entrypoint)
 	return argv
 }
 

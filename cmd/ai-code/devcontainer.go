@@ -54,10 +54,11 @@ type DevcontainerExecutor struct {
 	init   error
 	// answered: a worker that fails before its first answer is broken.
 	answered bool
-	// cid is the container this executor started, from --cidfile; engine is the
-	// command that started it, and forks exec into cid.
+	// cid names the project's container; engine is the command that runs it,
+	// and entry the worker inside, which forks exec too.
 	cid    string
 	engine string
+	entry  string
 	// stderr holds the engine's captured output, for a failure report.
 	stderr *cappedBuffer
 }
@@ -176,25 +177,27 @@ func (e *DevcontainerExecutor) start(ctx context.Context) error {
 		return err
 	}
 
+	if !devcontainer.HaveImage(engine, image) {
+		e.report("devcontainer: pulling %s. The first time, this can take several minutes.", image)
+		if out, err := exec.CommandContext(ctx, engine, "pull", image).CombinedOutput(); err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
+			e.init = fmt.Errorf("pulling %s: %v\n\n%s", image, err, strings.TrimSpace(string(out)))
+			return e.init
+		}
+	}
 	if e.workerPath, err = workerForImage(engine, image); err != nil {
 		e.init = err
 		return err
 	}
-	argv := e.cfg.RunArgv(e.project, e.workdir, e.workerPath, binInContainer)
-
-	// --cidfile after RunArgv binds the id to the container actually created;
-	// the name is fresh because the engine refuses an existing file.
-	cidfile := filepath.Join(os.TempDir(), fmt.Sprintf("ai-code-cid-%d-%d", os.Getpid(), time.Now().UnixNano()))
-	os.Remove(cidfile)
-	argv = append(argv, "--cidfile", cidfile)
-	argv = append(argv, image)
 	e.engine = engine
-
-	// The engine pulls a missing image during run, so only report a real pull.
-	if !devcontainer.HaveImage(engine, image) {
-		e.report("devcontainer: pulling %s. The first time, this can take several minutes.", image)
+	e.entry = path.Join(workersInContainer, filepath.Base(e.workerPath))
+	name, err := e.ensureContainer(engine, image)
+	if err != nil {
+		e.init = err
+		return err
 	}
-	e.report("devcontainer: starting a container from %s.", image)
 	defer func() {
 		if e.init == nil && e.cmd != nil {
 			e.done("devcontainer: ready in %s (%s). The tool call runs inside it from here.",
@@ -202,7 +205,7 @@ func (e *DevcontainerExecutor) start(ctx context.Context) error {
 		}
 	}()
 
-	cmd := exec.CommandContext(context.Background(), engine, argv...)
+	cmd := exec.CommandContext(context.Background(), engine, e.execArgv(name, e.workdir, e.entry)...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		e.init = fmt.Errorf("container stdin: %w", err)
@@ -224,7 +227,7 @@ func (e *DevcontainerExecutor) start(ctx context.Context) error {
 	e.stderr = stderr
 
 	if err := cmd.Start(); err != nil {
-		e.init = fmt.Errorf("starting container (%s): %w", engine, err)
+		e.init = fmt.Errorf("starting the worker in the container (%s): %w", engine, err)
 		return e.init
 	}
 	go func() {
@@ -237,27 +240,100 @@ func (e *DevcontainerExecutor) start(ctx context.Context) error {
 		e.init = fmt.Errorf("the worker in the container did not start: %w", err)
 		return e.init
 	}
-	e.cid = readCIDFile(cidfile)
+	e.cid = name
 	return nil
 }
 
-// binInContainer is where the worker is mounted inside the container.
-const binInContainer = "/ai-code-bin"
+// workersInContainer is where the directory of worker binaries is mounted.
+const workersInContainer = "/ai-code-workers"
 
-// readCIDFile waits briefly for the engine to record the container id, which
-// it writes a moment after creation. An id that never appears only disables
-// forks, which is reported where a fork is asked for.
-func readCIDFile(path string) string {
-	defer os.Remove(path)
-	for range 100 {
-		if b, err := os.ReadFile(path); err == nil {
-			if id := strings.TrimSpace(string(b)); id != "" {
-				return id
-			}
-		}
-		time.Sleep(20 * time.Millisecond)
+// Labels on a kept container: the first says ai-code made it and for which
+// configuration, so a container is only ever replaced by the tool that made it.
+const (
+	labelConfig  = "ai-code.config"
+	labelProject = "ai-code.project"
+)
+
+// containerName is stable for a project, so every session in it shares one
+// container and what is installed in it outlives the session.
+func containerName(project string) string { return "ai-code-" + devcontainerID(project) }
+
+// ensureContainer finds or creates this project's container and has it
+// running. A container made for another configuration or image is replaced,
+// which loses what was installed in it, as rebuilding a devcontainer does.
+func (e *DevcontainerExecutor) ensureContainer(engine, image string) (string, error) {
+	name := containerName(e.project)
+	root := mountCwd(e.project, e.project, e.cfg.WorkspaceFolder)
+	idOut, err := exec.Command(engine, "image", "inspect", "--format", "{{.Id}}", image).Output()
+	if err != nil {
+		return "", fmt.Errorf("asking %s for the id of %s: %w", filepath.Base(engine), image, err)
 	}
-	return ""
+	// The worker's own path is left out, so a newer ai-code reuses the container.
+	keyArgv := e.cfg.RunArgv(e.project, root, filepath.Dir(e.workerPath), workersInContainer, "", name)
+	sum := sha256.Sum256([]byte(strings.Join(keyArgv, "\x00") + "\x00" + strings.TrimSpace(string(idOut))))
+	key := hex.EncodeToString(sum[:])[:16]
+
+	label, running, exists := inspectKept(engine, name)
+	switch {
+	case exists && label == "":
+		return "", fmt.Errorf("a container named %s already exists and was not made by ai-code, so it is left alone; "+
+			"remove or rename it to let ai-code create this project's container", name)
+	case exists && label != key:
+		e.report("devcontainer: the configuration or image changed since %s was made; replacing it. "+
+			"Anything installed in the old one is lost.", name)
+		if out, err := exec.Command(engine, "rm", "-f", name).CombinedOutput(); err != nil {
+			return "", fmt.Errorf("removing the outdated container %s: %v\n\n%s", name, err, strings.TrimSpace(string(out)))
+		}
+		exists = false
+	case exists && !running:
+		e.report("devcontainer: starting %s, kept from an earlier session.", name)
+		if out, err := exec.Command(engine, "start", name).CombinedOutput(); err != nil {
+			return "", fmt.Errorf("starting the kept container %s: %v\n\n%s", name, err, strings.TrimSpace(string(out)))
+		}
+		return name, nil
+	case exists:
+		e.report("devcontainer: using %s, kept from an earlier session.", name)
+		return name, nil
+	}
+
+	e.report("devcontainer: creating %s from %s. It is kept for later sessions in this project.", name, image)
+	argv := e.cfg.RunArgv(e.project, root, filepath.Dir(e.workerPath), workersInContainer, e.entry, name)
+	argv = append(argv[:4:4], append([]string{"--label", labelConfig + "=" + key, "--label", labelProject + "=" + e.project}, argv[4:]...)...)
+	argv = append(argv, image, "--idle")
+	out, err := exec.Command(engine, argv...).CombinedOutput()
+	if err != nil {
+		// Another session in this project may have created it a moment ago.
+		if l, _, ok := inspectKept(engine, name); ok && l == key {
+			return name, nil
+		}
+		return "", fmt.Errorf("creating the container %s: %v\n\n%s", name, err, strings.TrimSpace(string(out)))
+	}
+	return name, nil
+}
+
+// inspectKept reads a container's configuration label and whether it runs.
+func inspectKept(engine, name string) (label string, running, exists bool) {
+	out, err := exec.Command(engine, "container", "inspect", "--format",
+		`{{index .Config.Labels "`+labelConfig+`"}}|{{.State.Running}}`, name).Output()
+	if err != nil {
+		return "", false, false
+	}
+	l, r, _ := strings.Cut(strings.TrimSpace(string(out)), "|")
+	if l == "<no value>" {
+		l = ""
+	}
+	return l, r == "true", true
+}
+
+// execArgv runs a worker in the container, as the configured user.
+func (e *DevcontainerExecutor) execArgv(name, workdir, entry string) []string {
+	argv := []string{"exec", "-i", "-w", workdir}
+	if e.cfg.ContainerUser != "" {
+		argv = append(argv, "--user", e.cfg.ContainerUser)
+	} else if e.cfg.RemoteUser != "" {
+		argv = append(argv, "--user", e.cfg.RemoteUser)
+	}
+	return append(argv, name, entry)
 }
 
 // Fork runs a second executor daemon inside the same container, so a worker
@@ -313,15 +389,10 @@ func (e *DevcontainerExecutor) startForked(ctx context.Context) error {
 		return e.init
 	}
 
-	argv := []string{"exec", "-i", "-w", e.workdir}
-	if e.cfg.ContainerUser != "" {
-		argv = append(argv, "--user", e.cfg.ContainerUser)
-	} else if e.cfg.RemoteUser != "" {
-		argv = append(argv, "--user", e.cfg.RemoteUser)
-	}
-	argv = append(argv, cid, binInContainer)
-
-	cmd := exec.CommandContext(context.Background(), engine, argv...)
+	e.host.mu.Lock()
+	entry := e.host.entry
+	e.host.mu.Unlock()
+	cmd := exec.CommandContext(context.Background(), engine, e.execArgv(cid, e.workdir, entry)...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		e.init = fmt.Errorf("worker shell stdin: %w", err)
@@ -472,7 +543,7 @@ func (e *DevcontainerExecutor) Definitions() []tool.Definition { return e.catalo
 
 func (e *DevcontainerExecutor) IsReadOnly(name string) bool { return e.catalog.IsReadOnly(name) }
 
-// Close tears down the container.
+// Close stops this session's worker; the container is kept for later sessions.
 func (e *DevcontainerExecutor) Close() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
