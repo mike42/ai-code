@@ -44,8 +44,6 @@ type UI struct {
 	Color string `toml:"color"`
 	// StatusLine draws the single redrawable line above the prompt.
 	StatusLine *bool `toml:"status_line"`
-	// ContextWarnPercent is when the status line starts warning.
-	ContextWarnPercent int `toml:"context_warn_percent"`
 }
 
 type Agent struct {
@@ -179,11 +177,10 @@ func Defaults() Config {
 	return Config{
 		DefaultMode: "build",
 		UI: UI{
-			Theme:              "auto",
-			Reasoning:          "collapsed",
-			Color:              "auto",
-			StatusLine:         boolPtr(true),
-			ContextWarnPercent: 80,
+			Theme:      "auto",
+			Reasoning:  "collapsed",
+			Color:      "auto",
+			StatusLine: boolPtr(true),
 		},
 		Agent: Agent{
 			MaxIterations: 0, // unlimited. See Agent.MaxIterations.

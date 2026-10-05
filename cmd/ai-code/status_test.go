@@ -1,6 +1,7 @@
 package main
 
 import (
+	"ai-code/internal/agent"
 	"context"
 	"io"
 	"os"
@@ -226,5 +227,18 @@ func TestALineSubmittedDuringASwapBecomesTheNextPrompt(t *testing.T) {
 	}
 	if n := a.agent.Pending(); n != 0 {
 		t.Errorf("%d went to the steering queue, where nothing would have run them", n)
+	}
+}
+
+// How full the session is shows on the status line; the prompt stays a bare
+// marker however full it gets.
+func TestThePromptMarkerCarriesNoPercentage(t *testing.T) {
+	a := statusApp(t, provider.ModelInfo{ID: "m", ContextWindow: 262144})
+	a.modeName = "build"
+	a.noteContext(agent.Event{Kind: agent.EvContext,
+		Context: &agent.ContextState{Projected: 240_000, Window: 262_144, Anchored: true}})
+
+	if got := render.Strip(a.promptString()); got != "> " {
+		t.Errorf("prompt = %q, want the bare marker", got)
 	}
 }

@@ -170,11 +170,10 @@ func TestSteeringEmitsAnEvent(t *testing.T) {
 // Auto-compaction fires inside the run, at a turn boundary, and the run
 // continues afterwards.
 func TestAutoCompactionRunsInlineAndTheTurnContinues(t *testing.T) {
-	// Summarisation runs at the top of the loop, before any agent turn; this
-	// prose session folds into the checkpoint in two pieces.
+	// Summarisation runs at the top of the loop, before any agent turn, in
+	// one call.
 	summary := scriptedTurn{text: "## Goal\nFinish the work.\n\n## Next Steps\n1. Carry on."}
 	client := &scriptedClient{charsPerToken: 4, turns: []scriptedTurn{
-		summary,
 		summary,
 		{text: "carrying on"},
 	}}
@@ -184,7 +183,7 @@ func TestAutoCompactionRunsInlineAndTheTurnContinues(t *testing.T) {
 
 	// A 20k window with a 4k reserve: the budget is 16k.
 	a := New(client, "m", exec, sink, Options{
-		MaxIterations: 10, ContextLimit: 20000, WarnPercent: 80,
+		MaxIterations: 10, ContextLimit: 20000,
 		AutoCompact: true, ReserveTokens: 4000, KeepRecentTokens: 1000,
 	})
 	a.SetSystem(strings.Repeat("system prompt. ", 100))

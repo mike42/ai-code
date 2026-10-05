@@ -21,7 +21,6 @@ theme                = "auto"       # a chroma style name, or "none"
 reasoning            = "collapsed"  # off | collapsed | full
 color                = "auto"       # auto | always | never
 status_line          = true
-context_warn_percent = 80
 
 [agent]
 # max_iterations = 200            # 0 (the default) is unlimited: a task runs
@@ -50,7 +49,7 @@ parallel_reads = true               # run read-only tools concurrently
 loop_guard     = 4                  # stop after N identical tool calls in a row
 # context_override = 32768          # when the server reports nothing usable
 
-auto_compact               = true   # summarise at the reserve instead of stopping
+auto_compact               = true   # have the model summarise before the window fills
 compact_reserve_tokens     = 16384  # room kept free: one full response plus the
                                     # summarisation call compaction itself makes.
                                     # This is the only ceiling ai-code puts on a

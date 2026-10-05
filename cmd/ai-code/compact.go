@@ -11,8 +11,9 @@ import (
 	"ai-code/internal/session"
 )
 
-// cmdCompact runs the automatic compaction path -- prune, then summarise --
-// at a break chosen by hand rather than when the window happens to fill.
+// cmdCompact asks the model to summarise the session at a break chosen by
+// hand. Old tool output is left alone: clearing it first would change the
+// request the server has cached, and the summary would be read from scratch.
 func (a *App) cmdCompact(ctx context.Context, args string) error {
 	style := render.NewStyle(a.screen.Color())
 
@@ -21,9 +22,6 @@ func (a *App) cmdCompact(ctx context.Context, args string) error {
 	}
 
 	before := a.contextState().Projected
-
-	// Free tool output first: it costs no model call and is most of the saving.
-	cleared := a.agent.ClearOldOutput()
 
 	// Said only when there will be a wait: deciding not to compact is free.
 	if a.agent.CompactionWorthwhile(a.cfg.Agent.CompactKeepRecentTokens) {
@@ -40,7 +38,6 @@ func (a *App) cmdCompact(ctx context.Context, args string) error {
 		return err
 	}
 	res.TokensBefore = before
-	res.Cleared, res.ClearedTokens = cleared.Results, cleared.Tokens
 
 	if a.sess != nil {
 		// Appended is the boundary the next request starts from, so a resume
@@ -68,20 +65,11 @@ func (a *App) cmdCompact(ctx context.Context, args string) error {
 		return nil
 	}
 
-	var did []string
-	if res.Cleared == 1 {
-		did = append(did, "pruned 1 tool result")
-	} else if res.Cleared > 1 {
-		did = append(did, fmt.Sprintf("pruned %d tool results", res.Cleared))
-	}
-	did = append(did, fmt.Sprintf("summarised the first %d messages, kept %d",
-		res.SummarisedThrough, res.MessagesAfter))
-
 	a.out(
-		fmt.Sprintf("Next request: %s → %s of a %s window (%s freed; %s).",
+		fmt.Sprintf("Next request: %s → %s of a %s window (%s freed; summarised the first %d messages, kept %d).",
 			compactInt(res.TokensBefore), compactInt(res.TokensAfter),
 			compactInt(a.contextState().Window), compactInt(saved),
-			strings.Join(did, ", ")),
+			res.SummarisedThrough, res.MessagesAfter),
 		style.Dim("Nothing was deleted. The session on disk keeps every message; only what gets sent is shorter."),
 		"")
 

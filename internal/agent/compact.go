@@ -14,22 +14,27 @@ import (
 
 // Compaction summarises a session so it fits back inside the context window.
 //
-// The prompt structure and serialisation approach are adapted from pi
-// (github.com/badlogic/pi, MIT, (c) 2025 Mario Zechner),
-// packages/coding-agent/src/core/compaction/{compaction,utils}.ts: a fixed
-// section format, a flat transcript rather than replayed messages, and file
-// lists carried across the boundary.
+// The checkpoint format is adapted from pi (github.com/badlogic/pi, MIT,
+// (c) 2025 Mario Zechner), packages/coding-agent/src/core/compaction: a fixed
+// section format, and file lists carried across the boundary.
+//
+// The model writes the checkpoint from the request it is already working
+// from, with one instruction appended. Every token before the instruction is
+// the prefix the server processed on the previous turn, so on a server that
+// keeps it cached the summary costs only its own output. Any other prompt
+// shape -- another system prompt, a flattened transcript -- has to be read
+// from scratch, which on a large session and slow hardware takes many minutes.
 
-const summarisationSystemPrompt = `You are a context summarization assistant. Read the conversation you are given and produce a structured summary in the exact format requested.
+const checkpointInstruction = `Stop work on the task for a moment. Everything above is about to be replaced by a context checkpoint, and you are the one writing it. Another model will continue this work from the checkpoint with none of the original messages available.
 
-Do NOT continue the conversation. Do NOT answer any question that appears in it. Output only the summary.`
+Do NOT call any tools. Do NOT continue the task or answer anything above. Output only the checkpoint.
 
-const summarisationPrompt = `The transcript above is a conversation to summarise. Produce a context checkpoint that another model will use to continue this work with none of the original messages available.
+If the conversation above begins with an earlier <context-checkpoint>, carry forward everything in it that is still true, and fold the newer conversation into it.
 
 Use this EXACT format:
 
 ## Goal
-[What is the user trying to accomplish, in their terms. Multiple items if the session covered several tasks.]
+[What the user is trying to accomplish, in their terms. Multiple items if the session covered several tasks.]
 
 ## Constraints & Preferences
 - [Constraints, preferences and requirements the user stated, including corrections they made to earlier work]
@@ -53,50 +58,6 @@ Use this EXACT format:
 
 ## Critical Context
 - [Data, examples, commands or references needed to continue]
-- [Or "(none)"]
-
-Keep every section concise. Preserve exact file paths, function names, commands and error messages verbatim -- an approximate path is worse than no path.`
-
-// updateSummarisationPrompt folds new conversation into an existing
-// checkpoint. Taken from pi's UPDATE_SUMMARIZATION_INSTRUCTIONS: a second
-// compaction sees only messages since the first.
-const updateSummarisationPrompt = `The transcript above is NEW conversation to fold into the existing checkpoint in <previous-summary> tags.
-
-RULES:
-- PRESERVE every fact from the previous summary that is still true
-- ADD the new progress, decisions and context from the transcript
-- MOVE items from "In Progress" to "Done" when the transcript shows them completed
-- UPDATE "Next Steps" to reflect what is left, not what was left before
-- PRESERVE exact file paths, function names, commands and error messages verbatim
-- REMOVE only what the transcript shows is no longer relevant
-
-Use this EXACT format:
-
-## Goal
-[Preserve existing goals; add new ones if the task expanded]
-
-## Constraints & Preferences
-- [Preserve existing, add any newly stated]
-- [Or "(none)"]
-
-## Progress
-### Done
-- [x] [Previously done items AND newly completed ones]
-
-### In Progress
-- [ ] [What is underway now]
-
-### Blocked
-- [Current blockers only -- drop the ones that were resolved, or "(none)"]
-
-## Key Decisions
-- **[Decision]**: [Why] (keep all previous, add new)
-
-## Next Steps
-1. [Ordered, based on the current state]
-
-## Critical Context
-- [Carry forward what is still needed, add what is new]
 - [Or "(none)"]
 
 Keep every section concise. Preserve exact file paths, function names, commands and error messages verbatim -- an approximate path is worse than no path.`
@@ -481,19 +442,20 @@ func (a *Agent) Compact(ctx context.Context, keepRecentTokens int) (*CompactResu
 		return nil, ErrNothingToFree
 	}
 
-	summary, err := a.summariseThrough(ctx, cut, a.SummaryCap())
+	summary, err := a.summariseInPlace(ctx, a.SummaryCap())
 	if err != nil {
 		return nil, err
 	}
 
 	// Measure against the checkpoint that got written: nothing is installed
 	// unless it leaves the next request smaller.
+	prevStart := a.startAt
 	a.setSummary(summary, cut)
 	after := a.plannedTokens()
 	if after >= before {
 		// Keep the summary as a standby, but take back the boundary: the
-		// un-summarised request was already smaller.
-		a.startAt = 0
+		// request without it was already smaller.
+		a.startAt = prevStart
 		a.requestChanged()
 		a.publish()
 		return &CompactResult{
@@ -546,9 +508,9 @@ func (a *Agent) worthSummarising(cut, summaryTokens int) bool {
 // the one place the sent prefix moves, so it invalidates ground truth.
 func (a *Agent) setSummary(summary string, cut int) {
 	a.summary = summary
+	a.summaryWrittenAt = len(a.messages)
 	a.summarisedThrough = cut
 	a.startAt = cut
-	a.warned = false
 	a.requestChanged()
 	a.publish()
 }
@@ -581,14 +543,14 @@ func (a *Agent) Summarise(ctx context.Context, maxTokens int) (*CompactResult, e
 	}
 
 	through := a.checkpointThrough(maxTokens)
-	summary, err := a.summariseThrough(ctx, through, maxTokens)
+	summary, err := a.summariseInPlace(ctx, maxTokens)
 	if err != nil {
 		return nil, err
 	}
 
 	a.summary = summary
 	a.summarisedThrough = through
-	a.warned = false
+	a.summaryWrittenAt = len(a.messages)
 
 	// Nothing moved: the transcript is exactly as it was and the figure is
 	// equal on both sides.
@@ -604,96 +566,43 @@ func (a *Agent) Summarise(ctx context.Context, maxTokens int) (*CompactResult, e
 	}, nil
 }
 
-// summariseThrough summarises messages[:through], folding in the checkpoint in hand.
-func (a *Agent) summariseThrough(ctx context.Context, through, maxTokens int) (string, error) {
-	end := min(through, len(a.messages))
-	covered := a.messages[:end]
-
-	// Only the conversation the checkpoint does not already account for.
-	start := 0
-	summary := a.summary
-	if strings.TrimSpace(summary) != "" {
-		start = min(a.summarisedThrough, end)
+// summariseInPlace asks the model for a checkpoint of everything it can see,
+// sending the next request exactly as it would go out with the instruction
+// appended. The recorded boundary is the caller's; the text may describe more
+// than that, which costs nothing.
+func (a *Agent) summariseInPlace(ctx context.Context, maxTokens int) (string, error) {
+	if strings.TrimSpace(a.summary) != "" && a.summaryWrittenAt >= len(a.messages) {
+		// Nothing has happened since the checkpoint was written.
+		return a.summary, nil
 	}
 
-	fresh := a.messages[start:end]
-	if strings.TrimSpace(serialiseConversation(fresh)) == "" {
-		if strings.TrimSpace(summary) != "" {
-			// Nothing has happened since the checkpoint was written, so it is
-			// already the answer.
-			return summary, nil
-		}
-		return "", errors.New("there is nothing to compact yet")
+	// The planned request is the one the server last processed, plus what has
+	// been appended since. Only when the summary would not fit beside it does
+	// the trimmed request stand in, and that one is not cached.
+	sending := a.plannedRequest().msgs
+	if a.Usable() > 0 && !a.summaryCallFits() {
+		sending = a.messagesToSend()
 	}
-
-	// Folded in pieces when there is more new conversation than one request can carry.
-	for _, chunk := range a.summarisationChunks(fresh, maxTokens) {
-		next, err := a.summarise(ctx, serialiseConversation(chunk), summary, maxTokens)
-		if err != nil {
-			return "", err
-		}
-		summary = next
+	messages := a.withSystem(sending)
+	if Validate(messages) != nil {
+		// streamTurn would send the repaired list, so that is the cached one.
+		messages, _ = Repair(messages)
 	}
-
-	// File lists stay over everything the checkpoint covers, not just the new
-	// part; the scan is local and needs no model call.
-	return summary + collectFileOperations(covered), nil
-}
-
-// minSummarisationChunk is the least new conversation worth one summarisation request.
-const minSummarisationChunk = 1024
-
-// summarisationChunks splits new conversation into pieces that fit one request
-// alongside the checkpoint being folded into.
-func (a *Agent) summarisationChunks(msgs []provider.Message, maxTokens int) [][]provider.Message {
-	// The whole usable window, not the prompt budget: the prompt budget holds a
-	// quarter back for a reply, and this request's reply is already subtracted
-	// as maxTokens.
-	budget := a.Usable() - maxTokens -
-		a.estimate(len(a.summary)+len(updateSummarisationPrompt)+len(summarisationSystemPrompt))
-	if a.Usable() <= 0 {
-		// No window to fit anything to; one piece and let the server decide.
-		return [][]provider.Message{msgs}
-	}
-	if budget < minSummarisationChunk {
-		budget = minSummarisationChunk
-	}
-	limit := int(float64(budget) * a.charsPerTokenNow())
-
-	var out [][]provider.Message
-	start, size := 0, 0
-	for i := range msgs {
-		n := len(serialiseConversation(msgs[i : i+1]))
-		if size > 0 && size+n > limit {
-			out = append(out, msgs[start:i])
-			start, size = i, 0
-		}
-		size += n
-	}
-	return append(out, msgs[start:])
-}
-
-func (a *Agent) summarise(ctx context.Context, transcript, previous string, maxTokens int) (string, error) {
-	prompt := "<transcript>\n" + transcript + "\n</transcript>\n\n"
-	instructions := summarisationPrompt
-	if strings.TrimSpace(previous) != "" {
-		// A second compaction sees only what happened since the first, so the
-		// checkpoint must carry the earlier state forward.
-		prompt += "<previous-summary>\n" + previous + "\n</previous-summary>\n\n"
-		instructions = updateSummarisationPrompt
-	}
+	messages = append(messages[:len(messages):len(messages)],
+		provider.Message{Role: provider.RoleUser, Content: checkpointInstruction})
 
 	req := provider.Request{
-		Model: a.model,
-		Messages: []provider.Message{
-			{Role: provider.RoleSystem, Content: summarisationSystemPrompt},
-			{Role: provider.RoleUser, Content: prompt + instructions},
-		},
+		Model:    a.model,
+		Messages: messages,
+		// The tool definitions are part of the rendered prompt; leaving them
+		// out would change its first tokens and lose the cache.
+		Tools:       toolDefs(a.exec),
+		Temperature: a.opts.Temperature,
+		TopP:        a.opts.TopP,
 		// A cap rather than the turn budget: a checkpoint that grows without
 		// bound defeats the purpose of making one.
 		MaxTokens: maxTokens,
-		// Summarising is mechanical; max-effort reasoning costs minutes for a
-		// checkpoint that reads no better.
+		// Thinking would spend the cap before the checkpoint is written.
 		Effort: provider.EffortNone,
 	}
 
@@ -713,84 +622,26 @@ func (a *Agent) summarise(ctx context.Context, transcript, previous string, maxT
 		}
 	}
 
+	msg := stream.Message()
+	if len(msg.ToolCalls) > 0 {
+		return "", errors.New("the model called a tool instead of writing the summary; the session is unchanged")
+	}
 	// A summary cut off by the cap is partial; mirrors pi's getSummarizationFailure.
 	if stream.StopReason() == provider.StopLength {
 		return "", errors.New("the summary hit the output token cap and is incomplete, so it was discarded. " +
-			"The session is unchanged. Try /compact again, or start a new session")
+			"The session is unchanged")
 	}
-
-	summary := strings.TrimSpace(stream.Message().Content)
+	summary := strings.TrimSpace(msg.Content)
 	if summary == "" {
 		return "", errors.New("the model returned an empty summary; the session is unchanged")
 	}
-	return summary, nil
+	return summary + collectFileOperations(a.messages), nil
 }
 
-// serialiseConversation flattens messages into tagged text. A transcript
-// rather than a message list, so the model reads it as data to summarise
-// rather than a conversation to continue.
-func serialiseConversation(messages []provider.Message) string {
-	const toolResultMax = 2000
-
-	var parts []string
-	for _, m := range messages {
-		switch m.Role {
-		case provider.RoleUser:
-			if s := strings.TrimSpace(m.Content); s != "" {
-				parts = append(parts, "[User]: "+s)
-			}
-		case provider.RoleAssistant:
-			if s := strings.TrimSpace(m.Content); s != "" {
-				parts = append(parts, "[Assistant]: "+s)
-			}
-			if len(m.ToolCalls) > 0 {
-				var calls []string
-				for _, tc := range m.ToolCalls {
-					calls = append(calls, fmt.Sprintf("%s(%s)", tc.Name, compactArgs(tc.Args)))
-				}
-				parts = append(parts, "[Assistant tool calls]: "+strings.Join(calls, "; "))
-			}
-		case provider.RoleTool:
-			s := strings.TrimSpace(m.Content)
-			if s == "" {
-				continue
-			}
-			if len(s) > toolResultMax {
-				s = s[:toolResultMax] + fmt.Sprintf("\n[... %d more characters truncated]", len(s)-toolResultMax)
-			}
-			prefix := "[Tool result]: "
-			if m.IsError {
-				prefix = "[Tool error]: "
-			}
-			parts = append(parts, prefix+s)
-		}
-	}
-	return strings.Join(parts, "\n\n")
-}
-
-func compactArgs(raw string) string {
-	var m map[string]any
-	if err := json.Unmarshal([]byte(raw), &m); err != nil {
-		if len(raw) > 200 {
-			return raw[:200] + "..."
-		}
-		return raw
-	}
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var parts []string
-	for _, k := range keys {
-		v := fmt.Sprint(m[k])
-		if len(v) > 120 {
-			v = v[:120] + "..."
-		}
-		parts = append(parts, fmt.Sprintf("%s=%q", k, v))
-	}
-	return strings.Join(parts, ", ")
+// summaryCallTokens is what asking for a checkpoint adds to the request: the
+// instruction and the longest checkpoint allowed.
+func (a *Agent) summaryCallTokens() int {
+	return a.estimate(len(checkpointInstruction)) + a.SummaryCap()
 }
 
 // collectFileOperations records which files the session read and changed, for the checkpoint.

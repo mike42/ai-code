@@ -352,31 +352,32 @@ func TestContextFullRefusesTheTurnAndKeepsTheSession(t *testing.T) {
 	}
 }
 
-func TestContextWarningFiresOnceAtThreshold(t *testing.T) {
+// A session with room left works on without a word about it: making room
+// happens when room runs out, and needs no advance notice.
+func TestANearlyFullSessionCarriesOnQuietly(t *testing.T) {
 	const window = 65536
 	usable := window - BudgetFor(window).Reserve
-	trigger := usable * 80 / 100
+	nearlyFull := usable * 90 / 100
 	client := &scriptedClient{turns: []scriptedTurn{
-		{text: "a", usage: provider.Usage{PromptTokens: trigger + 1000, CompletionTokens: 100}},
-		{text: "b", usage: provider.Usage{PromptTokens: trigger + 2000, CompletionTokens: 100}},
+		{text: "a", usage: provider.Usage{PromptTokens: nearlyFull, CompletionTokens: 100}},
+		{text: "b", usage: provider.Usage{PromptTokens: nearlyFull + 1000, CompletionTokens: 100}},
 	}}
 	sink := &collectSink{}
 	exec := tool.NewLocalExecutor(tool.NewState(t.TempDir()))
 	a := New(client, "m", exec, sink, Options{
-		MaxIterations: 5, ContextLimit: window, WarnPercent: 80,
+		MaxIterations: 5, ContextLimit: window, AutoCompact: true,
 	})
 
 	_ = a.Run(context.Background(), "one")
 	_ = a.Run(context.Background(), "two")
 
-	warnings := 0
-	for _, n := range sink.notices() {
-		if strings.Contains(n, "this session can use") {
-			warnings++
-		}
+	if n := sink.notices(); len(n) > 0 {
+		t.Errorf("notices = %q, want none while the session still fits", n)
 	}
-	if warnings != 1 {
-		t.Errorf("got %d context warnings, want exactly 1 -- repeating it every turn is noise", warnings)
+	for _, e := range sink.events {
+		if e.Kind == EvCompacted {
+			t.Error("compacted a session that still fits")
+		}
 	}
 }
 

@@ -148,7 +148,6 @@ func (a *App) switchTo(ctx context.Context, client provider.Client, name string,
 
 	newLimit, source := contextLimitFor(model, a.cfg.Agent.ContextOverride)
 	oldLimit := a.agent.Window()
-	used := a.contextState().Projected
 	// Computed before anything is reassigned: the choice below may be to stay put.
 	sameModel := model.ID == a.agent.Model() && name == a.providerName
 	plan := a.agent.PlanResume(newLimit)
@@ -198,9 +197,6 @@ func (a *App) switchTo(ctx context.Context, client provider.Client, name string,
 			"This session is about %s tokens, so the next request carries %s of it -- the last "+
 				"%d messages, leaving about %s to answer in. Nothing is deleted; /compact frees the rest.",
 			tokenCount(plan.Session), tokenCount(p.Prompt), p.Kept, tokenCount(p.Free)))
-	case newLimit > 0 && used*100/max(newLimit, 1) >= a.cfg.UI.ContextWarnPercent:
-		a.note(fmt.Sprintf("This session already fills %d%% of the new window.",
-			used*100/newLimit))
 	}
 
 	// Same model with an unfinished turn: resume it without asking.

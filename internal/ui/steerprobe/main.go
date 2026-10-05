@@ -16,7 +16,7 @@ import (
 func main() {
 	screen := render.NewScreen(os.Stdout, "always")
 	r := render.NewInteractive(screen, render.InteractiveOptions{
-		ShowStatus: true, Reasoning: "collapsed", WarnPercent: 80, SteerPrompt: "> ",
+		ShowStatus: true, Reasoning: "collapsed", SteerPrompt: "> ",
 	})
 	r.Start()
 

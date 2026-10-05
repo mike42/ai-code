@@ -12,7 +12,7 @@ import (
 // Emit and read back the status line, without starting its paint loop.
 func statusTester() *Interactive {
 	return NewInteractive(NewScreen(io.Discard, "never"), InteractiveOptions{
-		ShowStatus: true, WarnPercent: 80,
+		ShowStatus: true,
 	})
 }
 

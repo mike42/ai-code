@@ -602,7 +602,6 @@ func (a *App) contextState() agent.ContextState {
 
 func (a *App) promptString() string {
 	style := render.NewStyle(a.screen.Color())
-	cs := a.contextState()
 
 	// ASCII ">", not a chevron: a font can fall back on U+203A, and a copy-paste
 	// can mismeasure it.
@@ -613,9 +612,6 @@ func (a *App) promptString() string {
 	workers := ""
 	if m := a.workerMarker(); m != "" {
 		workers = style.Dim(m)
-	}
-	if cs.Window > 0 && cs.Percent() >= a.cfg.UI.ContextWarnPercent {
-		return workers + style.Warn(fmt.Sprintf("[%d%%] ", cs.Percent())) + style.Bold(marker)
 	}
 	return workers + style.Bold(marker)
 }
@@ -745,11 +741,11 @@ func (a *App) cmdTokens(ctx context.Context, args string) error {
 			compactInt(cs.Projected), compactInt(limit), cs.Percent())
 	}
 	if usable > 0 {
-		what := "summarises"
+		at, what := a.agent.CompactsAt(), "summarises"
 		if a.cfg.Agent.AutoCompact != nil && !*a.cfg.Agent.AutoCompact {
-			what = "stops"
+			at, what = usable, "stops"
 		}
-		head += style.Dim(fmt.Sprintf(" · %s at %s", what, compactInt(usable)))
+		head += style.Dim(fmt.Sprintf(" · %s at %s", what, compactInt(at)))
 	}
 
 	var notes []string

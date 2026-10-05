@@ -21,7 +21,6 @@ type Interactive struct {
 	theme  string
 
 	showStatus bool
-	warnPct    int
 	steerMark  string
 
 	mu           sync.Mutex
@@ -89,10 +88,9 @@ const rateWindow = 5 * time.Second
 var spinner = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 type InteractiveOptions struct {
-	ShowStatus  bool
-	Theme       string
-	Reasoning   string // off | collapsed | full
-	WarnPercent int
+	ShowStatus bool
+	Theme      string
+	Reasoning  string // off | collapsed | full
 	// Verbose is the starting detail level, from -v; /verbose and /quiet move it.
 	Verbose bool
 	// SteerPrompt is the marker drawn in place of the status line while typing
@@ -106,7 +104,6 @@ func NewInteractive(s *Screen, opts InteractiveOptions) *Interactive {
 		screen:     s,
 		style:      style,
 		showStatus: opts.ShowStatus && s.IsTTY(),
-		warnPct:    opts.WarnPercent,
 		reasonMode: opts.Reasoning,
 		verbose:    opts.Verbose,
 		steerMark:  opts.SteerPrompt,
@@ -779,12 +776,8 @@ func (r *Interactive) statusLocked() string {
 		if !r.ctxState.Anchored {
 			mark = "~"
 		}
-		ctx := fmt.Sprintf("%s%s/%s ctx",
-			mark, compactNum(r.ctxState.Projected), compactNum(r.ctxState.Window))
-		if r.ctxState.Percent() >= r.warnPct {
-			ctx = r.style.Warn(ctx)
-		}
-		parts = append(parts, ctx)
+		parts = append(parts, fmt.Sprintf("%s%s/%s ctx",
+			mark, compactNum(r.ctxState.Projected), compactNum(r.ctxState.Window)))
 	}
 
 	switch {

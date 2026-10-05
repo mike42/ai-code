@@ -26,8 +26,6 @@ type Options struct {
 	LoopGuard       int
 	// ContextLimit is the effective window in tokens, 0 when unknown.
 	ContextLimit int
-	// WarnPercent is the occupancy at which the agent emits a context warning.
-	WarnPercent int
 
 	// AutoCompact summarises the session when it reaches the reserve instead of stopping.
 	AutoCompact bool
@@ -63,7 +61,13 @@ type Agent struct {
 	requestChangedAt int
 	// toolChars caches the size of the tool definitions, constant per session.
 	toolChars int
-	warned    bool
+	// roundFrom is where the round being measured began; largestRound is the
+	// most one round of replies and tool results has added in this session.
+	roundFrom    int
+	largestRound int
+	// aheadFailed stops repeated attempts to summarise before the window is
+	// full once one has failed; a compaction that succeeds clears it.
+	aheadFailed bool
 
 	readOnly func(name string) bool
 
@@ -83,6 +87,9 @@ type Agent struct {
 	// summarisedThrough is how many messages from the start of the transcript
 	// the summary accounts for.
 	summarisedThrough int
+	// summaryWrittenAt is how long the transcript was when the summary text
+	// was written; the text can describe more than summarisedThrough records.
+	summaryWrittenAt int
 
 	// resumeFromTranscript carries recent messages verbatim and lets older ones
 	// fall off, rather than spend a small window on a checkpoint.
@@ -98,9 +105,6 @@ type Agent struct {
 func New(client provider.Client, model string, exec tool.Executor, sink Sink, opts Options) *Agent {
 	if opts.LoopGuard <= 0 {
 		opts.LoopGuard = 4
-	}
-	if opts.WarnPercent <= 0 {
-		opts.WarnPercent = 80
 	}
 	a := &Agent{client: client, model: model, exec: exec, sink: sink, opts: opts}
 
@@ -193,8 +197,11 @@ func (a *Agent) Messages() []provider.Message { return a.messages }
 // described the one it replaces.
 func (a *Agent) SetMessages(m []provider.Message) {
 	a.messages = m
+	a.roundFrom = len(m)
+	a.aheadFailed = false
 	a.summary = ""
 	a.summarisedThrough = 0
+	a.summaryWrittenAt = 0
 	a.startAt = 0
 	a.resumeFromTranscript = false
 	a.requestChanged()
@@ -218,6 +225,7 @@ func (a *Agent) SetCheckpoint(summary string, summarisedThrough, cut int) {
 	clampIndex := func(n int) int { return clamp(n, 0, len(a.messages)) }
 	a.summary = summary
 	a.summarisedThrough = clampIndex(summarisedThrough)
+	a.summaryWrittenAt = a.summarisedThrough
 	a.startAt = clampIndex(cut)
 	// Whatever was recorded against these messages was recorded under a
 	// different system prompt and tool set.
@@ -238,7 +246,7 @@ func (a *Agent) SetModel(model string, contextLimit, maxOutputTokens int) {
 	a.model = model
 	a.opts.ContextLimit = contextLimit
 	a.opts.MaxOutputTokens = maxOutputTokens
-	a.warned = false
+	a.aheadFailed = false
 	// A different model tokenizes differently, so the learned ratio and every
 	// recorded prefill are stale.
 	a.charsPerToken = 0
@@ -801,12 +809,17 @@ func (a *Agent) lengthStopMessage(sent int, src budgetSource, completion int) st
 	}
 }
 
-// guardContext keeps the session inside the window, compacting when it
-// reaches the reserve. It runs only on a complete message list: before a new
-// prompt, and after a round of tool results.
+// guardContext keeps the session inside the window. It runs only on a
+// complete message list: before a new prompt, and after a round of tool
+// results.
+//
+// The model summarises the session while there is still room for another
+// round, because that summary is a request the server has almost entirely
+// cached. Once the window is full the cache is lost whatever is done, so
+// waiting until then makes every compaction pay for a full prefill.
 func (a *Agent) guardContext(ctx context.Context) error {
-	window := a.opts.ContextLimit
 	usable := a.Usable()
+	a.measureRound()
 	if usable <= 0 {
 		return nil // unknown window: nothing to guard against
 	}
@@ -819,20 +832,95 @@ func (a *Agent) guardContext(ctx context.Context) error {
 	// Room to answer in, not merely room to sit in: the output floor is part
 	// of the trigger.
 	if usable-projected >= minOutputTokens {
-		// The warning is a fraction of the budget, not the window: against the
-		// window it would fire after the compaction it warns about.
-		if trigger := usable * a.opts.WarnPercent / 100; projected >= trigger && !a.warned {
-			a.warned = true
-			a.emit(Event{Kind: EvNotice, Level: LevelInfo, Text: fmt.Sprintf(
-				"The next request is %s of the %s this session can use (%s window, %s kept free for the reply). "+
-					"ai-code will make room by itself when it fills up.",
-				compactTokens(projected), compactTokens(usable),
-				compactTokens(window), compactTokens(window-usable))})
+		if a.compactionDue(projected) {
+			return a.compactAhead(ctx)
 		}
 		return nil
 	}
 
 	return a.makeRoom(ctx, projected)
+}
+
+// measureRound records how much the round since the last check added. A
+// reply is counted at what it cost to generate, thinking included, since that
+// is what the output budget has to hold.
+func (a *Agent) measureRound() {
+	grown := 0
+	for _, m := range a.messages[min(a.roundFrom, len(a.messages)):] {
+		switch m.Role {
+		case provider.RoleAssistant:
+			grown += max(m.Completion, a.estimate(messageChars(m)))
+		case provider.RoleTool:
+			grown += a.estimate(messageChars(m))
+		}
+	}
+	a.largestRound = max(a.largestRound, grown)
+	a.roundFrom = len(a.messages)
+}
+
+// nextRoundTokens is how much room the next round may need: the largest this
+// session has produced, and at least one full tool result. Never more than
+// half the budget, the most a compaction is required to free, so a session
+// with one outsized round does not compact again straight after landing.
+func (a *Agent) nextRoundTokens() int {
+	usable := a.Usable()
+	return min(max(a.largestRound, a.budget().MaxToolResult), usable/2)
+}
+
+// CompactsAt is the size of request at which the model is asked to
+// summarise, or the budget itself when it never is.
+func (a *Agent) CompactsAt() int {
+	if !a.opts.AutoCompact || a.resumeFromTranscript {
+		return a.Usable()
+	}
+	return a.Usable() - a.nextRoundTokens()
+}
+
+// compactionDue reports whether the next round might not fit, which is the
+// last point a summary can still be written from the cached prefix.
+func (a *Agent) compactionDue(projected int) bool {
+	if !a.opts.AutoCompact || a.resumeFromTranscript || a.aheadFailed {
+		return false
+	}
+	return a.Usable()-projected < a.nextRoundTokens() && a.CompactionWorthwhile(0)
+}
+
+// compactAhead summarises while the session still fits. A failure is not
+// fatal: there is room left, and makeRoom still has its fallbacks.
+func (a *Agent) compactAhead(ctx context.Context) error {
+	a.emit(Event{Kind: EvNotice, Level: LevelInfo, Text: fmt.Sprintf(
+		"The next request is %s of the %s this session can use. Asking the model to summarise "+
+			"the older messages now, while the server still has them cached. "+
+			"Nothing is deleted -- the session on disk keeps every message.",
+		compactTokens(a.plannedTokens()), compactTokens(a.Usable()))})
+	ok, err := a.compactNow(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		a.emit(Event{Kind: EvNotice, Level: LevelWarn, Text: "Summarising failed: " + err.Error() +
+			". Carrying on; it is tried again when the window is full."})
+	}
+	// A summary that did not shrink the request would be asked for again
+	// every round.
+	a.aheadFailed = !ok
+	return nil
+}
+
+// compactNow runs one summary and reports it. ErrNothingToFree is not an
+// error here: it means there was nothing for a summary to stand in for.
+func (a *Agent) compactNow(ctx context.Context) (bool, error) {
+	res, err := a.Compact(ctx, 0)
+	if errors.Is(err, ErrNothingToFree) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	a.aheadFailed = false
+	a.emit(Event{Kind: EvCompacted, Text: res.Summary, Compaction: res,
+		Context: ptr(a.ContextState())})
+	return res.Rewrote, nil
 }
 
 // fits reports whether the next request leaves room to answer in.
@@ -841,13 +929,42 @@ func (a *Agent) fits() bool {
 	return usable <= 0 || usable-a.plannedTokens() >= minOutputTokens
 }
 
-// makeRoom makes room for the next request, cheapest first: prune, then
-// summarise, then drop the oldest turns. Never returns having freed nothing.
+// summaryCallFits reports whether a summary can be asked for on top of the
+// request as it stands, which is the request the server has cached.
+func (a *Agent) summaryCallFits() bool {
+	return a.plannedTokens()+a.summaryCallTokens() <= a.opts.ContextLimit
+}
+
+// makeRoom makes room for the next request once it no longer fits. A summary
+// from the model comes first, while the request it is written from is still
+// the one the server has cached. Clearing old tool output and dropping the
+// oldest turns lose detail a summary would have kept, so they are the
+// fallback. Never returns having freed nothing.
 func (a *Agent) makeRoom(ctx context.Context, before int) error {
 	window := a.opts.ContextLimit
 	usable := a.Usable()
+	summarised := false
 
-	// 1. Clear old tool output: no model call, no waiting.
+	// 1. Summarise from the cached request, if the summary still fits beside it.
+	if a.opts.AutoCompact && !a.resumeFromTranscript && a.summaryCallFits() {
+		a.emit(Event{Kind: EvNotice, Level: LevelInfo, Text: fmt.Sprintf(
+			"The next request would be %s, and the window is %s. Asking the model to summarise the older messages. "+
+				"Nothing is deleted -- the session on disk keeps every message.",
+			compactTokens(before), compactTokens(window))})
+		ok, err := a.compactNow(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			a.emit(Event{Kind: EvNotice, Level: LevelWarn, Text: "Summarising failed: " + err.Error() + "."})
+		}
+		summarised = err == nil
+		if ok && a.fits() {
+			return nil
+		}
+	}
+
+	// 2. Clear old tool output: no model call, but the model loses what it read.
 	if p := a.ClearOldOutput(); p.Results > 0 {
 		// Report what the next request saved, not the text removed: most of
 		// it was never in the request.
@@ -876,35 +993,24 @@ func (a *Agent) makeRoom(ctx context.Context, before int) error {
 			compactTokens(window-usable))
 	}
 
-	// 2. Summarise. One attempt: summarising is itself a request that has to
-	// fit, and nothing has been removed if it fails.
-	a.emit(Event{Kind: EvNotice, Level: LevelInfo, Text: fmt.Sprintf(
-		"The next request would be %s, and the window is %s. Summarising the older messages to make room. "+
-			"Nothing is deleted -- the session on disk keeps every message.",
-		compactTokens(a.plannedTokens()), compactTokens(window))})
-
-	res, err := a.Compact(ctx, 0)
-	switch {
-	case errors.Is(err, ErrNothingToFree):
-		// Nothing left a summary could stand in for; the escalation below is
-		// exactly that case.
-	case err != nil:
-		if ctx.Err() != nil {
-			return ctx.Err()
+	// 3. Summarise what clearing left, if the first attempt could not run.
+	// The cache is gone by now, but a summary still beats dropping turns.
+	if !summarised {
+		ok, err := a.compactNow(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("%w: the next request is %s, the window is %s, and summarising failed: %w.\n\n"+
+				"Start again with /new. The session on disk keeps every message",
+				ErrContextFull, compactTokens(a.plannedTokens()), compactTokens(window), err)
 		}
-		return fmt.Errorf("%w: the next request is %s, the window is %s, and summarising failed: %w.\n\n"+
-			"Start again with /new. The session on disk keeps every message",
-			ErrContextFull, compactTokens(a.plannedTokens()), compactTokens(window), err)
-	default:
-		res.Cleared, res.ClearedTokens = 0, 0
-		a.emit(Event{Kind: EvCompacted, Text: res.Summary, Compaction: res,
-			Context: ptr(a.ContextState())})
-		if a.fits() {
+		if ok && a.fits() {
 			return nil
 		}
 	}
 
-	// 3. The kept tail is still too large, so one turn inside it is. Drop the
+	// 4. The kept tail is still too large, so one turn inside it is. Drop the
 	// oldest, one at a time, and never the newest: the checkpoint was written
 	// before it, so dropping it loses work outright.
 	lastTurn := a.lastTurnStart()
@@ -931,7 +1037,7 @@ func (a *Agent) makeRoom(ctx context.Context, before int) error {
 		return nil
 	}
 
-	// 4. One message is larger than the whole budget. Say which.
+	// 5. One message is larger than the whole budget. Say which.
 	return fmt.Errorf("%w: %s",
 		ErrContextFull, a.oversizedMessage(usable))
 }

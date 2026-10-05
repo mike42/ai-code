@@ -527,7 +527,6 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 			ShowStatus:  showStatus,
 			Theme:       cfg.UI.Theme,
 			Reasoning:   cfg.UI.Reasoning,
-			WarnPercent: cfg.UI.ContextWarnPercent,
 			SteerPrompt: promptMarker,
 			Verbose:     f.verbose,
 		})
@@ -606,7 +605,6 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 			ParallelReads:   cfg.Agent.ParallelReads == nil || *cfg.Agent.ParallelReads,
 			LoopGuard:       cfg.Agent.LoopGuard,
 			ContextLimit:    limit,
-			WarnPercent:     cfg.UI.ContextWarnPercent,
 
 			Effort: thinking,
 
