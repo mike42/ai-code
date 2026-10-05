@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"runtime"
@@ -92,36 +93,73 @@ func (t *BashTool) Run(ctx context.Context, st *State, raw json.RawMessage) Resu
 		defer devNull.Close()
 	}
 
+	// The pipe is ours rather than exec's: cmd.Wait would also wait for every
+	// process holding it, including one that left the group and cannot be
+	// killed with it, and cancellation would then never return.
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return Errorf("could not create the output pipe: %v", err)
+	}
+	defer pr.Close()
 	buf := newBoundedBuffer(t.MaxOutputBytes)
-	cmd.Stdout = buf
-	cmd.Stderr = buf
+	cmd.Stdout = pw
+	cmd.Stderr = pw
 
 	start := time.Now()
-	if err := cmd.Start(); err != nil {
+	err = cmd.Start()
+	pw.Close()
+	if err != nil {
 		return Errorf("could not start the shell: %v", err)
 	}
 
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	copied := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(buf, pr)
+		close(copied)
+	}()
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
 
 	var (
 		waitErr   error
 		timedOut  bool
 		cancelled bool
 	)
-	select {
-	case waitErr = <-done:
-	case <-runCtx.Done():
-		// SIGTERM first so the command can clean up, then SIGKILL; both go to the whole process group.
-		killProcessGroup(cmd, true)
+	// Finished means the shell has exited and nothing holds its output open.
+	ex, cp := exited, copied
+	for ex != nil || cp != nil {
 		select {
-		case waitErr = <-done:
-		case <-time.After(2 * time.Second):
-			killProcessGroup(cmd, false)
-			waitErr = <-done
+		case waitErr = <-ex:
+			ex = nil
+		case <-cp:
+			cp = nil
+		case <-runCtx.Done():
+			// SIGTERM first so the command can clean up, then SIGKILL; both go to the whole process group.
+			killProcessGroup(cmd, true)
+			grace := time.After(2 * time.Second)
+			for ex != nil || cp != nil {
+				select {
+				case waitErr = <-ex:
+					ex = nil
+				case <-cp:
+					cp = nil
+				case <-grace:
+					killProcessGroup(cmd, false)
+					if ex != nil {
+						waitErr = <-ex
+						ex = nil
+					}
+					// Whatever still holds the pipe left the group; what it
+					// writes now is not this command's output. Closing unblocks
+					// the copy where the platform allows; elsewhere it ends
+					// when that process does, and is not waited for.
+					pr.Close()
+					cp = nil
+				}
+			}
+			timedOut = runCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
+			cancelled = ctx.Err() != nil
 		}
-		timedOut = runCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
-		cancelled = ctx.Err() != nil
 	}
 
 	elapsed := time.Since(start)
@@ -136,7 +174,7 @@ func (t *BashTool) Run(ctx context.Context, st *State, raw json.RawMessage) Resu
 
 	// Truncate runs on every reporting path: an early return would dump the whole buffer.
 	truncated, wasTruncated := Truncate(trim(output), t.MaxOutputBytes)
-	if buf.overflowed {
+	if buf.Overflowed() {
 		wasTruncated = true
 	}
 	excerpt := truncated
@@ -358,6 +396,12 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 		b.tail = b.tail[len(b.tail)-tailCap:]
 	}
 	return n, nil
+}
+
+func (b *boundedBuffer) Overflowed() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.overflowed
 }
 
 func (b *boundedBuffer) String() string {

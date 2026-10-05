@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -189,6 +190,83 @@ func TestCancellationKillsTheWholeProcessGroup(t *testing.T) {
 		_ = syscall.Kill(childPID, syscall.SIGKILL)
 		t.Errorf("grandchild %d survived cancellation; killing the PID is not enough, "+
 			"the whole process group must go", childPID)
+	}
+}
+
+// startAndWaitForPID runs cmd in the background, which must write a pid to
+// pidFile, and returns that pid and the channel the result arrives on.
+func startAndWaitForPID(t *testing.T, ctx context.Context, st *State, cmd, pidFile string) (int, chan Result) {
+	t.Helper()
+	done := make(chan Result, 1)
+	go func() { done <- bashTool().Run(ctx, st, mustJSON(t, bashArgs{Command: cmd})) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(pidFile); err == nil {
+			if p, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && p > 0 {
+				return p, done
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Skip("could not observe the background pid")
+	return 0, nil
+}
+
+// `server &` is the shape: the shell has exited and been reaped, so the group
+// can no longer be found through it, but the job still holds the output pipe.
+func TestCancellationAfterTheShellExitsKillsItsBackgroundJobs(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "job.pid")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pid, done := startAndWaitForPID(t, ctx, NewState(dir),
+		"sh -c 'echo $$ > "+pidFile+"; exec sleep 60' & echo started", pidFile)
+	defer func() { _ = syscall.Kill(pid, syscall.SIGKILL) }()
+	// Long enough for the shell to have exited and been reaped.
+	time.Sleep(300 * time.Millisecond)
+	cancel()
+
+	select {
+	case res := <-done:
+		if !res.Interrupted {
+			t.Errorf("want an interrupted result, got: %s", res.Content)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("cancellation did not return while a background job held the output")
+	}
+	for range 100 {
+		if syscall.Kill(pid, 0) != nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("background job %d survived cancellation", pid)
+}
+
+// A process that started its own session is outside the group and cannot be
+// killed with it; cancellation must still return rather than wait on it.
+func TestCancellationReturnsWhenAProcessLeftTheGroup(t *testing.T) {
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skip("no setsid command")
+	}
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "escaped.pid")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pid, done := startAndWaitForPID(t, ctx, NewState(dir),
+		"setsid sh -c 'echo $$ > "+pidFile+"; exec sleep 60' & sleep 60", pidFile)
+	defer func() { _ = syscall.Kill(pid, syscall.SIGKILL) }()
+	cancel()
+
+	select {
+	case res := <-done:
+		if !res.Interrupted {
+			t.Errorf("want an interrupted result, got: %s", res.Content)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("cancellation did not return while an escaped process held the output")
 	}
 }
 

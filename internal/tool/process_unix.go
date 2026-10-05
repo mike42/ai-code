@@ -18,7 +18,9 @@ func setProcessGroup(c *exec.Cmd) {
 }
 
 // killProcessGroup sends a signal to the entire group. The negative PID is what
-// makes it a group operation.
+// makes it a group operation. Setpgid made the group id the leader's PID, and
+// the group outlives its leader: after `job &` the shell is gone and reaped,
+// so the id cannot be looked up through it, but the job is still in the group.
 func killProcessGroup(c *exec.Cmd, graceful bool) {
 	if c.Process == nil {
 		return
@@ -27,12 +29,7 @@ func killProcessGroup(c *exec.Cmd, graceful bool) {
 	if graceful {
 		sig = syscall.SIGTERM
 	}
-	pgid, err := syscall.Getpgid(c.Process.Pid)
-	if err != nil {
-		_ = c.Process.Signal(sig)
-		return
-	}
-	_ = syscall.Kill(-pgid, sig)
+	_ = syscall.Kill(-c.Process.Pid, sig)
 }
 
 // OwnProcessGroup starts c in a process group of its own, so that a signal the
