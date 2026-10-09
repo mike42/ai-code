@@ -286,3 +286,21 @@ func TestTabWithoutCompletionsDoesNothing(t *testing.T) {
 		t.Errorf("display = %q, want the line untouched", got)
 	}
 }
+
+// A line Ctrl-C clears is handed over to be kept, not dropped; an empty line
+// has nothing to keep.
+func TestCtrlCHandsOverTheLineItClears(t *testing.T) {
+	st := newSteerTester()
+	var kept []string
+	st.Discarded = func(text string) { kept = append(kept, text) }
+
+	st.type_("do not lose this")
+	st.feed([]byte{3})
+	st.feed([]byte{3})
+	if len(kept) != 1 || kept[0] != "do not lose this" {
+		t.Errorf("kept %q, want the cleared line once", kept)
+	}
+	if st.interrupt != 1 {
+		t.Errorf("interrupts = %d, want 1 from the second Ctrl-C", st.interrupt)
+	}
+}

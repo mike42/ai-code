@@ -41,8 +41,6 @@ type DevcontainerExecutor struct {
 	workdir string
 	// progress names each startup phase as it is reached.
 	progress tool.Progress
-	// ready guards the one-off "ready" note; teardown clears it.
-	ready bool
 
 	// host names the executor that owns the container on a fork; a fork runs a
 	// second daemon inside it, so agents share a filesystem.
@@ -506,11 +504,6 @@ func (e *DevcontainerExecutor) Execute(ctx context.Context, req tool.Request) (t
 		return tool.Errorf("%s", msg), nil
 	}
 	e.answered = true
-	if !e.ready {
-		// The first reply is the first evidence the container daemon answers.
-		e.ready = true
-		e.report("devcontainer: ready.")
-	}
 	return res, nil
 }
 
@@ -531,7 +524,6 @@ func (e *DevcontainerExecutor) failure(op string, err error) string {
 
 // teardown drops the dead container so the next start builds a fresh one.
 func (e *DevcontainerExecutor) teardown() {
-	e.ready = false
 	e.cmd = nil
 	e.client = nil
 	e.init = nil

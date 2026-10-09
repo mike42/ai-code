@@ -61,8 +61,11 @@ type Interactive struct {
 	steerText   string
 	steerCol    int
 	steerActive bool
-	// steerQueued counts messages submitted but not yet folded in. The status
-	// line has to say they were received, or Enter looks like it did nothing.
+	// queueSource reports how many submitted lines are waiting, read from the
+	// queues themselves so no path that drains one can leave a stale count.
+	// The status line has to say they were received, or Enter looks like it did
+	// nothing. steerQueued is its reading for the line being drawn.
+	queueSource func() int
 	steerQueued int
 
 	// dirty coalesces transient-zone repaints: deltas set it, and the ticker
@@ -260,9 +263,6 @@ func (r *Interactive) Emit(e agent.Event) {
 		// Always into the scrollback, even a single line: it only ever existed
 		// in the transient zone, which the next committed line erases.
 		r.md.Flush()
-		r.mu.Lock()
-		r.steerQueued = max(0, r.steerQueued-1)
-		r.mu.Unlock()
 		if label, ok := workerReportLabel(e.Text); ok {
 			// The report body was committed in full when it arrived, so only
 			// the moment it was given to the model belongs here.
@@ -536,10 +536,19 @@ func firstLines(s string, n int) []string {
 	return lines
 }
 
-// SetQueued reports how many steering messages are waiting to be folded in.
-func (r *Interactive) SetQueued(n int) {
+// SetQueueSource sets where the status line reads how many submitted lines
+// are waiting. It is called without the renderer's lock held, so it may take
+// locks of its own, but must not call back into the renderer.
+func (r *Interactive) SetQueueSource(f func() int) {
 	r.mu.Lock()
-	r.steerQueued = n
+	r.queueSource = f
+	r.mu.Unlock()
+}
+
+// QueueChanged repaints at once, so a submitted line is acknowledged without
+// waiting for the next tick.
+func (r *Interactive) QueueChanged() {
+	r.mu.Lock()
 	r.dirty = true
 	r.mu.Unlock()
 	r.redraw()
@@ -599,6 +608,15 @@ func (r *Interactive) redraw() {
 	width := r.screen.Width()
 
 	r.mu.Lock()
+	source := r.queueSource
+	r.mu.Unlock()
+	queued := 0
+	if source != nil {
+		queued = source()
+	}
+
+	r.mu.Lock()
+	r.steerQueued = queued
 	partial := r.partial
 	reasoning := r.reasoning
 	notice := r.notice

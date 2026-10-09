@@ -172,17 +172,46 @@ func TestQueuedCommandsRunInOrderAndClear(t *testing.T) {
 
 	a.queueCommand("/think high")
 	a.queueCommand("/tokens")
-	if n := a.pendingCommands(); n != 2 {
+	if n := a.queuedCount(); n != 2 {
 		t.Fatalf("queued %d commands, want 2", n)
 	}
 
 	captureOut(t, func() { a.runQueuedCommands(context.Background()) })
 
-	if n := a.pendingCommands(); n != 0 {
+	if n := a.queuedCount(); n != 0 {
 		t.Errorf("%d commands left queued after running them", n)
 	}
 	if got := a.agent.Effort(); got != provider.EffortHigh {
 		t.Errorf("the queued /think did not take effect: effort = %q", got)
+	}
+}
+
+// The status line's count is read from the queues, so each way a queue drains
+// brings it back down: steering folded in or discarded, commands run at the
+// boundary, prompts deferred past a swap taken up.
+func TestQueuedCountFollowsEveryQueue(t *testing.T) {
+	a := statusApp(t, provider.ModelInfo{ID: "a-model", ContextWindow: 65536})
+
+	a.agent.Steer("look at the tests too")
+	a.queueCommand("/tokens")
+	a.queuePrompt("and then the docs")
+	if n := a.queuedCount(); n != 3 {
+		t.Fatalf("count = %d, want 3: one of each kind", n)
+	}
+
+	captureOut(t, func() { a.runQueuedCommands(context.Background()) })
+	if n := a.queuedCount(); n != 2 {
+		t.Errorf("count = %d after the command ran, want 2", n)
+	}
+	if _, ok := a.takeDeferredPrompt(); !ok {
+		t.Fatal("the deferred prompt was lost")
+	}
+	if n := a.queuedCount(); n != 1 {
+		t.Errorf("count = %d after the deferred prompt was taken, want 1", n)
+	}
+	a.agent.TakeSteering()
+	if n := a.queuedCount(); n != 0 {
+		t.Errorf("count = %d after steering was discarded, want 0", n)
 	}
 }
 

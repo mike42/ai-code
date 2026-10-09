@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"ai-code/internal/agent"
@@ -98,6 +99,12 @@ type App struct {
 	// steerMu guards steering: whether the terminal is already open for input.
 	steerMu  sync.Mutex
 	steering bool
+	// typed is every line entered at the steering prompt, sent or cleared,
+	// waiting to join the input history when the prompt closes.
+	typed []string
+	// steerInterrupted is set when Ctrl-C at the steering prompt cancelled the
+	// turn: the user stopped it to be heard, so queued steering runs next.
+	steerInterrupted atomic.Bool
 
 	cmdMu      sync.Mutex
 	queuedCmds []string
@@ -230,8 +237,22 @@ func (a *App) out(lines ...string) {
 }
 
 // runTurn executes one exchange, with Ctrl-C bound to cancellation and the
-// terminal open for steering.
+// terminal open for steering. A turn the user cancelled from the steering
+// prompt is followed straight away by one carrying the messages they queued.
 func (a *App) runTurn(parent context.Context, input string) error {
+	for {
+		cancelled, err := a.runOnce(parent, input)
+		if err != nil || !cancelled || !a.steerInterrupted.Swap(false) ||
+			parent.Err() != nil || a.agent.Pending() == 0 {
+			return err
+		}
+		input = ""
+	}
+}
+
+// runOnce is one exchange of runTurn, reporting whether it was cancelled.
+func (a *App) runOnce(parent context.Context, input string) (cancelled bool, err error) {
+	a.steerInterrupted.Store(false)
 	ctx, cancel := context.WithCancel(parent)
 	restore := installInterrupt(cancel)
 	defer restore()
@@ -248,9 +269,9 @@ func (a *App) runTurn(parent context.Context, input string) error {
 	if err := a.claim(ctx); err != nil {
 		if ctx.Err() != nil {
 			a.note("Not sent.")
-			return nil
+			return false, nil
 		}
-		return err
+		return false, err
 	}
 	defer a.finishRun()
 	a.lastRoundModel = a.agent.Model()
@@ -263,24 +284,30 @@ func (a *App) runTurn(parent context.Context, input string) error {
 		defer a.interactive.SetBusy(false)
 	}
 
-	err := a.agent.Run(holding(ctx), input)
+	err = a.agent.Run(holding(ctx), input)
 	a.lastRoundModel = a.agent.Model()
 	if line := a.displacedNote(); line != "" {
 		a.note(line)
 	}
 
-	a.pendingInput = stopSteering()
+	a.keepPending(stopSteering())
 
-	if ctx.Err() != nil {
-		// The turn was cancelled: steering queued but not folded in is dropped.
-		if n := len(a.agent.TakeSteering()); n > 0 {
-			noun := "steering message"
-			if n > 1 {
-				noun += "s"
-			}
-			a.note(fmt.Sprintf("Discarded %d %s queued while the cancelled turn was running.", n, noun))
+	// Steering queued when the turn was cancelled stays queued: runTurn sends
+	// it next if the user cancelled to be heard, otherwise the next turn
+	// carries it ahead of whatever starts that turn.
+	cancelled = ctx.Err() != nil
+	if n := a.agent.Pending(); cancelled && n > 0 && !a.steerInterrupted.Load() {
+		line := "1 steering message kept; it goes to the model with the next message."
+		if n > 1 {
+			line = fmt.Sprintf("%d steering messages kept; they go to the model with the next message.", n)
 		}
+		a.note(line)
 	}
+
+	// A turn that ends without a tool call never reaches the boundary between
+	// iterations, so commands typed during it run here. A cancelled turn still
+	// runs them: they were asked for, and change nothing it would have sent.
+	a.runQueuedCommands(holding(parent))
 
 	a.recordNew()
 	a.recordCheckpoint()
@@ -297,7 +324,44 @@ func (a *App) runTurn(parent context.Context, input string) error {
 	if a.turnErr != nil {
 		err, a.turnErr = a.turnErr, nil
 	}
-	return err
+	return cancelled, err
+}
+
+// keepPending adds text left unsent at a closing steering prompt to what the
+// next prompt starts with, rather than replacing what an earlier one left.
+func (a *App) keepPending(left string) {
+	if strings.TrimSpace(left) == "" {
+		return
+	}
+	if a.pendingInput != "" {
+		a.pendingInput += "\n"
+	}
+	a.pendingInput += left
+}
+
+// rememberTyped holds a line entered at the steering prompt for the history.
+// It runs on the steering goroutine, so the history is written later, by
+// recordTyped on the goroutine that owns the editor and the session file.
+func (a *App) rememberTyped(text string) {
+	a.steerMu.Lock()
+	a.typed = append(a.typed, text)
+	a.steerMu.Unlock()
+}
+
+// recordTyped moves lines entered at the steering prompt into the input
+// history and the session file, in the order they were typed.
+func (a *App) recordTyped() {
+	a.steerMu.Lock()
+	typed := a.typed
+	a.typed = nil
+	a.steerMu.Unlock()
+	ed := a.liveEditor()
+	for _, line := range typed {
+		if ed != nil {
+			ed.AddHistory(line)
+		}
+		a.recordInput(line)
+	}
 }
 
 // cancelTurn stops the running turn, if any, as Ctrl-C would.
@@ -332,14 +396,20 @@ func (a *App) steerWith(cancel context.CancelFunc, submit func(string)) func() s
 	a.steering = true
 	a.steerMu.Unlock()
 
+	if submit == nil {
+		submit = a.steerSubmit
+	}
 	st := ui.NewSteerer(int(os.Stdin.Fd()))
 	st.Render = a.interactive.SetSteering
-	if submit != nil {
-		st.Submit = submit
-	} else {
-		st.Submit = a.steerSubmit
+	st.Submit = func(text string) {
+		a.rememberTyped(text)
+		submit(text)
 	}
-	st.Interrupt = cancel
+	st.Discarded = a.rememberTyped
+	st.Interrupt = func() {
+		a.steerInterrupted.Store(true)
+		cancel()
+	}
 	st.Control = a.interactive.Control
 	// The same candidates the prompt offers.
 	st.Completions = a.complete
@@ -356,6 +426,7 @@ func (a *App) steerWith(cancel context.CancelFunc, submit func(string)) func() s
 		a.steerMu.Lock()
 		a.steering = false
 		a.steerMu.Unlock()
+		a.recordTyped()
 		return left
 	}
 }
@@ -372,14 +443,14 @@ func (a *App) steerSubmit(text string) {
 				return
 			}
 			a.queueCommand(text)
-			a.interactive.SetQueued(a.agent.Pending() + a.pendingCommands())
+			a.interactive.QueueChanged()
 			return
 		}
 		if !a.agent.Steer(text) {
 			return
 		}
 		// The status line acknowledges it; the scrollback waits for EvSteer.
-		a.interactive.SetQueued(a.agent.Pending() + a.pendingCommands())
+		a.interactive.QueueChanged()
 	}
 }
 
@@ -1012,10 +1083,9 @@ func (a *App) queuePrompt(line string) {
 	}
 	a.cmdMu.Lock()
 	a.deferredPrompts = append(a.deferredPrompts, line)
-	n := len(a.deferredPrompts)
 	a.cmdMu.Unlock()
 	if a.interactive != nil {
-		a.interactive.SetQueued(n)
+		a.interactive.QueueChanged()
 	}
 }
 
@@ -1052,10 +1122,13 @@ func (a *App) queueCommand(line string) {
 	a.cmdMu.Unlock()
 }
 
-func (a *App) pendingCommands() int {
+// queuedCount is every line submitted during a turn or a swap and not yet
+// acted on: steering, slash commands and deferred prompts.
+func (a *App) queuedCount() int {
+	n := a.agent.Pending()
 	a.cmdMu.Lock()
 	defer a.cmdMu.Unlock()
-	return len(a.queuedCmds)
+	return n + len(a.queuedCmds) + len(a.deferredPrompts)
 }
 
 // runQueuedCommands executes commands typed during the turn at the boundary,

@@ -128,26 +128,61 @@ func stripCursorMoves(s string) string {
 // the only place that can acknowledge it.
 func TestQueuedSteeringIsAcknowledgedInTheStatusLine(t *testing.T) {
 	r, buf := newSteerRenderer(80)
+	queued := 1
+	r.SetQueueSource(func() int { return queued })
 
-	r.SetQueued(1)
+	r.QueueChanged()
 	if got := Strip(buf.String()); !strings.Contains(got, "1 steering message queued") {
 		t.Errorf("status = %q, want it to acknowledge the queued message", got)
 	}
 
-	r.SetQueued(2)
+	queued = 2
 	buf.Reset()
 	r.redraw()
 	if got := Strip(buf.String()); !strings.Contains(got, "2 steering messages queued") {
 		t.Errorf("status = %q, want a plural count", got)
 	}
+}
 
-	// Folding one in clears it from the count.
+// A queue can drain with no event the renderer sees -- a cancelled turn
+// discards steering, a slash command runs at the boundary -- and the line must
+// not keep reporting what is gone.
+func TestQueuedCountClearsWhenTheQueueDrainsSilently(t *testing.T) {
+	r, buf := newSteerRenderer(80)
+	queued := 1
+	r.SetQueueSource(func() int { return queued })
+	r.QueueChanged()
+
+	queued = 0
+	buf.Reset()
+	r.redraw()
+	if got := Strip(buf.String()); strings.Contains(got, "queued") {
+		t.Errorf("status = %q, want no queued count once the queue is empty", got)
+	}
+}
+
+// The fold-in event can arrive before the submitter's acknowledgement; the
+// order must not leave a count behind, nor subtract from what is still queued.
+func TestQueuedCountIgnoresEventOrder(t *testing.T) {
+	r, buf := newSteerRenderer(80)
 	r.md = NewMarkdown(func(string) {}, func([]string) {}, Style{}, false, "", func() int { return 80 })
-	r.Emit(agent.Event{Kind: agent.EvSteer, Text: "one of them"})
+	queued := 0
+	r.SetQueueSource(func() int { return queued })
+
+	r.Emit(agent.Event{Kind: agent.EvSteer, Text: "already folded in"})
+	r.QueueChanged()
+	buf.Reset()
+	r.redraw()
+	if got := Strip(buf.String()); strings.Contains(got, "queued") {
+		t.Errorf("status = %q, want nothing queued after a late acknowledgement", got)
+	}
+
+	queued = 1
+	r.Emit(agent.Event{Kind: agent.EvSteer, Text: "a worker report nobody counted"})
 	buf.Reset()
 	r.redraw()
 	if got := Strip(buf.String()); !strings.Contains(got, "1 steering message queued") {
-		t.Errorf("status = %q, want the count down to one", got)
+		t.Errorf("status = %q, want the message still queued to be shown", got)
 	}
 }
 

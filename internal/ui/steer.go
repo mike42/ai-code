@@ -22,6 +22,9 @@ type Steerer struct {
 	Submit func(text string)
 	// Interrupt is called for Ctrl-C on an empty line.
 	Interrupt func()
+	// Discarded receives a line Ctrl-C cleared without sending, so it can be
+	// kept in history rather than lost.
+	Discarded func(text string)
 	// Completions supplies Tab candidates for the line up to the cursor, in the
 	// same shape as Editor.Completions. Called off the lock; it reads the
 	// filesystem.
@@ -392,13 +395,16 @@ func (s *Steerer) edit(f func()) {
 // discard clears the buffer, reporting whether it was already empty.
 func (s *Steerer) discard() (wasEmpty bool) {
 	s.mu.Lock()
-	wasEmpty = len(s.buf) == 0
+	text := string(s.buf)
 	s.buf, s.cur = nil, 0
 	s.mu.Unlock()
 	if s.Render != nil {
 		s.Render("", 0, false)
 	}
-	return wasEmpty
+	if strings.TrimSpace(text) != "" && s.Discarded != nil {
+		s.Discarded(text)
+	}
+	return text == ""
 }
 
 func (s *Steerer) submit() {

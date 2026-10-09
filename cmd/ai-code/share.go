@@ -545,7 +545,7 @@ func (a *App) swapTo(parent context.Context, client provider.Client, server stri
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	stopSteering := a.steerWith(cancel, a.queuePrompt)
-	defer func() { a.pendingInput = stopSteering() }()
+	defer func() { a.keepPending(stopSteering()) }()
 	defer a.status("")
 
 	s := a.share

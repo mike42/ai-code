@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"os/exec"
 	goruntime "runtime"
 	"strconv"
@@ -282,5 +283,35 @@ func TestForeignContainerWithTheSameNameIsLeftAlone(t *testing.T) {
 	}
 	if _, _, exists := inspectKept(engine, containerName(project)); !exists {
 		t.Fatal("the foreign container was removed")
+	}
+}
+
+// A note that is not the last phase stays on screen until a later one replaces
+// it, and it hides the streaming reply and the thinking line while it does. So
+// a call must never return with one still showing.
+func TestACallLeavesNoUnfinishedNoteBehind(t *testing.T) {
+	toWorker, workerIn := io.Pipe()
+	workerOut, fromWorker := io.Pipe()
+	go func() { _ = worker.Serve(toWorker, fromWorker, t.TempDir()) }()
+	defer workerIn.Close()
+
+	client, err := worker.NewClient(workerIn, workerOut, worker.Settings{})
+	if err != nil {
+		t.Fatalf("starting the in-process worker: %v", err)
+	}
+	var phases []tool.Phase
+	e := &DevcontainerExecutor{cmd: exec.Command("true"), client: client, stderr: newCappedBuffer(stderrCap)}
+	e.SetProgress(func(p tool.Phase) { phases = append(phases, p) })
+
+	for i := range 2 {
+		res, err := e.Execute(context.Background(), tool.Request{
+			CallID: strconv.Itoa(i), Name: "bash", Args: []byte(`{"command":"echo hi"}`),
+		})
+		if err != nil || res.IsError {
+			t.Fatalf("call %d: %v %s", i, err, res.Content)
+		}
+		if n := len(phases); n > 0 && !phases[n-1].Done {
+			t.Fatalf("call %d returned with %q still showing", i, phases[n-1].Note)
+		}
 	}
 }

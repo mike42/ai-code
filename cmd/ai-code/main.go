@@ -612,6 +612,10 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 			ReserveTokens:    cfg.Agent.CompactReserveTokens,
 			KeepRecentTokens: cfg.Agent.CompactKeepRecentTokens,
 		})
+	if interactive != nil {
+		// Only once the agent exists: the renderer's ticker calls this.
+		interactive.SetQueueSource(app.queuedCount)
+	}
 	// After Attach, so the prompt recites the task tool.
 	tasks.Attach(ctx, app.agent)
 	app.workers = tasks.Pool()
