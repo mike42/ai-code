@@ -83,7 +83,8 @@ type App struct {
 
 	sess    *session.Session
 	resumed []provider.Message
-	// resumedInputs is the command history recovered from the session file.
+	// resumedInputs is the command history recovered from the resumed session,
+	// or for a new one, from the last session here that had any.
 	resumedInputs []string
 	recorded      int
 	// recordedSummary is the standby checkpoint already on disk.
@@ -158,6 +159,10 @@ func (a *App) openSession(f *flags) error {
 		}
 		return nil
 	}
+
+	// Before Create, or the new empty file would be the newest. Up history
+	// only: the conversation itself starts fresh.
+	a.resumedInputs, _ = session.PreviousInputs(a.sessionProject)
 
 	s, err := session.Create(session.Meta{
 		Project:  a.sessionProject,

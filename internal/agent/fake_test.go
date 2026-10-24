@@ -73,6 +73,8 @@ type scriptedTurn struct {
 	stop      provider.StopReason
 	usage     provider.Usage
 	err       error
+	// cutErr ends the stream with this error once its events are sent.
+	cutErr error
 }
 
 func (c *scriptedClient) Name() string          { return "scripted" }
@@ -230,6 +232,9 @@ func chunks(s string, n int) []string {
 
 func (s *scriptedStream) Recv() (provider.Event, error) {
 	if s.i >= len(s.events) {
+		if s.turn.cutErr != nil {
+			return provider.Event{}, s.turn.cutErr
+		}
 		return provider.Event{}, io.EOF
 	}
 	e := s.events[s.i]

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"ai-code/internal/provider"
 )
@@ -353,5 +354,41 @@ func TestStateDirHoldsSessionsAndNotes(t *testing.T) {
 	}
 	if w, _ := WorkspaceDir("/any"); w != dir {
 		t.Errorf("notes go to %s, want %s", w, dir)
+	}
+}
+
+func TestPreviousInputsComeFromTheLastSessionThatHadAny(t *testing.T) {
+	tempRoot(t)
+	mk := func(project string, mod time.Time, inputs ...string) {
+		t.Helper()
+		s, err := Create(Meta{Project: project})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, in := range inputs {
+			_ = s.Append(Entry{Type: EntryInput, Input: in})
+		}
+		s.Close()
+		if err := os.Chtimes(s.Path(), mod, mod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base := time.Now().Add(-time.Hour)
+	mk("/p", base, "oldest prompt")
+	mk("/p", base.Add(2*time.Minute), "mega prompt", "/quit")
+	mk("/p", base.Add(3*time.Minute)) // quit before typing anything
+	mk("/other", base.Add(4*time.Minute), "a different project")
+
+	got, err := PreviousInputs("/p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"mega prompt", "/quit"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("PreviousInputs() = %q, want %q", got, want)
+	}
+
+	if got, err := PreviousInputs("/nowhere"); err != nil || got != nil {
+		t.Errorf("PreviousInputs for a new project = %q, %v; want nothing", got, err)
 	}
 }

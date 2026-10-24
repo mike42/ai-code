@@ -2,6 +2,9 @@ package agent
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -44,6 +47,9 @@ type Agent struct {
 	// the run once that round of results is in. Calls run concurrently.
 	unavailableMu sync.Mutex
 	unavailable   *tool.Unavailable
+
+	// streamErr is why the last response stream died, for answerCutOff.
+	streamErr error
 
 	client   provider.Client
 	model    string
@@ -382,6 +388,28 @@ func (a *Agent) Run(ctx context.Context, userInput string) error {
 			return err
 		}
 
+		if stop == provider.StopAborted {
+			results, cause, goOn := a.answerCutOff(&assistant)
+			a.messages = append(a.messages, assistant)
+			a.messages = append(a.messages, results...)
+			if goOn && len(assistant.ToolCalls) == 0 {
+				a.messages = append(a.messages, provider.Message{Role: provider.RoleUser,
+					Content: "[ai-code] Your last response was cut off before it finished: " +
+						cause + ". Carry on from where it stopped."})
+			}
+			a.publish()
+			if !goOn {
+				a.emit(Event{Kind: EvDone, Text: string(stop), Context: ptr(a.ContextState())})
+				return nil
+			}
+			a.applySteering()
+			if a.atBoundary != nil && a.atBoundary(ctx) {
+				a.emit(Event{Kind: EvDone, Text: "stopped", Context: ptr(a.ContextState())})
+				return nil
+			}
+			continue
+		}
+
 		// The reported figures travel on the message itself, attached in streamTurn.
 		a.messages = append(a.messages, assistant)
 		a.publish()
@@ -509,13 +537,13 @@ func (a *Agent) streamTurn(ctx context.Context, turn int) (msg provider.Message,
 			break
 		}
 		if err != nil {
-			// A stream that dies mid-turn leaves a partial assistant message.
-			// Partial text is kept; partial tool calls are discarded by
-			// finishPartial, a truncated arguments blob being worse than none.
+			// A stream that dies mid-turn leaves a partial assistant message;
+			// Run answers its calls as failures so the model can re-issue them.
 			if ctx.Err() != nil {
 				return provider.Message{}, "", false, false, ctx.Err()
 			}
-			return a.finishPartial(stream), provider.StopAborted, false, reasoned, nil
+			a.streamErr = err
+			return partialMessage(stream.Message()), provider.StopAborted, false, reasoned, nil
 		}
 
 		switch ev.Kind {
@@ -565,18 +593,84 @@ func (a *Agent) noticeEmptyTurn(assistant provider.Message, reasoned bool) {
 	a.emit(Event{Kind: EvNotice, Level: LevelWarn, Text: text})
 }
 
-func (a *Agent) finishPartial(stream provider.Stream) provider.Message {
-	msg := stream.Message()
-	if len(msg.ToolCalls) > 0 {
-		a.emit(Event{Kind: EvNotice, Level: LevelWarn, Text: fmt.Sprintf(
-			"The response stream ended early; %s were incomplete and were discarded.",
-			pluralise(len(msg.ToolCalls), "tool call"))})
-		msg.ToolCalls = nil
+// partialMessage makes what arrived before a stream died safe to send back.
+// Calls are kept so the model can be told they failed: each gets an id if it
+// had none, and arguments that are not valid JSON become "{}" because a
+// server may reject the request over them. A call cut off before its name
+// arrived is dropped, as there is nothing to tell the model it was.
+func partialMessage(msg provider.Message) provider.Message {
+	calls := msg.ToolCalls[:0:0]
+	for _, tc := range msg.ToolCalls {
+		if tc.Name == "" {
+			continue
+		}
+		if tc.ID == "" {
+			tc.ID = "call_cut_" + randomHex(8)
+		}
+		calls = append(calls, tc)
 	}
-	if strings.TrimSpace(msg.Content) == "" {
-		msg.Content = "(the response was cut off before any output arrived)"
-	}
+	msg.ToolCalls = calls
 	return msg
+}
+
+// answerCutOff gives the model feedback on a response whose stream died, the
+// way a failed tool reports back, and reports whether the run should go on.
+// It stops only when nothing at all arrived: that is the server failing, not
+// the model, and another request would most likely meet the same fate.
+func (a *Agent) answerCutOff(msg *provider.Message) (results []provider.Message, cause string, goOn bool) {
+	cause = fmt.Sprintf("the response stream ended with an error: %v", a.streamErr)
+	a.streamErr = nil
+
+	if len(msg.ToolCalls) == 0 && strings.TrimSpace(msg.Content) == "" &&
+		strings.TrimSpace(msg.Reasoning) == "" {
+		msg.Content = "(the response was cut off before any output arrived)"
+		a.emit(Event{Kind: EvNotice, Level: LevelWarn, Text: fmt.Sprintf(
+			"The response was cut off before anything arrived: %s.", cause)})
+		return nil, cause, false
+	}
+
+	if len(msg.ToolCalls) == 0 {
+		a.emit(Event{Kind: EvNotice, Level: LevelWarn, Text: fmt.Sprintf(
+			"The response was cut off: %s. The model has been told to carry on.", cause)})
+		return nil, cause, true
+	}
+
+	n := len(msg.ToolCalls)
+	verb := "was"
+	if n > 1 {
+		verb = "were"
+	}
+	a.emit(Event{Kind: EvNotice, Level: LevelWarn, Text: fmt.Sprintf(
+		"The response was cut off: %s. %s %s not run; the model has been told so it can retry.",
+		cause, pluralise(n, "tool call"), verb)})
+
+	for i, tc := range msg.ToolCalls {
+		complete := json.Valid([]byte(tc.Args))
+		if !complete {
+			msg.ToolCalls[i].Args = "{}"
+		}
+		results = append(results, provider.Message{
+			Role: provider.RoleTool, ToolCallID: tc.ID, Name: tc.Name, IsError: true,
+			Content: cutOffFeedback(cause, tc, complete),
+		})
+	}
+	return results, cause, true
+}
+
+func cutOffFeedback(cause string, tc provider.ToolCall, complete bool) string {
+	if complete {
+		return fmt.Sprintf("This call was not run: your response was cut off before it finished "+
+			"(%s). Nothing it would have done has happened. Issue it again if it is still needed.", cause)
+	}
+	return fmt.Sprintf("This call was not run: your response was cut off while its arguments "+
+		"were being written (%s), so only %d characters of them arrived. Nothing it would have "+
+		"done has happened. Issue the call again in full.", cause, len(tc.Args))
+}
+
+func randomHex(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 // dispatch runs the requested tools and returns their results in call order.
@@ -720,7 +814,7 @@ const (
 	// DefaultKeepRecentTokens is how much of the tail survives verbatim.
 	DefaultKeepRecentTokens = 20000
 	// minOutputTokens is the least room worth starting a turn with: under this
-	// a turn stops mid-arguments and finishPartial throws the call away.
+	// a turn stops mid-arguments and the call cannot run.
 	minOutputTokens = 512
 )
 

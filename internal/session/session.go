@@ -399,6 +399,52 @@ func Latest(project string) (*Info, error) {
 	return &all[0], nil
 }
 
+// PreviousInputs returns the input history of the most recently written
+// session for project that has any, so a fresh session can offer it on Up.
+// Files are read newest first and only until one has inputs: a session quit
+// before anything was typed is passed over rather than ending the search.
+func PreviousInputs(project string) ([]string, error) {
+	dir, err := dirFor(project)
+	if err != nil {
+		return nil, err
+	}
+	des, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	type candidate struct {
+		path string
+		mod  time.Time
+	}
+	var files []candidate
+	for _, de := range des {
+		if de.IsDir() || !strings.HasSuffix(de.Name(), ".jsonl") {
+			continue
+		}
+		fi, err := de.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, candidate{filepath.Join(dir, de.Name()), fi.ModTime()})
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].mod.After(files[j].mod) })
+
+	for _, c := range files {
+		entries, meta, err := readFile(c.path)
+		if err != nil || meta.Project != project {
+			continue
+		}
+		if in := Inputs(entries); len(in) > 0 {
+			return in, nil
+		}
+	}
+	return nil, nil
+}
+
 func firstLine(s string, max int) string {
 	s = strings.TrimSpace(s)
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
