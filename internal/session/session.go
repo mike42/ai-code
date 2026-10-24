@@ -399,10 +399,7 @@ func Latest(project string) (*Info, error) {
 	return &all[0], nil
 }
 
-// PreviousInputs returns the input history of the most recently written
-// session for project that has any, so a fresh session can offer it on Up.
-// Files are read newest first and only until one has inputs: a session quit
-// before anything was typed is passed over rather than ending the search.
+// PreviousInputs returns the inputs of the newest session for project that has any.
 func PreviousInputs(project string) ([]string, error) {
 	dir, err := dirFor(project)
 	if err != nil {

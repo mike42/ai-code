@@ -577,6 +577,21 @@ func (r *Interactive) SetNotice(text string) {
 	r.redraw()
 }
 
+// CommitOutput commits one line of external command output, sanitised.
+func (r *Interactive) CommitOutput(line string) {
+	line = strings.Map(func(c rune) rune {
+		if c == '\t' {
+			return ' '
+		}
+		if c < 0x20 || c == 0x7f {
+			return -1
+		}
+		return c
+	}, Strip(line))
+	r.screen.Commit(r.style.Dim("  " + line))
+	r.redraw()
+}
+
 // SetSteering reports the line being typed during the turn. While active it
 // takes the bottom line in place of the status line; clearing it gives the row
 // back.

@@ -42,8 +42,7 @@ func (s Style) Warn(t string) string    { return s.wrap(codeYellow, t) }
 func (s Style) Error(t string) string   { return s.wrap(codeRed, t) }
 func (s Style) Accent(t string) string  { return s.wrap(codeMagenta, t) }
 
-// Strip removes every escape sequence. Used by the golden tests that assert on
-// what a selection would actually contain.
+// Strip removes every escape sequence.
 func Strip(s string) string {
 	var b strings.Builder
 	inEsc := false

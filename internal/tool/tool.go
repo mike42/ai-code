@@ -100,6 +100,8 @@ type Progress func(Phase)
 type Phase struct {
 	Note string
 	Done bool
+	// Output: Note is a line of command output for the scrollback.
+	Output bool
 }
 
 // ProgressReporter is an executor whose first call can block long enough to

@@ -48,7 +48,7 @@ type Agent struct {
 	unavailableMu sync.Mutex
 	unavailable   *tool.Unavailable
 
-	// streamErr is why the last response stream died, for answerCutOff.
+	// streamErr is why the last stream died.
 	streamErr error
 
 	client   provider.Client
@@ -537,8 +537,7 @@ func (a *Agent) streamTurn(ctx context.Context, turn int) (msg provider.Message,
 			break
 		}
 		if err != nil {
-			// A stream that dies mid-turn leaves a partial assistant message;
-			// Run answers its calls as failures so the model can re-issue them.
+			// Run answers the partial message's calls as failures.
 			if ctx.Err() != nil {
 				return provider.Message{}, "", false, false, ctx.Err()
 			}
@@ -593,11 +592,7 @@ func (a *Agent) noticeEmptyTurn(assistant provider.Message, reasoned bool) {
 	a.emit(Event{Kind: EvNotice, Level: LevelWarn, Text: text})
 }
 
-// partialMessage makes what arrived before a stream died safe to send back.
-// Calls are kept so the model can be told they failed: each gets an id if it
-// had none, and arguments that are not valid JSON become "{}" because a
-// server may reject the request over them. A call cut off before its name
-// arrived is dropped, as there is nothing to tell the model it was.
+// partialMessage keeps cut-off calls sendable: ids filled in, nameless ones dropped.
 func partialMessage(msg provider.Message) provider.Message {
 	calls := msg.ToolCalls[:0:0]
 	for _, tc := range msg.ToolCalls {
@@ -613,10 +608,7 @@ func partialMessage(msg provider.Message) provider.Message {
 	return msg
 }
 
-// answerCutOff gives the model feedback on a response whose stream died, the
-// way a failed tool reports back, and reports whether the run should go on.
-// It stops only when nothing at all arrived: that is the server failing, not
-// the model, and another request would most likely meet the same fate.
+// answerCutOff reports a dead stream to the model as failed calls; stops only if nothing arrived.
 func (a *Agent) answerCutOff(msg *provider.Message) (results []provider.Message, cause string, goOn bool) {
 	cause = fmt.Sprintf("the response stream ended with an error: %v", a.streamErr)
 	a.streamErr = nil

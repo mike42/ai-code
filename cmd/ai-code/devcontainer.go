@@ -83,6 +83,58 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 
 func (b *cappedBuffer) String() string { return string(b.buf) }
 
+// outputLines streams command output: whole lines to scrollback, a partial
+// line (e.g. a waiting prompt) into the notice.
+type outputLines struct {
+	progress tool.Progress
+	notice   string
+	tail     *cappedBuffer
+	partial  []byte
+}
+
+func newOutputLines(progress tool.Progress, notice string) *outputLines {
+	return &outputLines{progress: progress, notice: notice, tail: newCappedBuffer(stderrCap)}
+}
+
+func (o *outputLines) Write(p []byte) (int, error) {
+	o.tail.Write(p)
+	if o.progress == nil {
+		return len(p), nil
+	}
+	ended := false
+	for _, c := range p {
+		if c == '\n' || c == '\r' {
+			o.flush()
+			ended = true
+			continue
+		}
+		o.partial = append(o.partial, c)
+	}
+	switch {
+	case len(o.partial) > 0:
+		o.progress(tool.Phase{Note: o.notice + " " + string(o.partial)})
+	case ended:
+		o.progress(tool.Phase{Note: o.notice})
+	}
+	return len(p), nil
+}
+
+func (o *outputLines) flush() {
+	if len(o.partial) > 0 {
+		o.progress(tool.Phase{Note: string(o.partial), Output: true})
+		o.partial = o.partial[:0]
+	}
+}
+
+// failure repeats the output tail only if nobody saw it stream.
+func (o *outputLines) failure() string {
+	if o.progress != nil {
+		o.flush()
+		return "Its output is above."
+	}
+	return "Output:\n" + strings.TrimSpace(o.tail.String())
+}
+
 // NewDevcontainerExecutor wires up a lazily-started devcontainer executor.
 // project is the mount source; cwd is the launch directory.
 func NewDevcontainerExecutor(cfg *devcontainer.Config, cfgErr error, project, cwd string, settings worker.Settings) *DevcontainerExecutor {
@@ -176,12 +228,18 @@ func (e *DevcontainerExecutor) start(ctx context.Context) error {
 	}
 
 	if !devcontainer.HaveImage(engine, image) {
-		e.report("devcontainer: pulling %s. The first time, this can take several minutes.", image)
-		if out, err := exec.CommandContext(ctx, engine, "pull", image).CombinedOutput(); err != nil {
+		notice := fmt.Sprintf("devcontainer: pulling %s.", image)
+		e.report("%s", notice)
+		out := newOutputLines(e.progress, notice)
+		cmd := exec.CommandContext(ctx, engine, "pull", image)
+		cmd.Stdout, cmd.Stderr = out, out
+		err := cmd.Run()
+		out.flush()
+		if err != nil {
 			if ctx.Err() != nil {
 				return err
 			}
-			e.init = fmt.Errorf("pulling %s: %v\n\n%s", image, err, strings.TrimSpace(string(out)))
+			e.init = fmt.Errorf("pulling %s: %v\n\n%s", image, err, out.failure())
 			return e.init
 		}
 	}
@@ -439,18 +497,21 @@ func (e *DevcontainerExecutor) resolveImage(ctx context.Context, engine string) 
 		if devcontainer.HaveImage(engine, tag) {
 			return tag, nil
 		}
-		e.report("devcontainer: building the image from %s. The first time, this can take several "+
-			"minutes; Ctrl-C stops it.", filepath.Base(e.cfg.DockerfilePath()))
-		out := newCappedBuffer(stderrCap)
+		notice := fmt.Sprintf("devcontainer: building the image from %s; Ctrl-C stops it.",
+			filepath.Base(e.cfg.DockerfilePath()))
+		e.report("%s", notice)
+		out := newOutputLines(e.progress, notice)
 		cmd := exec.CommandContext(ctx, engine, e.cfg.BuildArgv(engine, tag)...)
 		cmd.Stdout, cmd.Stderr = out, out
-		if err := cmd.Run(); err != nil {
+		err = cmd.Run()
+		out.flush()
+		if err != nil {
 			if ctx.Err() != nil {
 				return "", fmt.Errorf("building %s from %s was interrupted",
 					tag, e.cfg.DockerfilePath())
 			}
-			return "", fmt.Errorf("building %s from %s failed: %v\n\nBuild output:\n%s",
-				tag, e.cfg.DockerfilePath(), err, strings.TrimSpace(out.String()))
+			return "", fmt.Errorf("building %s from %s failed: %v\n\n%s",
+				tag, e.cfg.DockerfilePath(), err, out.failure())
 		}
 		return tag, nil
 
