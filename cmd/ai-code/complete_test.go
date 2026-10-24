@@ -176,17 +176,17 @@ func TestPathCompletion(t *testing.T) {
 		{"directory gets a trailing separator", "look at inter", 8, []string{"internal/"}},
 		{"one segment at a time", "look at internal/", 8, []string{"internal/tool/", "internal/ui/"}},
 		{"files below a directory", "internal/ui/e", 0, []string{"internal/ui/editor.go"}},
-		{"gitignored paths are not offered", "buil", 0, nil},
+		{"gitignored paths are offered, as in a shell", "buil", 0, []string{"build/"}},
 		{"dotfiles need the dot", "no", 0, []string{"notes.md"}},
 		{"dotfiles appear once asked for", ".hid", 0, []string{".hidden"}},
-		{"an empty line lists the working directory", "", 0, []string{"internal/", "notes.md"}},
+		{"an empty line lists the working directory", "", 0, []string{"build/", "internal/", "notes.md"}},
 		// Tab after a trailing space lists too: the same keystroke in the same
 		// place in a word may not depend on whether prose precedes it.
-		{"an empty word mid-line lists it too", "please look at ", 15, []string{"internal/", "notes.md"}},
+		{"an empty word mid-line lists it too", "please look at ", 15, []string{"build/", "internal/", "notes.md"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			at, got := completePath(root, root, tc.line)
+			at, got := completePath(root, tc.line)
 			if len(got) != 0 && at != tc.at {
 				t.Errorf("replacement starts at %d, want %d", at, tc.at)
 			}
@@ -250,7 +250,7 @@ func TestUnreadableDirectoryCompletesNothing(t *testing.T) {
 	root := completeTree(t)
 
 	missing := filepath.Join(root, "no-such-dir")
-	if at, got := completePath(missing, root, ""); at != 0 || got != nil {
+	if at, got := completePath(missing, ""); at != 0 || got != nil {
 		t.Errorf("missing cwd = (%d, %v), want nothing", at, got)
 	}
 
@@ -262,10 +262,10 @@ func TestUnreadableDirectoryCompletesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.Chmod(locked, 0o755) })
-	if at, got := completePath(locked, root, ""); at != 0 || got != nil {
+	if at, got := completePath(locked, ""); at != 0 || got != nil {
 		t.Errorf("unreadable cwd = (%d, %v), want nothing", at, got)
 	}
-	if _, got := completePath(root, root, "locked/"); got != nil {
+	if _, got := completePath(root, "locked/"); got != nil {
 		t.Errorf("descending into an unreadable directory = %v, want nothing", got)
 	}
 }

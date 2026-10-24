@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"ai-code/internal/provider"
-	"ai-code/internal/tool"
 )
 
 // complete supplies Tab candidates for the line up to the cursor: slash
@@ -21,7 +20,7 @@ func (a *App) complete(line string) (int, []string) {
 			// This machine's paths are not the remote one's.
 			return 0, nil
 		}
-		return completePath(a.cwd, a.projectRoot, line)
+		return completePath(a.cwd, line)
 	}
 	if argAt < 0 {
 		// Every prefix match, not matchCommands': "/mode" dispatches to /mode
@@ -90,7 +89,7 @@ func (a *App) modelCandidates(prefix string) []string {
 // completePath completes the last whitespace-delimited word as a path,
 // relative to the working directory, one segment at a time: one directory
 // read per Tab, never a tree walk.
-func completePath(cwd, root, line string) (int, []string) {
+func completePath(cwd, line string) (int, []string) {
 	start := strings.LastIndexAny(line, " \t") + 1
 	word := line[start:]
 	// An empty word lists the working directory, as a shell does.
@@ -103,7 +102,6 @@ func completePath(cwd, root, line string) (int, []string) {
 	if err != nil {
 		return 0, nil
 	}
-	ignored := tool.DirIgnorer(root, readDir)
 
 	var out []string
 	for _, ent := range entries {
@@ -120,9 +118,6 @@ func completePath(cwd, root, line string) (int, []string) {
 			if st, err := os.Stat(filepath.Join(readDir, name)); err == nil {
 				isDir = st.IsDir()
 			}
-		}
-		if ignored(name, isDir) {
-			continue
 		}
 		if isDir {
 			name += "/"
