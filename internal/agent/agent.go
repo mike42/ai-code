@@ -384,24 +384,24 @@ func (a *Agent) Run(ctx context.Context, userInput string) error {
 				turn--
 				continue
 			}
+			if a.dropRejectedImage(err) {
+				turn--
+				continue
+			}
 			a.emit(Event{Kind: EvError, Text: err.Error()})
 			return err
 		}
 
 		if stop == provider.StopAborted {
-			results, cause, goOn := a.answerCutOff(&assistant)
+			results, cause := a.answerCutOff(&assistant)
 			a.messages = append(a.messages, assistant)
 			a.messages = append(a.messages, results...)
-			if goOn && len(assistant.ToolCalls) == 0 {
+			if len(assistant.ToolCalls) == 0 {
 				a.messages = append(a.messages, provider.Message{Role: provider.RoleUser,
 					Content: "[ai-code] Your last response was cut off before it finished: " +
 						cause + ". Carry on from where it stopped."})
 			}
 			a.publish()
-			if !goOn {
-				a.emit(Event{Kind: EvDone, Text: string(stop), Context: ptr(a.ContextState())})
-				return nil
-			}
 			a.applySteering()
 			if a.atBoundary != nil && a.atBoundary(ctx) {
 				a.emit(Event{Kind: EvDone, Text: "stopped", Context: ptr(a.ContextState())})
@@ -541,6 +541,11 @@ func (a *Agent) streamTurn(ctx context.Context, turn int) (msg provider.Message,
 			if ctx.Err() != nil {
 				return provider.Message{}, "", false, false, ctx.Err()
 			}
+			// Nothing arrived: a refusal sent as a stream event, handled like an HTTP one.
+			if m := stream.Message(); len(m.ToolCalls) == 0 && strings.TrimSpace(m.Content) == "" &&
+				strings.TrimSpace(m.Reasoning) == "" {
+				return provider.Message{}, "", false, false, err
+			}
 			a.streamErr = err
 			return partialMessage(stream.Message()), provider.StopAborted, false, reasoned, nil
 		}
@@ -592,6 +597,40 @@ func (a *Agent) noticeEmptyTurn(assistant provider.Message, reasoned bool) {
 	a.emit(Event{Kind: EvNotice, Level: LevelWarn, Text: text})
 }
 
+// dropRejectedImage handles a request the server refused while it carried
+// images: the newest is replaced by the server's answer and the request is
+// sent again. Each call removes one, so repeated refusals end.
+func (a *Agent) dropRejectedImage(err error) bool {
+	var api *provider.APIError
+	var inStream *provider.StreamError
+	switch {
+	case errors.As(err, &inStream):
+	case errors.As(err, &api):
+		switch api.Status {
+		case 401, 403, 404, 408, 429, 502, 503, 504:
+			return false
+		}
+	default:
+		return false
+	}
+	for i := len(a.messages) - 1; i >= 0; i-- {
+		m := &a.messages[i]
+		if len(m.Images) == 0 {
+			continue
+		}
+		n := len(m.Images)
+		m.Images = nil
+		m.Content += fmt.Sprintf("\n\n[%s removed: the server refused the request carrying it: %v]",
+			pluralise(n, "attached image"), err)
+		a.requestChanged()
+		a.publish()
+		a.emit(Event{Kind: EvNotice, Level: LevelWarn, Text: fmt.Sprintf(
+			"The server refused a request with an image (%v). The image was removed and the model told; sending again.", err)})
+		return true
+	}
+	return false
+}
+
 // partialMessage keeps cut-off calls sendable: ids filled in, nameless ones dropped.
 func partialMessage(msg provider.Message) provider.Message {
 	calls := msg.ToolCalls[:0:0]
@@ -608,23 +647,15 @@ func partialMessage(msg provider.Message) provider.Message {
 	return msg
 }
 
-// answerCutOff reports a dead stream to the model as failed calls; stops only if nothing arrived.
-func (a *Agent) answerCutOff(msg *provider.Message) (results []provider.Message, cause string, goOn bool) {
+// answerCutOff reports a dead stream to the model as failed calls.
+func (a *Agent) answerCutOff(msg *provider.Message) (results []provider.Message, cause string) {
 	cause = fmt.Sprintf("the response stream ended with an error: %v", a.streamErr)
 	a.streamErr = nil
-
-	if len(msg.ToolCalls) == 0 && strings.TrimSpace(msg.Content) == "" &&
-		strings.TrimSpace(msg.Reasoning) == "" {
-		msg.Content = "(the response was cut off before any output arrived)"
-		a.emit(Event{Kind: EvNotice, Level: LevelWarn, Text: fmt.Sprintf(
-			"The response was cut off before anything arrived: %s.", cause)})
-		return nil, cause, false
-	}
 
 	if len(msg.ToolCalls) == 0 {
 		a.emit(Event{Kind: EvNotice, Level: LevelWarn, Text: fmt.Sprintf(
 			"The response was cut off: %s. The model has been told to carry on.", cause)})
-		return nil, cause, true
+		return nil, cause
 	}
 
 	n := len(msg.ToolCalls)
@@ -646,7 +677,7 @@ func (a *Agent) answerCutOff(msg *provider.Message) (results []provider.Message,
 			Content: cutOffFeedback(cause, tc, complete),
 		})
 	}
-	return results, cause, true
+	return results, cause
 }
 
 func cutOffFeedback(cause string, tc provider.ToolCall, complete bool) string {

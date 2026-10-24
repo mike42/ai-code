@@ -1,10 +1,15 @@
 package tool
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"os"
 	"strings"
 )
@@ -61,6 +66,19 @@ func (t *ReadTool) Run(ctx context.Context, st *State, raw json.RawMessage) Resu
 			return Errorf("%s is a directory, not a file. Use the ls tool to list its contents.", rel(st, path))
 		}
 		return Errorf("could not read %s: %v", rel(st, path), err)
+	}
+
+	if img, ok := asImage(content); ok {
+		st.SetStamp(stampFile(path, content))
+		what := img.MIME
+		if img.Width > 0 {
+			what = fmt.Sprintf("%dx%d %s", img.Width, img.Height, img.MIME)
+		}
+		return Result{
+			Content: fmt.Sprintf("%s is a %s image (%s), attached below.", rel(st, path), what, humanBytes(len(content))),
+			Display: fmt.Sprintf("Read %s (%s, %s)", rel(st, path), what, humanBytes(len(content))),
+			Images:  []Image{img},
+		}
 	}
 
 	if looksBinary(content) {
@@ -165,4 +183,39 @@ func stemOf(name string) string {
 		return name[:i]
 	}
 	return name
+}
+
+// imageMagic is matched by hand: net/http's sniffer would put networking in the worker.
+var imageMagic = []struct{ prefix, mime string }{
+	{"\x89PNG\r\n\x1a\n", "image/png"},
+	{"\xff\xd8\xff", "image/jpeg"},
+	{"GIF87a", "image/gif"},
+	{"GIF89a", "image/gif"},
+	{"BM", "image/bmp"},
+	{"II*\x00", "image/tiff"},
+	{"MM\x00*", "image/tiff"},
+	{"\x00\x00\x01\x00", "image/x-icon"},
+}
+
+// asImage recognises a picture by its leading bytes; the server decides
+// whether it can use it.
+func asImage(b []byte) (Image, bool) {
+	mime := ""
+	for _, m := range imageMagic {
+		if bytes.HasPrefix(b, []byte(m.prefix)) {
+			mime = m.mime
+			break
+		}
+	}
+	if len(b) >= 12 && string(b[:4]) == "RIFF" && string(b[8:12]) == "WEBP" {
+		mime = "image/webp"
+	}
+	if mime == "" {
+		return Image{}, false
+	}
+	img := Image{MIME: mime, Data: b}
+	if cfg, _, err := image.DecodeConfig(bytes.NewReader(b)); err == nil {
+		img.Width, img.Height = cfg.Width, cfg.Height
+	}
+	return img, true
 }

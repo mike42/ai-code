@@ -84,8 +84,8 @@ func TestACutOffBeforeAnyOutputStops(t *testing.T) {
 	sink := &collectSink{}
 	a := newAgent(t, client, sink)
 
-	if err := a.Run(context.Background(), "go"); err != nil {
-		t.Fatalf("Run: %v", err)
+	if err := a.Run(context.Background(), "go"); err == nil || !strings.Contains(err.Error(), "connection reset") {
+		t.Fatalf("Run error = %v, want the stream's error", err)
 	}
 	if len(client.seen) != 1 {
 		t.Errorf("sent %d requests, want 1", len(client.seen))
