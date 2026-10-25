@@ -2,16 +2,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 
 	"ai-code/internal/agent"
 	"ai-code/internal/config"
 	"ai-code/internal/mcp"
 	"ai-code/internal/render"
-	"ai-code/internal/runtime"
+	"ai-code/internal/worker"
 )
 
 // mcpSetup is what --mcp asked for: session-only entries, and every name to
@@ -102,13 +104,22 @@ func mcpResolver(cwd string, cli map[string]mcp.Entry) func() (map[string]mcp.En
 	}
 }
 
-// mcpUnsupported is why MCP servers cannot run under rt, or "" if they can.
-// They run where bash runs; a sandboxed session never falls back to the host.
-func mcpUnsupported(rt *runtime.Runtime) string {
-	if rt == nil || rt.Kind == runtime.KindHost {
-		return ""
+// mcpLauncher starts each server through a worker that open starts in the
+// target environment, as every tool runs there. The binary and its argument
+// list, or the URL and headers, go in the worker's opening message.
+func mcpLauncher(open func(context.Context) (*exec.Cmd, error)) mcp.Launcher {
+	return func(ctx context.Context, e mcp.Entry) (*exec.Cmd, []byte, error) {
+		cmd, err := open(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		launch := mcp.LaunchFor(e)
+		preface, err := json.Marshal(worker.Hello{MCP: &launch})
+		if err != nil {
+			return nil, nil, err
+		}
+		return cmd, append(preface, '\n'), nil
 	}
-	return fmt.Sprintf("MCP servers cannot run under the %s runtime yet, and never run on the host for a sandboxed session", rt.Kind)
 }
 
 // mcpReport is the one line a finished start leaves in the scrollback.

@@ -45,6 +45,57 @@ type Screen struct {
 	transient int
 	// atLineStart tracks whether the cursor sits in column zero of a fresh line.
 	atLineStart bool
+
+	// editor holds the bottom row while a line is being typed at the prompt.
+	editor LineEditor
+}
+
+// LineEditor is a prompt that owns the bottom row of the terminal, and may
+// have the terminal in raw mode, where a bare newline does not return the
+// carriage. While one is attached, commits go through it, above the line
+// being typed, and the transient zone is not drawn.
+type LineEditor interface {
+	// Above writes finished lines above the edited line and repaints it. It
+	// is called with the screen's lock held.
+	Above(lines []string)
+}
+
+// Attach hands the bottom row to a line editor, until Detach.
+func (s *Screen) Attach(e LineEditor) {
+	if !s.isTTY {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.eraseTransientLocked()
+	s.w.Flush()
+	s.editor = e
+}
+
+// Detach takes the bottom row back. The editor must have left raw mode first.
+func (s *Screen) Detach() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.editor = nil
+}
+
+// aboveEditorLocked routes committed lines through an attached editor, and
+// reports whether it did.
+func (s *Screen) aboveEditorLocked(lines []string) bool {
+	if s.editor == nil {
+		return false
+	}
+	out := make([]string, len(lines))
+	for i, l := range lines {
+		l = strings.TrimRight(l, " \t")
+		if s.color && HasOpenSGR(l) {
+			l += sgrReset
+		}
+		out[i] = l
+	}
+	s.w.Flush()
+	s.editor.Above(out)
+	return true
 }
 
 func NewScreen(out io.Writer, colorMode string) *Screen {
@@ -117,6 +168,9 @@ func (s *Screen) Resize() {
 func (s *Screen) Commit(line string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.aboveEditorLocked([]string{line}) {
+		return
+	}
 	s.eraseTransientLocked()
 	s.commitLocked(line)
 	s.w.Flush()
@@ -126,6 +180,9 @@ func (s *Screen) Commit(line string) {
 func (s *Screen) CommitBlock(lines ...string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.aboveEditorLocked(lines) {
+		return
+	}
 	s.eraseTransientLocked()
 	for _, l := range lines {
 		s.commitLocked(l)
@@ -166,6 +223,11 @@ func (s *Screen) setTransient(cursorCol int, lines []string) {
 	if !s.isTTY {
 		// Without a terminal there is nowhere to redraw; transient content is
 		// dropped, which is what a pipe or a CI log should receive.
+		return
+	}
+	if s.editor != nil {
+		// The bottom row is the prompt's; the zone is drawn again once a
+		// turn takes the row back.
 		return
 	}
 	s.eraseTransientLocked()

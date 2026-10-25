@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,41 +13,55 @@ import (
 	"testing"
 
 	"ai-code/internal/config"
+	"ai-code/internal/devcontainer"
 	"ai-code/internal/mcp"
 	"ai-code/internal/provider"
 	"ai-code/internal/runtime"
 	"ai-code/internal/session"
 	"ai-code/internal/tool"
+	"ai-code/internal/worker"
 )
 
 var (
-	helloOnce sync.Once
+	binsOnce  sync.Once
 	helloPath string
-	helloErr  error
+	// workerPath is the ai-code worker, standing in for one started by
+	// docker exec or ssh in the target environment.
+	workerPath string
+	binsErr    error
 )
 
-// helloBinary builds the mcphello stub once for these tests.
-func helloBinary(t *testing.T) string {
+func buildBins(t *testing.T) {
 	t.Helper()
-	helloOnce.Do(func() {
+	binsOnce.Do(func() {
 		dir, err := os.MkdirTemp("", "mcphello")
 		if err != nil {
-			helloErr = err
+			binsErr = err
 			return
 		}
-		helloPath = filepath.Join(dir, "mcphello")
+		exe := ""
 		if goruntime.GOOS == "windows" {
-			helloPath += ".exe"
+			exe = ".exe"
 		}
+		helloPath = filepath.Join(dir, "mcphello"+exe)
+		workerPath = filepath.Join(dir, "ai-code-worker"+exe)
 		goTool := filepath.Join(goruntime.GOROOT(), "bin", "go")
-		if out, err := exec.Command(goTool, "build", "-o", helloPath, "ai-code/internal/mcp/mcphello").CombinedOutput(); err != nil {
-			helloErr = err
-			t.Logf("%s", out)
+		for out, pkg := range map[string]string{helloPath: "ai-code/internal/mcp/mcphello", workerPath: "ai-code/cmd/ai-code-worker"} {
+			if msg, err := exec.Command(goTool, "build", "-o", out, pkg).CombinedOutput(); err != nil {
+				binsErr = err
+				t.Logf("%s", msg)
+				return
+			}
 		}
 	})
-	if helloErr != nil {
-		t.Fatal(helloErr)
+	if binsErr != nil {
+		t.Fatal(binsErr)
 	}
+}
+
+// helloBinary is the mcphello stub, built once for these tests.
+func helloBinary(t *testing.T) string {
+	buildBins(t)
 	return helloPath
 }
 
@@ -254,20 +270,90 @@ func TestMCPCommandsDuringATurn(t *testing.T) {
 	}
 }
 
-func TestMCPNeverFallsBackToTheHostUnderASandbox(t *testing.T) {
-	if mcpUnsupported(&runtime.Runtime{Kind: runtime.KindHost}) != "" {
-		t.Fatal("host runtime refused")
+// The worker in the target environment is started with nothing but its own
+// path; the server's binary and arguments travel in its opening message.
+func TestMCPWorkerCommandsNameOnlyTheWorker(t *testing.T) {
+	rt, err := runtime.ParseFlag("ssh://dev@build-box/srv/proj")
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, k := range []runtime.Kind{runtime.KindDevcontainer, runtime.KindSSH} {
-		msg := mcpUnsupported(&runtime.Runtime{Kind: k})
-		if !strings.Contains(msg, "never run on the host") {
-			t.Errorf("%s: %q", k, msg)
-		}
+	ssh := NewSSHExecutor(rt, "", worker.Settings{})
+	ssh.remoteBin = "/home/dev/.cache/ai-code/bin/ai-code-worker-0123"
+	cmd, err := ssh.MCPCommand(context.Background())
+	if err != nil {
+		t.Fatal(err)
 	}
-	a, _, _ := mcpApp(t, map[string]mcp.Entry{"h": {Name: "h", Source: "cli", Binary: helloBinary(t)}})
-	a.mcp.SetUnsupported(mcpUnsupported(&runtime.Runtime{Kind: runtime.KindDevcontainer}))
-	if err := a.cmdMCP(context.Background(), "start h"); err == nil || a.mcp.Running("h") {
-		t.Fatalf("started under a sandbox: %v", err)
+	last := cmd.Args[len(cmd.Args)-1]
+	if last != `sh -c 'cd '\''/srv/proj'\'' && exec '\''/home/dev/.cache/ai-code/bin/ai-code-worker-0123'\'''` {
+		t.Fatalf("ssh remote command = %q", last)
+	}
+
+	dc := &DevcontainerExecutor{cfg: &devcontainer.Config{RemoteUser: "dev"},
+		cmd: &exec.Cmd{}, cid: "c1", engine: "podman", entry: "/ai-code-workers/w", workdir: "/workspace"}
+	dc.publishUp()
+	fork := &DevcontainerExecutor{host: dc, workdir: "/workspace/sub"}
+	// A tool call holds mu for as long as it runs; starting an MCP server in
+	// the running container must not wait for it.
+	dc.mu.Lock()
+	cmd, err = fork.MCPCommand(context.Background())
+	dc.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cmd.Args, " "); got != "podman exec -i -w /workspace/sub --user dev c1 /ai-code-workers/w" {
+		t.Fatalf("devcontainer command = %q", got)
+	}
+
+	launch := mcpLauncher(func(context.Context) (*exec.Cmd, error) { return exec.Command("worker"), nil })
+	_, preface, err := launch(context.Background(), mcp.Entry{Binary: "/opt/mcp/lldb", Args: []string{"--root", "/my dir", `it's "quoted"`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hello worker.Hello
+	if err := json.Unmarshal(preface, &hello); err != nil {
+		t.Fatal(err)
+	}
+	if hello.MCP == nil || hello.MCP.Binary != "/opt/mcp/lldb" || strings.Join(hello.MCP.Args, "|") != `--root|/my dir|it's "quoted"` {
+		t.Fatalf("opening message = %s", preface)
+	}
+}
+
+// End to end through the real worker, as a devcontainer or ssh session runs
+// it: /mcp add, the tool call, the server's working directory.
+func TestMCPRunsInTheTargetEnvironmentThroughTheWorker(t *testing.T) {
+	buildBins(t)
+	a, _, _ := mcpApp(t, nil)
+	target := t.TempDir()
+	opened := 0
+	a.mcp.SetLauncher(mcpLauncher(func(context.Context) (*exec.Cmd, error) {
+		opened++
+		cmd := exec.Command(workerPath)
+		cmd.Dir = target
+		return cmd, nil
+	}))
+	if err := a.cmdMCP(context.Background(), "add hello="+helloPath+` --greeting "good day"`); err != nil {
+		t.Fatal(err)
+	}
+	settle(t, a)
+	exe := mcp.Wrap(a.exec, a.mcp)
+	res, err := exe.Execute(context.Background(), tool.Request{Name: "hello_hello", Args: json.RawMessage(`{"name":"sandbox"}`)})
+	if err != nil || res.Content != "good day, sandbox" {
+		t.Fatalf("result = %+v, %v", res, err)
+	}
+	if opened != 1 {
+		t.Fatalf("worker opened %d times", opened)
+	}
+
+	a.mcp.SetLauncher(mcpLauncher(func(context.Context) (*exec.Cmd, error) {
+		return nil, errors.New("the devcontainer is unavailable: no engine")
+	}))
+	got := make(chan mcp.Report, 1)
+	a.mcp.SetReporter(func(r mcp.Report) { got <- r })
+	if err := a.mcp.Restart("hello"); err != nil {
+		t.Fatal(err)
+	}
+	if r := <-got; r.Err == nil || !strings.Contains(r.Err.Error(), "devcontainer is unavailable") {
+		t.Fatalf("report = %+v", r)
 	}
 }
 

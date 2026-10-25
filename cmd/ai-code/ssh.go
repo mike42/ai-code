@@ -237,6 +237,27 @@ func (e *SSHExecutor) prepare(ctx context.Context) (string, error) {
 	return remote, nil
 }
 
+// workerLaunch is the remote command that starts a worker in the remote
+// working directory. It names nothing but the worker: what a worker is asked
+// to do travels in its opening message, never through the remote shell.
+func (e *SSHExecutor) workerLaunch(bin string) string {
+	launch := "exec " + shQuote(bin)
+	if e.rt.SSHDir != "" {
+		launch = "cd " + shQuote(e.rt.SSHDir) + " && " + launch
+	}
+	return launch
+}
+
+// MCPCommand returns a command that starts another worker on the remote
+// machine, beside the session's own, to run or reach an MCP server there.
+func (e *SSHExecutor) MCPCommand(ctx context.Context) (*exec.Cmd, error) {
+	bin, err := e.prepare(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return exec.Command("ssh", e.sshArgv(e.workerLaunch(bin))...), nil
+}
+
 func (e *SSHExecutor) start(ctx context.Context) error {
 	if e.cmd != nil {
 		return nil
@@ -247,11 +268,7 @@ func (e *SSHExecutor) start(ctx context.Context) error {
 		return err
 	}
 
-	launch := "exec " + shQuote(bin)
-	if e.rt.SSHDir != "" {
-		launch = "cd " + shQuote(e.rt.SSHDir) + " && " + launch
-	}
-	cmd := exec.Command("ssh", e.sshArgv(launch)...)
+	cmd := exec.Command("ssh", e.sshArgv(e.workerLaunch(bin))...)
 	tool.OwnProcessGroup(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

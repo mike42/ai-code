@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path"
 	"path/filepath"
@@ -52,8 +53,8 @@ type flags struct {
 	appendPrompt string
 	noCloud      bool
 	// mcp is each --mcp value: NAME, or NAME=VALUE.
-	mcp []string
-	args         []string
+	mcp  []string
+	args []string
 }
 
 func main() {
@@ -384,6 +385,8 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 	var exe tool.Executor
 	var toolState *tool.State
 	var remoteExec *SSHExecutor
+	// mcpWorker opens a worker in the target environment for an MCP server.
+	var mcpWorker func(context.Context) (*exec.Cmd, error)
 	switch rt.Kind {
 	case runtime.KindDevcontainer:
 		// Expand ${...} references before anything reads the config;
@@ -393,6 +396,7 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 		}
 		dc := NewDevcontainerExecutor(rt.Config, rt.ConfigErr, projectRoot, cwd, toolSettings(cfg, limit))
 		exe = dc
+		mcpWorker = dc.MCPCommand
 		defer dc.Close()
 
 		// Tools run inside the container, where the project is mounted at
@@ -438,6 +442,7 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 		ssh := NewSSHExecutor(rt, f.sshConfig, toolSettings(cfg, limit))
 		remoteExec = ssh
 		exe = ssh
+		mcpWorker = ssh.MCPCommand
 		defer ssh.Close()
 
 		// Everything the model is told about its surroundings is about the
@@ -475,14 +480,13 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 	}
 	exe = tool.Filter(exe, choice.allow)
 
-	// MCP servers run where bash runs, and their tools join the chain here, so
-	// sub-agents see them too.
-	mcpOff := mcpUnsupported(rt)
-	if mcpOff != "" && len(mcpSet.start) > 0 {
-		return errors.New("--mcp: " + mcpOff)
-	}
+	// MCP servers run in the target environment, through a worker there, like
+	// every other tool; only the host runtime runs them on this machine.
+	// Their tools join the chain here, so sub-agents see them too.
 	mcpMgr := mcp.NewManager(mcpResolver(cwd, mcpSet.cli), os.Environ())
-	mcpMgr.SetUnsupported(mcpOff)
+	if mcpWorker != nil {
+		mcpMgr.SetLauncher(mcpLauncher(mcpWorker))
+	}
 	defer mcpMgr.Close()
 	exe = mcp.Wrap(exe, mcpMgr)
 

@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sync"
 	"time"
 
+	"ai-code/internal/mcp"
 	"ai-code/internal/tool"
 )
 
@@ -26,7 +28,16 @@ type Settings struct {
 
 type Hello struct {
 	Settings Settings `json:"settings"`
+	// MCP, when set, makes this worker relay one MCP server instead of
+	// serving tools: run here, or reached from here.
+	MCP *mcp.Launch `json:"mcp,omitempty"`
 }
+
+// ExitStatus ends the worker with Code and nothing printed: a relayed MCP
+// server's own status, which ai-code reports.
+type ExitStatus struct{ Code int }
+
+func (e ExitStatus) Error() string { return fmt.Sprintf("exit status %d", e.Code) }
 
 func Tools(s Settings, cwd string) *tool.LocalExecutor {
 	return tool.NewLocalExecutor(tool.NewState(cwd),
@@ -43,15 +54,30 @@ func Tools(s Settings, cwd string) *tool.LocalExecutor {
 // Serve reads requests concurrently so a cancel can reach a running call; EOF
 // cancels it too.
 func Serve(r io.Reader, w io.Writer, cwd string) error {
-	out := bufio.NewWriter(w)
-	defer out.Flush()
-	enc := json.NewEncoder(out)
-	dec := json.NewDecoder(bufio.NewReader(r))
+	return ServeWith(r, w, os.Stderr, cwd)
+}
+
+// ServeWith is Serve with the stderr a relayed MCP server writes to.
+func ServeWith(r io.Reader, w io.Writer, errW io.Writer, cwd string) error {
+	in := bufio.NewReader(r)
+	dec := json.NewDecoder(in)
 
 	var hello Hello
 	if err := dec.Decode(&hello); err != nil {
 		return fmt.Errorf("reading the opening message: %w", err)
 	}
+	if hello.MCP != nil {
+		// What the decoder read past the opening message belongs to the server.
+		rest := io.MultiReader(dec.Buffered(), in)
+		if code := mcp.Relay(rest, w, errW, cwd, *hello.MCP); code != 0 {
+			return ExitStatus{code}
+		}
+		return nil
+	}
+
+	out := bufio.NewWriter(w)
+	defer out.Flush()
+	enc := json.NewEncoder(out)
 	exec := Tools(hello.Settings, cwd)
 
 	var (

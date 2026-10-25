@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -16,59 +17,73 @@ import (
 	"ai-code/internal/tool"
 )
 
-// stdioTransport runs the server as a child process and speaks
-// newline-delimited JSON over its stdin and stdout.
+// stdioTransport speaks newline-delimited JSON over a process's stdin and
+// stdout: the server itself on the host runtime, or the worker relaying to
+// it inside the target environment.
 type stdioTransport struct {
 	cmd   *exec.Cmd
 	stdin io.WriteCloser
 	wmu   sync.Mutex
 	tail  *lastLine
+	// direct: cmd is the server, so close may signal its process group. A
+	// relaying worker ends its server itself when its stdin closes.
+	direct bool
 	// exited is closed once the process has been reaped.
 	exited chan struct{}
 }
 
-// startProcess execs binary with args, never through a shell.
-func startProcess(c *Conn, binary string, args []string, env []string) (*stdioTransport, error) {
+// resolveBinary finds binary on this machine, refusing what would run through
+// a shell.
+func resolveBinary(binary string) (string, error) {
 	path, err := exec.LookPath(binary)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", binary, unwrapLookPath(err))
+		return "", fmt.Errorf("%s: %w", binary, unwrapLookPath(err))
 	}
 	if runtime.GOOS == "windows" {
 		switch strings.ToLower(filepath.Ext(path)) {
 		case ".bat", ".cmd":
-			return nil, fmt.Errorf("%s is a batch file, which Windows runs through cmd.exe; ai-code runs MCP servers without a shell", path)
+			return "", fmt.Errorf("%s is a batch file, which Windows runs through cmd.exe; ai-code runs MCP servers without a shell", path)
 		}
 	}
-	cmd := exec.Command(path, args...)
-	cmd.Env = env
-	tool.OwnProcessGroup(cmd)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, err
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	t := &stdioTransport{cmd: cmd, stdin: stdin, tail: &lastLine{}, exited: make(chan struct{})}
-	cmd.Stderr = t.tail
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("%s: %w", binary, err)
-	}
-	c.t = t
-	go t.read(c, stdout)
-	return t, nil
+	return path, nil
 }
 
 func unwrapLookPath(err error) error {
 	var e *exec.Error
 	if errors.As(err, &e) {
-		if errors.Is(e.Err, exec.ErrNotFound) {
+		if errors.Is(e.Err, exec.ErrNotFound) || errors.Is(e.Err, fs.ErrNotExist) {
 			return errors.New("not found")
 		}
 		return e.Err
 	}
 	return err
+}
+
+// startCmd starts cmd, writes preface to it first if there is one, and reads
+// its stdout as MCP messages for c.
+func startCmd(c *Conn, cmd *exec.Cmd, preface []byte, direct bool) error {
+	tool.OwnProcessGroup(cmd)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	t := &stdioTransport{cmd: cmd, stdin: stdin, tail: &lastLine{}, direct: direct, exited: make(chan struct{})}
+	cmd.Stderr = t.tail
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	c.t = t
+	go t.read(c, stdout)
+	if len(preface) > 0 {
+		if err := t.send(context.Background(), bytes.TrimRight(preface, "\n")); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (t *stdioTransport) read(c *Conn, stdout io.Reader) {
@@ -119,16 +134,18 @@ func (t *stdioTransport) send(ctx context.Context, msg []byte) error {
 }
 
 // close ends the server: stdin closed so a well-behaved server exits by
-// itself, and its process group terminated for one that does not. Only the
-// process started here is signalled.
+// itself; a server run directly also has its own process group terminated.
+// Only the process started here is signalled.
 func (t *stdioTransport) close() error {
 	t.wmu.Lock()
 	_ = t.stdin.Close()
 	t.wmu.Unlock()
-	select {
-	case <-t.exited:
-	default:
-		tool.TerminateProcessGroup(t.cmd)
+	if t.direct {
+		select {
+		case <-t.exited:
+		default:
+			tool.TerminateProcessGroup(t.cmd)
+		}
 	}
 	return nil
 }

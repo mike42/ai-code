@@ -20,8 +20,9 @@ import (
 	"ai-code/internal/mcp/hello"
 )
 
-// helloBin is the mcphello command, built once for the package's tests.
-var helloBin string
+// helloBin is the mcphello command and workerBin the ai-code worker, built
+// once for the package's tests.
+var helloBin, workerBin string
 
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "mcphello")
@@ -29,14 +30,18 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	helloBin = filepath.Join(dir, "mcphello")
+	exe := ""
 	if runtime.GOOS == "windows" {
-		helloBin += ".exe"
+		exe = ".exe"
 	}
+	helloBin = filepath.Join(dir, "mcphello"+exe)
+	workerBin = filepath.Join(dir, "ai-code-worker"+exe)
 	goTool := filepath.Join(runtime.GOROOT(), "bin", "go")
-	if out, err := exec.Command(goTool, "build", "-o", helloBin, "./mcphello").CombinedOutput(); err != nil {
-		fmt.Fprintf(os.Stderr, "building mcphello: %v\n%s", err, out)
-		os.Exit(1)
+	for out, pkg := range map[string]string{helloBin: "./mcphello", workerBin: "ai-code/cmd/ai-code-worker"} {
+		if msg, err := exec.Command(goTool, "build", "-o", out, pkg).CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "building %s: %v\n%s", pkg, err, msg)
+			os.Exit(1)
+		}
 	}
 	code := m.Run()
 	os.RemoveAll(dir)

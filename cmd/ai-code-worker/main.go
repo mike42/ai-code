@@ -2,6 +2,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -18,6 +19,10 @@ func main() {
 	cwd, err := os.Getwd()
 	if err == nil {
 		err = worker.Serve(os.Stdin, os.Stdout, cwd)
+	}
+	var status worker.ExitStatus
+	if errors.As(err, &status) {
+		os.Exit(status.Code)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "ai-code-worker:", err)

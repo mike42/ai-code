@@ -3,8 +3,8 @@ package mcp
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"os/exec"
 	"slices"
 	"sort"
 	"strings"
@@ -95,10 +95,10 @@ type Manager struct {
 	order    []string
 	reserved map[string]bool
 	// changed is closed and replaced whenever a start finishes.
-	changed     chan struct{}
-	report      func(Report)
-	held        []Report
-	unsupported string
+	changed  chan struct{}
+	report   func(Report)
+	held     []Report
+	launcher Launcher
 }
 
 // NewManager resolves entries through resolve each time it needs them, so
@@ -107,11 +107,15 @@ func NewManager(resolve func() (map[string]Entry, error), env []string) *Manager
 	return &Manager{resolve: resolve, env: env, servers: map[string]*server{}, changed: make(chan struct{})}
 }
 
-// SetUnsupported makes every start fail with msg: the runtime cannot run
-// servers, and the host is never a fallback for a sandboxed session.
-func (m *Manager) SetUnsupported(msg string) {
+// Launcher opens a worker in the target environment that will run or reach
+// e there, returning the command to start and the opening message to send it.
+type Launcher func(ctx context.Context, e Entry) (cmd *exec.Cmd, preface []byte, err error)
+
+// SetLauncher makes every server start through fn, in the session's target
+// environment. Without one, servers run on this machine: the host runtime.
+func (m *Manager) SetLauncher(fn Launcher) {
 	m.mu.Lock()
-	m.unsupported = msg
+	m.launcher = fn
 	m.mu.Unlock()
 }
 
@@ -171,9 +175,6 @@ func (m *Manager) Start(name string) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.unsupported != "" {
-		return errors.New(m.unsupported)
-	}
 	if s := m.servers[name]; s != nil {
 		return fmt.Errorf("%s is already %s; /mcp restart %s starts it again", name, s.state, name)
 	}
@@ -198,9 +199,18 @@ func (m *Manager) run(ctx context.Context, s *server) {
 		cl  *Client
 		err error
 	)
-	if e.URL != "" {
+	switch {
+	case m.launcher != nil:
+		var (
+			cmd     *exec.Cmd
+			preface []byte
+		)
+		if cmd, preface, err = m.launcher(ctx, e); err == nil {
+			cl, err = ConnectVia(ctx, cmd, preface, notify)
+		}
+	case e.URL != "":
 		cl, err = Dial(ctx, e.URL, e.Headers, notify)
-	} else {
+	default:
 		cl, err = Connect(ctx, e.Binary, e.Args, m.env, notify)
 	}
 	var tools []Tool

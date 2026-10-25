@@ -80,10 +80,16 @@ type Editor struct {
 	lastCursor  int
 	lastWidth   int
 
-	// paintMu serialises painting: the read loop paints after each key, and
-	// Refresh paints from whichever goroutine noticed the prompt is wrong;
+	// paintMu serialises every write to the terminal: the read loop paints
+	// after each key, and other goroutines put lines above the prompt;
 	// interleaved escape sequences corrupt the line.
 	paintMu sync.Mutex
+	// reading is set while the line is on screen and the terminal is raw.
+	// suspended is set while an external editor has the terminal; lines
+	// arriving then wait in held.
+	reading   bool
+	suspended bool
+	held      []string
 
 	// piped is created once and reused: a fresh bufio.Reader per call would
 	// read ahead into its buffer and then discard it, silently swallowing every
@@ -125,27 +131,30 @@ func (e *Editor) ReadLine(prompt string) (string, error) {
 		return e.readPiped()
 	}
 
+	// Raw mode, the first paint and the reading flag change together, so a
+	// line put above the prompt from elsewhere sees either no prompt and a
+	// cooked terminal, or both.
+	e.paintMu.Lock()
 	old, err := term.MakeRaw(int(e.in.Fd()))
 	if err != nil {
+		e.paintMu.Unlock()
 		return e.readPiped()
 	}
-	defer term.Restore(int(e.in.Fd()), old)
-
 	fmt.Fprint(e.out, bracketedPasteOn)
-	defer fmt.Fprint(e.out, bracketedPasteOff)
-
 	e.buf = append(e.buf[:0], []rune(e.preload)...)
 	e.cursor = len(e.buf)
 	e.preload = ""
 	e.historyPos = -1
-	e.invalidate()
-
 	// This call's prompt supersedes anything left over from the last one.
-	e.paintMu.Lock()
 	e.live = ""
+	e.invalidate()
+	e.paint(prompt)
+	e.reading = true
 	e.paintMu.Unlock()
 
-	e.redraw(prompt)
+	// end, when set, writes the line left in the scrollback on the way out.
+	var end func() string
+	defer func() { e.leave(old, end) }()
 
 	reader := bufio.NewReaderSize(e.in, 4096)
 	active := false
@@ -165,16 +174,17 @@ func (e *Editor) ReadLine(prompt string) (string, error) {
 
 		switch r {
 		case '\r', '\n':
-			e.finalise(prompt, string(e.buf))
-			return string(e.buf), nil
+			text := string(e.buf)
+			end = func() string { return e.finalLine(prompt, text) }
+			return text, nil
 
 		case 3: // Ctrl-C
-			fmt.Fprint(e.out, "\r\n")
+			end = newline
 			return "", ErrInterrupt
 
 		case 4: // Ctrl-D
 			if len(e.buf) == 0 {
-				fmt.Fprint(e.out, "\r\n")
+				end = newline
 				return "", ErrEOF
 			}
 			e.deleteForward()
@@ -213,25 +223,21 @@ func (e *Editor) ReadLine(prompt string) (string, error) {
 				// The search prompt is on the line, so the finalising repaint
 				// is what puts the recalled command into the scrollback
 				// looking typed.
-				e.finalise(prompt, string(e.buf))
-				return string(e.buf), nil
-			}
-		case 12: // Ctrl-L
-			fmt.Fprint(e.out, "\x1b[2J\x1b[H")
-			e.invalidate()
-
-		case 7: // Ctrl-G -- hand off to a real editor
-			text, err := e.launchEditor(string(e.buf))
-			term.Restore(int(e.in.Fd()), old)
-			if err == nil && strings.TrimSpace(text) != "" {
-				e.finalise(prompt, text)
+				text := string(e.buf)
+				end = func() string { return e.finalLine(prompt, text) }
 				return text, nil
 			}
-			_, _ = term.MakeRaw(int(e.in.Fd()))
-			e.invalidate()
-			if err != nil {
-				fmt.Fprintf(e.out, "\r\n%s\r\n", err)
+		case 12: // Ctrl-L
+			e.write("\x1b[2J\x1b[H")
+
+		case 7: // Ctrl-G -- hand off to a real editor
+			e.suspend(old)
+			text, err := e.launchEditor(string(e.buf))
+			if err == nil && strings.TrimSpace(text) != "" {
+				end = func() string { return e.finalLine(prompt, text) }
+				return text, nil
 			}
+			e.resume(err)
 
 		case '\t':
 			e.complete()
@@ -660,8 +666,122 @@ func (e *Editor) listMatches(matches []string) {
 	if extra > 0 {
 		fmt.Fprintf(&b, "... and %d more\r\n", extra)
 	}
-	_, _ = io.WriteString(e.out, b.String())
+	e.write(b.String())
+}
+
+// write puts bytes on the terminal from the read loop, after which the line
+// is repainted whole.
+func (e *Editor) write(s string) {
+	e.paintMu.Lock()
+	defer e.paintMu.Unlock()
+	_, _ = io.WriteString(e.out, s)
 	e.invalidate()
+}
+
+func newline() string { return "\r\n" }
+
+// leave ends a ReadLine: the final line, then cooked mode, under the paint
+// lock, so nothing put above the prompt meanwhile lands on a raw terminal or
+// repaints a prompt that has gone.
+func (e *Editor) leave(old *term.State, end func() string) {
+	e.paintMu.Lock()
+	defer e.paintMu.Unlock()
+	var b strings.Builder
+	if end != nil {
+		b.WriteString(end())
+	}
+	b.WriteString(bracketedPasteOff)
+	_, _ = io.WriteString(e.out, b.String())
+	_ = term.Restore(int(e.in.Fd()), old)
+	e.reading, e.suspended = false, false
+	e.flushHeldLocked()
+	e.invalidate()
+}
+
+// suspend gives the terminal to an external editor.
+func (e *Editor) suspend(old *term.State) {
+	e.paintMu.Lock()
+	defer e.paintMu.Unlock()
+	_ = term.Restore(int(e.in.Fd()), old)
+	e.suspended = true
+}
+
+// resume takes the terminal back from an external editor that produced
+// nothing, printing what arrived while it ran; the read loop repaints.
+func (e *Editor) resume(err error) {
+	e.paintMu.Lock()
+	defer e.paintMu.Unlock()
+	_, _ = term.MakeRaw(int(e.in.Fd()))
+	e.suspended = false
+	e.flushHeldLocked()
+	if err != nil {
+		fmt.Fprintf(e.out, "%s\r\n", err)
+	}
+	e.invalidate()
+}
+
+func (e *Editor) flushHeldLocked() {
+	if len(e.held) == 0 {
+		return
+	}
+	var b strings.Builder
+	for _, l := range e.held {
+		b.WriteString(l)
+		b.WriteString("\r\n")
+	}
+	_, _ = io.WriteString(e.out, b.String())
+	e.held = nil
+}
+
+// Above puts finished lines into the scrollback above the prompt and draws
+// the prompt again below them as it was. Safe from any goroutine. Without a
+// line on screen the lines are simply written, carriage return included,
+// since the terminal may still be raw.
+func (e *Editor) Above(lines []string) {
+	if len(lines) == 0 {
+		return
+	}
+	e.paintMu.Lock()
+	defer e.paintMu.Unlock()
+	e.aboveLocked(lines, "")
+}
+
+// aboveLocked writes lines above the prompt, then repaints the prompt with
+// the given text, or as it stood when prompt is empty. The repaint is built
+// from what was on screen, not from the buffer the read loop is editing.
+func (e *Editor) aboveLocked(lines []string, prompt string) {
+	if e.suspended {
+		e.held = append(e.held, lines...)
+		if prompt != "" {
+			e.live = prompt
+		}
+		return
+	}
+	var b strings.Builder
+	if e.reading && e.painted {
+		b.WriteString("\r\x1b[2K")
+	}
+	for _, l := range lines {
+		b.WriteString(l)
+		b.WriteString("\r\n")
+	}
+	if !e.reading {
+		_, _ = io.WriteString(e.out, b.String())
+		return
+	}
+	if prompt != "" && prompt != e.lastPrompt {
+		_, _ = io.WriteString(e.out, b.String())
+		e.live = prompt
+		e.invalidate()
+		e.paint(prompt)
+		return
+	}
+	shown := e.lastPrompt
+	b.WriteString(shown)
+	b.WriteString(string(e.lastVisible))
+	moveTo(&b, render.VisibleWidth(shown)+len(e.lastVisible), e.lastCursor)
+	_, _ = io.WriteString(e.out, b.String())
+	e.painted = true
 }
 
 func longestCommonPrefix(ss []string) string {
@@ -705,19 +825,7 @@ func (e *Editor) EmitAbove(prompt string, lines ...string) {
 	}
 	e.paintMu.Lock()
 	defer e.paintMu.Unlock()
-
-	var b strings.Builder
-	if e.painted {
-		b.WriteString("\r\x1b[2K")
-	}
-	for _, l := range lines {
-		b.WriteString(l)
-		b.WriteString("\r\n")
-	}
-	fmt.Fprint(e.out, b.String())
-	e.live = prompt
-	e.invalidate()
-	e.paint(prompt)
+	e.aboveLocked(lines, prompt)
 }
 
 // redraw repaints the prompt line as a single write, carrying only the
@@ -808,10 +916,11 @@ func summarise(s string) string {
 	return fmt.Sprintf("%s… [%d lines, Ctrl-G to edit]", first, strings.Count(s, "\n")+1)
 }
 
-// finalise leaves the completed input on the line before moving off it: redraw
-// only shows a scrolled window into the buffer, and without this the scrollback
-// would keep its tail. Wrapping is safe here, since the line is never redrawn.
-func (e *Editor) finalise(prompt, text string) {
+// finalLine is the completed input as left on the line before moving off it:
+// redraw only shows a scrolled window into the buffer, and without this the
+// scrollback would keep its tail. Wrapping is safe here, since the line is
+// never redrawn. Called with the paint lock held.
+func (e *Editor) finalLine(prompt, text string) string {
 	// Prefer a prompt repainted while the line was being typed: otherwise the
 	// marker committed to the scrollback says what was true when it first
 	// appeared, not when it was submitted.
@@ -826,8 +935,7 @@ func (e *Editor) finalise(prompt, text string) {
 	// clears the tail of the last row left by the scrolled window.
 	b.WriteString("\x1b[K")
 	b.WriteString("\r\n")
-	_, _ = io.WriteString(e.out, b.String())
-	e.invalidate()
+	return b.String()
 }
 
 // invalidate declares that something other than redraw has written to the

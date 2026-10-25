@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"os/exec"
 	"slices"
 	"strings"
 
@@ -35,11 +36,30 @@ type Client struct {
 	Version    string
 }
 
-// Connect runs binary with args, never through a shell, and initialises it.
+// Connect runs binary with args on this machine, never through a shell, and
+// initialises it. Only the host runtime does this.
 func Connect(ctx context.Context, binary string, args, env []string, notify func(method string)) (*Client, error) {
+	path, err := resolveBinary(binary)
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.Command(path, args...)
+	cmd.Env = env
 	c := newConn()
 	setNotify(c, notify)
-	if _, err := startProcess(c, binary, args, env); err != nil {
+	if err := startCmd(c, cmd, nil, true); err != nil {
+		return nil, fmt.Errorf("%s: %w", binary, err)
+	}
+	return initialise(ctx, c, nil)
+}
+
+// ConnectVia starts cmd, a worker in the target environment, sends it
+// preface (which says what to run or reach there), and initialises whatever
+// it relays to.
+func ConnectVia(ctx context.Context, cmd *exec.Cmd, preface []byte, notify func(method string)) (*Client, error) {
+	c := newConn()
+	setNotify(c, notify)
+	if err := startCmd(c, cmd, preface, false); err != nil {
 		return nil, err
 	}
 	return initialise(ctx, c, nil)
@@ -50,6 +70,7 @@ func Dial(ctx context.Context, url string, headers map[string]string, notify fun
 	c := newConn()
 	setNotify(c, notify)
 	t := newHTTPTransport(c, url, headers)
+	c.t = t
 	return initialise(ctx, c, t.setVersion)
 }
 

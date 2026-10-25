@@ -532,7 +532,12 @@ func (a *App) repl(ctx context.Context, cancel context.CancelFunc, opening strin
 		prompt := a.promptString()
 		stopIdle := a.startIdleCheckpoint(ctx, editor)
 		a.setPrompting(true)
+		if editor.IsTTY() {
+			// Anything committed while the prompt is up goes above it.
+			a.screen.Attach(editor)
+		}
 		line, err := editor.ReadLine(prompt)
+		a.screen.Detach()
 		a.setPrompting(false)
 		stopIdle()
 

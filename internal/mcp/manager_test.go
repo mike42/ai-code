@@ -3,13 +3,17 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
 
+	"ai-code/internal/mcp/hello"
 	"ai-code/internal/tool"
 )
 
@@ -223,11 +227,131 @@ func TestManagerRestartArgs(t *testing.T) {
 	}
 }
 
-func TestManagerUnsupportedRuntime(t *testing.T) {
-	m, _ := newManager(t, map[string]Entry{"h": helloEntry("h")})
-	m.SetUnsupported("not here")
-	if err := m.Start("h"); err == nil || err.Error() != "not here" {
-		t.Fatalf("err = %v", err)
+// workerLauncher starts the real worker binary on this machine, in place of
+// `docker exec ... worker` or `ssh ... worker`, with the opening message the
+// worker protocol defines. launched records every command it made.
+func workerLauncher(launched *[]*exec.Cmd, mu *sync.Mutex) Launcher {
+	return func(ctx context.Context, e Entry) (*exec.Cmd, []byte, error) {
+		cmd := exec.Command(workerBin)
+		mu.Lock()
+		*launched = append(*launched, cmd)
+		mu.Unlock()
+		preface, err := json.Marshal(map[string]any{"settings": map[string]any{}, "mcp": LaunchFor(e)})
+		return cmd, append(preface, '\n'), err
+	}
+}
+
+func TestManagerRunsServersThroughTheLauncher(t *testing.T) {
+	entries := map[string]Entry{
+		"h":    {Name: "h", Source: "cli", Binary: helloBin, Args: []string{"--greeting", `good "day"`, "--root=/my dir"}},
+		"gone": {Name: "gone", Source: "local", Binary: "/no/such/mcp-server"},
+	}
+	m, r := newManager(t, entries)
+	var (
+		launched []*exec.Cmd
+		mu       sync.Mutex
+	)
+	m.SetLauncher(workerLauncher(&launched, &mu))
+	exe := Wrap(nullExec{}, m)
+	m.Start("h")
+	m.Settle(context.Background(), func([]string) {})
+	if rep := <-r.ch; rep.Err != nil {
+		t.Fatal(rep.Err)
+	}
+	mu.Lock()
+	if len(launched) != 1 || len(launched[0].Args) != 1 {
+		t.Fatalf("the launcher's command carried arguments: %q", launched[0].Args)
+	}
+	mu.Unlock()
+	res, _ := exe.Execute(context.Background(), tool.Request{Name: "h_hello", Args: json.RawMessage(`{"name":"you"}`)})
+	if res.Content != `good "day", you (root /my dir)` {
+		t.Fatalf("arguments did not arrive as a list: %+v", res)
+	}
+
+	// Progress and cancellation cross the worker too.
+	ctx, cancel := context.WithCancel(context.Background())
+	var notes []string
+	exe.SetProgress(func(p tool.Phase) { notes = append(notes, p.Note); cancel() })
+	if res, _ := exe.Execute(ctx, tool.Request{Name: "h_wait"}); !res.Interrupted {
+		t.Fatalf("wait = %+v", res)
+	}
+	if len(notes) != 1 || notes[0] != "h: waiting (1/2)" {
+		t.Fatalf("progress = %q", notes)
+	}
+	exe.SetProgress(nil)
+
+	// The server's own exit status comes back through the worker.
+	res, _ = exe.Execute(context.Background(), tool.Request{Name: "h_crash", Args: json.RawMessage(`{"status":3}`)})
+	if !res.IsError || res.Content != "h exited (status 3)" {
+		t.Fatalf("crash = %+v", res)
+	}
+
+	m.Start("gone")
+	rep := <-r.ch
+	if rep.Err == nil || !strings.Contains(rep.Err.Error(), "exited (status 127): /no/such/mcp-server: not found") {
+		t.Fatalf("missing binary: %v", rep.Err)
+	}
+}
+
+func TestManagerReachesURLsThroughTheLauncher(t *testing.T) {
+	srv := httptest.NewServer(hello.Handler(hello.Options{Token: "secret"}, false))
+	defer srv.Close()
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	refused := "http://" + ln.Addr().String() + "/mcp"
+	ln.Close()
+	entries := map[string]Entry{
+		"web":  {Name: "web", Source: "local", URL: srv.URL, Headers: map[string]string{"Authorization": "Bearer secret"}},
+		"down": {Name: "down", Source: "local", URL: refused},
+	}
+	m, r := newManager(t, entries)
+	var (
+		launched []*exec.Cmd
+		mu       sync.Mutex
+	)
+	m.SetLauncher(workerLauncher(&launched, &mu))
+	exe := Wrap(nullExec{}, m)
+	m.Start("web")
+	if rep := <-r.ch; rep.Err != nil || rep.Tools != 2 {
+		t.Fatalf("report = %+v", rep)
+	}
+	res, _ := exe.Execute(context.Background(), tool.Request{Name: "web_hello", Args: json.RawMessage(`{"name":"net"}`)})
+	if res.IsError || res.Content != "Hello, net" {
+		t.Fatalf("result = %+v", res)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	exe.SetProgress(func(tool.Phase) { cancel() })
+	if res, _ := exe.Execute(ctx, tool.Request{Name: "web_wait"}); !res.Interrupted {
+		t.Fatalf("wait = %+v", res)
+	}
+	exe.SetProgress(nil)
+	if res, _ := exe.Execute(context.Background(), tool.Request{Name: "web_hello", Args: json.RawMessage(`{"name":"again"}`)}); res.Content != "Hello, again" {
+		t.Fatalf("after cancel = %+v", res)
+	}
+
+	m.Start("down")
+	rep := <-r.ch
+	if rep.Err == nil || !strings.Contains(rep.Err.Error(), "refused") {
+		t.Fatalf("refused: %v", rep.Err)
+	}
+}
+
+// A server that ignores the end of its stdin is still ended when the worker's
+// stdin closes: the worker terminates the server's process group.
+func TestRelayEndsAServerThatIgnoresItsStdin(t *testing.T) {
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	done := make(chan int, 1)
+	go func() { done <- Relay(inR, outW, io.Discard, t.TempDir(), Launch{Binary: helloBin}); outW.Close() }()
+	go io.Copy(io.Discard, outR)
+	for _, m := range []string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"wait"}}`,
+	} {
+		inW.Write([]byte(m + "\n"))
+	}
+	inW.Close()
+	if code := <-done; code == 0 {
+		t.Fatalf("relay ended with status 0; the server should have been terminated")
 	}
 }
 

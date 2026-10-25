@@ -458,8 +458,7 @@ func TestSubmitPutsTheWholeLineInTheScrollback(t *testing.T) {
 	e.redraw("> ")
 	out()
 
-	e.finalise("> ", text)
-	got := out()
+	got := e.finalLine("> ", text)
 
 	if !strings.Contains(got, text) {
 		t.Errorf("submitted line = %q, want the whole prompt", got)
@@ -475,9 +474,8 @@ func TestSubmitPutsTheWholeLineInTheScrollback(t *testing.T) {
 // A short line is already drawn where it will stay. Rewriting it in place is
 // what keeps it from being echoed a second time by the app.
 func TestSubmitDoesNotRepeatAShortLine(t *testing.T) {
-	e, out := captureEditor(t)
-	e.finalise("> ", "fix the failing test")
-	got := out()
+	e, _ := captureEditor(t)
+	got := e.finalLine("> ", "fix the failing test")
 	if n := strings.Count(got, "fix the failing test"); n != 1 {
 		t.Errorf("submit emitted %q, want the line exactly once", got)
 	}
@@ -490,9 +488,8 @@ func TestSubmitDoesNotRepeatAShortLine(t *testing.T) {
 // the scrollback through render.Echo, and a raw newline here would split the
 // row the erase arithmetic below counts on.
 func TestSubmitKeepsMultilineInputSummarised(t *testing.T) {
-	e, out := captureEditor(t)
-	e.finalise("> ", "first line\nsecond line\nthird line")
-	got := out()
+	e, _ := captureEditor(t)
+	got := e.finalLine("> ", "first line\nsecond line\nthird line")
 
 	if strings.Contains(got, "second line") {
 		t.Errorf("submit = %q, want multi-line content summarised, not drawn", got)
@@ -508,10 +505,9 @@ func TestSubmitKeepsMultilineInputSummarised(t *testing.T) {
 // An enormous paste with its newlines stripped out is still one line, and
 // reproducing all of it would scroll the session away.
 func TestSubmitBoundsAnEnormousLine(t *testing.T) {
-	e, out := captureEditor(t)
+	e, _ := captureEditor(t)
 	huge := strings.Repeat("x", 100_000)
-	e.finalise("> ", "START "+huge+" END")
-	got := out()
+	got := e.finalLine("> ", "START "+huge+" END")
 
 	if len(got) > 4000 {
 		t.Errorf("submit emitted %d bytes for a 100k-character line, want it capped", len(got))
@@ -536,5 +532,29 @@ func TestPipedSubmitWritesNothingToTheTerminal(t *testing.T) {
 	}
 	if got := out(); got != "" {
 		t.Errorf("piped read wrote %q to the terminal, want nothing", got)
+	}
+}
+
+// Between prompts the terminal may still be raw, so lines carry their own
+// carriage return and no prompt is drawn after them; while an external
+// editor has the terminal they wait, and appear when it hands back.
+func TestAboveWithoutALineOnScreen(t *testing.T) {
+	e, out := captureEditor(t)
+	e.Above([]string{"one", "two"})
+	if got := out(); got != "one\r\ntwo\r\n" {
+		t.Errorf("no prompt up: %q, want the lines alone, each ending \\r\\n", got)
+	}
+
+	e.suspended = true
+	e.Above([]string{"later"})
+	if got := out(); got != "" {
+		t.Errorf("external editor running: wrote %q, want nothing", got)
+	}
+	e.paintMu.Lock()
+	e.suspended = false
+	e.flushHeldLocked()
+	e.paintMu.Unlock()
+	if got := out(); got != "later\r\n" {
+		t.Errorf("after the editor: %q, want the held line", got)
 	}
 }

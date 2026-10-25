@@ -229,7 +229,7 @@ func TestBareSlashStaysACommandList(t *testing.T) {
 	a := &App{cwd: root, projectRoot: root}
 
 	at, got := a.complete("")
-	if at != 0 || !slices.Equal(got, []string{"internal/", "notes.md"}) {
+	if at != 0 || !slices.Equal(got, []string{"build/", "internal/", "notes.md"}) {
 		t.Errorf("empty prompt = (%d, %v), want the working directory", at, got)
 	}
 

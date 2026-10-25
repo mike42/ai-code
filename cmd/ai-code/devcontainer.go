@@ -59,6 +59,27 @@ type DevcontainerExecutor struct {
 	entry  string
 	// stderr holds the engine's captured output, for a failure report.
 	stderr *cappedBuffer
+
+	// up names the running container once start has brought it up. It has
+	// its own lock because mu is held for the whole of a tool call, and
+	// starting another worker in the container must not wait for one.
+	upMu sync.Mutex
+	up   *containerUp
+}
+
+// containerUp is what starting another worker in a running container needs.
+type containerUp struct{ cid, engine, entry string }
+
+func (e *DevcontainerExecutor) publishUp() {
+	e.upMu.Lock()
+	e.up = &containerUp{cid: e.cid, engine: e.engine, entry: e.entry}
+	e.upMu.Unlock()
+}
+
+func (e *DevcontainerExecutor) running() *containerUp {
+	e.upMu.Lock()
+	defer e.upMu.Unlock()
+	return e.up
 }
 
 // stderrCap bounds the podman startup output kept for a failure report.
@@ -297,6 +318,7 @@ func (e *DevcontainerExecutor) start(ctx context.Context) error {
 		return e.init
 	}
 	e.cid = name
+	e.publishUp()
 	return nil
 }
 
@@ -416,6 +438,35 @@ func (e *DevcontainerExecutor) Fork() (tool.Executor, error) {
 func containerRunning(engine, cid string) bool {
 	out, err := exec.Command(engine, "inspect", "-f", "{{.State.Running}}", cid).Output()
 	return err == nil && strings.TrimSpace(string(out)) == "true"
+}
+
+// MCPCommand brings the container up if it is not already, and returns a
+// command that starts another worker in it, beside the session's own, to run
+// or reach an MCP server from inside.
+func (e *DevcontainerExecutor) MCPCommand(ctx context.Context) (*exec.Cmd, error) {
+	host := e
+	if e.host != nil {
+		host = e.host
+	}
+	up := host.running()
+	if up == nil {
+		// Not up yet: nothing is using mu, or the call holding it is the one
+		// bringing the container up, which this has to wait for anyway.
+		host.mu.Lock()
+		err := host.start(ctx)
+		why := host.stderrTail()
+		host.mu.Unlock()
+		if err != nil {
+			return nil, fmt.Errorf("the devcontainer is unavailable: %v%s", err, why)
+		}
+		if up = host.running(); up == nil {
+			return nil, fmt.Errorf("the devcontainer started without a container id, so nothing can be started in it")
+		}
+	}
+	if up.cid == "" || up.engine == "" {
+		return nil, fmt.Errorf("the container's id could not be read from the engine, so nothing can be started in it")
+	}
+	return exec.Command(up.engine, host.execArgv(up.cid, e.workdir, up.entry)...), nil
 }
 
 // startForked attaches a second daemon to the container the host owns.

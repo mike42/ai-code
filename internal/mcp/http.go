@@ -18,7 +18,7 @@ import (
 // httpTransport speaks Streamable HTTP: every message is a POST, answered by
 // a JSON body or an SSE stream of messages.
 type httpTransport struct {
-	conn    *Conn
+	conn    httpSink
 	url     string
 	headers map[string]string
 	client  *http.Client
@@ -31,11 +31,15 @@ type httpTransport struct {
 	version   string
 }
 
-func newHTTPTransport(c *Conn, url string, headers map[string]string) *httpTransport {
+// httpSink takes what comes back: a client's Conn, or the worker's bridge.
+type httpSink interface {
+	deliver(raw []byte)
+	failRequest(id int64, err error)
+}
+
+func newHTTPTransport(sink httpSink, url string, headers map[string]string) *httpTransport {
 	base, cancel := context.WithCancel(context.Background())
-	t := &httpTransport{conn: c, url: url, headers: headers, client: &http.Client{}, base: base, cancel: cancel}
-	c.t = t
-	return t
+	return &httpTransport{conn: sink, url: url, headers: headers, client: &http.Client{}, base: base, cancel: cancel}
 }
 
 func (t *httpTransport) setVersion(v string) {
