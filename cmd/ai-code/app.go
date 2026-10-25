@@ -42,9 +42,16 @@ type App struct {
 	client       provider.Client
 	providerName string
 	providerCfg  config.Provider
-	model        provider.ModelInfo
-	modeName     string
-	limitSource  string
+	// model is empty until the provider has said which one to use.
+	model provider.ModelInfo
+	// pick is that question, asked in the background at launch, with
+	// requestedModel the one --model or AI_CODE_MODEL named.
+	pick           *modelPick
+	requestedModel string
+	// modelExplicit is set while the model is one the user named and the
+	// server has not yet loaded: only then may a prompt load it over another.
+	modelExplicit bool
+	modeName      string
 	// noCloud is true when a .nocloud file marks the tree; cloud providers are
 	// then unavailable.
 	noCloud bool
@@ -486,6 +493,10 @@ func (a *App) repl(ctx context.Context, cancel context.CancelFunc, opening strin
 	defer a.setEditor(nil)
 
 	a.banner()
+	// After the banner, so the line naming the model lands below it.
+	if a.pick == nil && a.model.ID == "" {
+		a.startModelPick(ctx, a.requestedModel)
+	}
 
 	// Before anything typed this run, so Up walks back through the session.
 	for _, h := range a.resumedInputs {
@@ -584,10 +595,20 @@ func (a *App) reportError(err error) {
 func (a *App) handleInput(ctx context.Context, line string) error {
 	a.agentMu.Lock()
 	defer a.agentMu.Unlock()
+	a.applyModelPick()
 	if strings.HasPrefix(line, "/") {
 		return a.command(ctx, line)
 	}
 
+	if err := a.readyToSend(ctx); err != nil {
+		if errors.Is(err, context.Canceled) && ctx.Err() == nil {
+			a.note("Not sent.")
+			err = nil
+		}
+		// Back in the prompt, ready to send once there is a model.
+		a.pendingInput = line
+		return err
+	}
 	a.echoTypedPrompt(line)
 	if err := a.beforeSend(ctx); err != nil {
 		if ctx.Err() == nil && errors.Is(err, context.Canceled) {
@@ -641,7 +662,6 @@ func (a *App) runtimeLabel() string {
 
 func (a *App) banner() {
 	style := render.NewStyle(a.screen.Color())
-	limit, _ := contextLimitFor(a.model, a.cfg.Agent.ContextOverride)
 
 	cls := ""
 	if a.client.Class() == provider.ClassCloud {
@@ -659,21 +679,19 @@ func (a *App) banner() {
 		}
 	}
 
-	ctx := compactInt(limit) + " ctx"
-	if s := slotSummary(a.model); s != "" {
-		ctx += " (" + s + ")"
-	}
+	// The model is announced on a line of its own once the provider says
+	// which it is; the prompt does not wait for that.
+	thinking := ""
 	if e := a.agent.Effort(); e != provider.EffortUnset {
-		ctx += "   thinking " + effortLabel(e)
+		thinking = "   " + style.Dim("thinking "+effortLabel(e))
 	}
 
 	a.out(
-		fmt.Sprintf("%s %s   %s   %s%s   %s%s",
+		fmt.Sprintf("%s %s   %s%s%s%s",
 			style.Bold("ai-code"), style.Dim(version),
-			a.model.ID,
 			style.Dim(a.providerName),
 			cls,
-			style.Dim(ctx),
+			thinking,
 			rtLine),
 		style.Dim(fmt.Sprintf("%s · /help for commands, Ctrl-G to open an editor",
 			a.where())),
@@ -971,13 +989,14 @@ func (a *App) cmdRestart(ctx context.Context, args string) error {
 	return &restartRequest{binary: binary, argv: a.restartArgv(binary)}
 }
 
-// restartArgv describes the session as it stands now, so a provider, model or
-// mode changed part-way through survives the restart.
+// restartArgv describes the session as it stands now, so a provider or mode
+// changed part-way through survives the restart. The model is left to the
+// same rule as any launch: --model would demand it, and load it back over
+// whatever the server holds by then.
 func (a *App) restartArgv(binary string) []string {
 	argv := []string{binary,
 		"--resume", a.sess.Meta.ID,
 		"--provider", a.providerName,
-		"--model", a.model.ID,
 		"--mode", a.modeName,
 	}
 	if a.rt != nil {

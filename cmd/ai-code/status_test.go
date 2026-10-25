@@ -54,33 +54,43 @@ func dividedModel() provider.ModelInfo {
 	}
 }
 
-// The startup banner reports the machine; it does not advise on it. How many
-// slots to run is a trade-off already made, usually for a reason ai-code
-// cannot see, and re-litigating it every session is noise.
-func TestBannerStatesTheSlotsWithoutAdvice(t *testing.T) {
+// The line announcing the model reports the machine; it does not advise on
+// it. How many slots to run is a trade-off already made, usually for a reason
+// ai-code cannot see, and re-litigating it every session is noise.
+func TestModelLineStatesTheSlotsWithoutAdvice(t *testing.T) {
 	a := statusApp(t, dividedModel())
-	out := captureOut(t, a.banner)
+	out := a.modelLine(modelChoice{Model: dividedModel(), Why: "loaded on local"})
 
 	for _, advice := range []string{"--parallel", "--kv-unified", "Reduce", "if you want"} {
 		if strings.Contains(out, advice) {
-			t.Errorf("the banner tells the user how to reconfigure their server (%q):\n%s", advice, out)
+			t.Errorf("the model line tells the user how to reconfigure their server (%q):\n%s", advice, out)
 		}
 	}
-	for _, fact := range []string{"a-model", "262k", "786k", "3 slots"} {
+	for _, fact := range []string{"a-model", "loaded on local", "262k", "786k", "3 slots"} {
 		if !strings.Contains(out, fact) {
-			t.Errorf("the banner omits %q, which is one of the facts it is for:\n%s", fact, out)
+			t.Errorf("the model line omits %q, which is one of the facts it is for:\n%s", fact, out)
 		}
-	}
-	if n := len(nonBlank(out)); n != 2 {
-		t.Errorf("the banner is %d lines, want 2:\n%s", n, out)
 	}
 }
 
-func TestBannerSaysNothingAboutSlotsWhenThereIsOne(t *testing.T) {
-	a := statusApp(t, provider.ModelInfo{ID: "a-model", ContextWindow: 262144})
-	out := captureOut(t, a.banner)
-	if strings.Contains(out, "slot") {
+func TestModelLineSaysNothingAboutSlotsWhenThereIsOne(t *testing.T) {
+	m := provider.ModelInfo{ID: "a-model", ContextWindow: 262144}
+	a := statusApp(t, m)
+	if out := a.modelLine(modelChoice{Model: m}); strings.Contains(out, "slot") {
 		t.Errorf("an undivided window should not mention slots:\n%s", out)
+	}
+}
+
+// The banner is what can be said without asking the provider anything, so
+// it never names a model: one named before the server answers is a guess.
+func TestBannerNamesNoModel(t *testing.T) {
+	a := statusApp(t, dividedModel())
+	out := captureOut(t, a.banner)
+	if strings.Contains(out, "a-model") || strings.Contains(out, "ctx") {
+		t.Errorf("the banner speaks for the model before the provider has:\n%s", out)
+	}
+	if n := len(nonBlank(out)); n != 2 {
+		t.Errorf("the banner is %d lines, want 2:\n%s", n, out)
 	}
 }
 

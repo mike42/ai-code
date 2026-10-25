@@ -205,10 +205,12 @@ func (l *Lemonade) Models(ctx context.Context) ([]ModelInfo, error) {
 	}
 	// Mark what is resident; a health failure still leaves a useful model list.
 	resident := -1
-	if h, err := l.Health(ctx); err == nil && h.ModelLoaded != "" {
+	if h, err := l.Health(ctx); err == nil {
 		for i := range models {
-			if models[i].ID == h.ModelLoaded {
+			if slices.Contains(h.Loaded, models[i].ID) {
 				models[i].Loaded = true
+			}
+			if models[i].ID == h.ModelLoaded {
 				resident = i
 			}
 		}
@@ -254,11 +256,17 @@ func (l *Lemonade) Health(ctx context.Context) (*Health, error) {
 		MaxLLMSlots: body.MaxModels.LLM,
 	}
 	for _, m := range body.AllModelsLoaded {
+		if m.Loaded {
+			h.Loaded = append(h.Loaded, m.ModelName)
+		}
 		if m.ModelName == body.ModelLoaded {
 			h.Ready = m.Loaded && m.Status == "ready"
 			h.Busy = m.IsBusy
 			h.Streaming = m.IsStreaming
 		}
+	}
+	if len(h.Loaded) == 0 && h.ModelLoaded != "" {
+		h.Loaded = []string{h.ModelLoaded}
 	}
 	return h, nil
 }

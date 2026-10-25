@@ -277,7 +277,7 @@ func TestMCPWorkerCommandsNameOnlyTheWorker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ssh := NewSSHExecutor(rt, "", worker.Settings{})
+	ssh := NewSSHExecutor(rt, "", noSettings)
 	ssh.remoteBin = "/home/dev/.cache/ai-code/bin/ai-code-worker-0123"
 	cmd, err := ssh.MCPCommand(context.Background())
 	if err != nil {

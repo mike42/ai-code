@@ -24,6 +24,9 @@ type Settings struct {
 	ReadMaxBytes   int           `json:"read_max_bytes,omitempty"`
 	ReadMaxLines   int           `json:"read_max_lines,omitempty"`
 	GrepMaxResults int           `json:"grep_max_results,omitempty"`
+	// BashMaxOutputFunc, for tools in this process, is read at each command in
+	// place of BashMaxOutput, which a worker elsewhere receives as a number.
+	BashMaxOutputFunc func() int `json:"-"`
 }
 
 type Hello struct {
@@ -41,7 +44,8 @@ func (e ExitStatus) Error() string { return fmt.Sprintf("exit status %d", e.Code
 
 func Tools(s Settings, cwd string) *tool.LocalExecutor {
 	return tool.NewLocalExecutor(tool.NewState(cwd),
-		&tool.BashTool{Timeout: s.BashTimeout, MaxOutputBytes: s.BashMaxOutput, Shell: s.Shell},
+		&tool.BashTool{Timeout: s.BashTimeout, MaxOutputBytes: s.BashMaxOutput,
+			MaxOutput: s.BashMaxOutputFunc, Shell: s.Shell},
 		&tool.ReadTool{MaxBytes: s.ReadMaxBytes, MaxLines: s.ReadMaxLines},
 		&tool.WriteTool{},
 		&tool.EditTool{},

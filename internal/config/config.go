@@ -124,12 +124,11 @@ type GrepTool struct {
 }
 
 type Provider struct {
-	Kind         string            `toml:"kind"`
-	BaseURL      string            `toml:"base_url"`
-	APIKey       string            `toml:"api_key"`
-	Class        string            `toml:"class"`
-	DefaultModel string            `toml:"default_model"`
-	Headers      map[string]string `toml:"headers"`
+	Kind    string            `toml:"kind"`
+	BaseURL string            `toml:"base_url"`
+	APIKey  string            `toml:"api_key"`
+	Class   string            `toml:"class"`
+	Headers map[string]string `toml:"headers"`
 	// Timeout bounds establishing the connection only -- DNS, TCP and TLS --
 	// never generation, which a large local model may stream for a long time.
 	Timeout Duration `toml:"timeout"`
@@ -346,8 +345,16 @@ func overlayFile(cfg *Config, path, source string) error {
 	cfg.Mode = map[string]Mode{}
 	cfg.MCP = nil
 
-	if _, err := toml.Decode(string(raw), cfg); err != nil {
+	md, err := toml.Decode(string(raw), cfg)
+	if err != nil {
 		return fmt.Errorf("parsing %s: %w", path, err)
+	}
+	// Silently ignoring it would leave someone believing it still chooses.
+	for name := range cfg.Provider {
+		if md.IsDefined("provider", name, "default_model") {
+			return fmt.Errorf("%s: provider.%s.default_model is not supported: ai-code uses the model "+
+				"the server has loaded, or the one named with --model or /model", path, name)
+		}
 	}
 
 	cfg.Provider = mergeProviders(existingProviders, cfg.Provider)
@@ -397,9 +404,6 @@ func mergeProvider(base, ov Provider) Provider {
 	}
 	if ov.Class != "" {
 		m.Class = ov.Class
-	}
-	if ov.DefaultModel != "" {
-		m.DefaultModel = ov.DefaultModel
 	}
 	if ov.Timeout.Duration != 0 {
 		m.Timeout = ov.Timeout
@@ -465,15 +469,6 @@ func overlayEnv(cfg *Config) error {
 	}
 	if v := os.Getenv("AI_CODE_EDITOR"); v != "" {
 		cfg.Editor = v
-	}
-	if v := os.Getenv("AI_CODE_MODEL"); v != "" {
-		p := cfg.DefaultProvider
-		if p == "" {
-			return errors.New("AI_CODE_MODEL is set but no default provider is configured")
-		}
-		pv := cfg.Provider[p]
-		pv.DefaultModel = v
-		cfg.Provider[p] = pv
 	}
 	if os.Getenv("NO_COLOR") != "" {
 		cfg.UI.Color = "never"

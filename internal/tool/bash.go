@@ -27,7 +27,16 @@ const (
 type BashTool struct {
 	Timeout        time.Duration
 	MaxOutputBytes int
-	Shell          string
+	// MaxOutput, when set, replaces MaxOutputBytes and is read per command.
+	MaxOutput func() int
+	Shell     string
+}
+
+func (t *BashTool) outputLimit() int {
+	if t.MaxOutput != nil {
+		return t.MaxOutput()
+	}
+	return t.MaxOutputBytes
 }
 
 func (t *BashTool) Name() string        { return "bash" }
@@ -101,7 +110,8 @@ func (t *BashTool) Run(ctx context.Context, st *State, raw json.RawMessage) Resu
 		return Errorf("could not create the output pipe: %v", err)
 	}
 	defer pr.Close()
-	buf := newBoundedBuffer(t.MaxOutputBytes)
+	limit := t.outputLimit()
+	buf := newBoundedBuffer(limit)
 	cmd.Stdout = pw
 	cmd.Stderr = pw
 
@@ -173,7 +183,7 @@ func (t *BashTool) Run(ctx context.Context, st *State, raw json.RawMessage) Resu
 	exitCode := cmd.ProcessState.ExitCode()
 
 	// Truncate runs on every reporting path: an early return would dump the whole buffer.
-	truncated, wasTruncated := Truncate(trim(output), t.MaxOutputBytes)
+	truncated, wasTruncated := Truncate(trim(output), limit)
 	if buf.Overflowed() {
 		wasTruncated = true
 	}

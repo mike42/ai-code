@@ -223,6 +223,8 @@ type Client interface {
 type Health struct {
 	Ready       bool
 	ModelLoaded string
+	// Loaded is every model the server reports resident, ModelLoaded included.
+	Loaded      []string
 	MaxLLMSlots int
 	Busy        bool
 	Streaming   bool

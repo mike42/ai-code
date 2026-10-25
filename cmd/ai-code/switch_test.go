@@ -348,11 +348,10 @@ func cloudProviderApp(t *testing.T) (*App, *int32) {
 	app, _ := swapApp(t, 65536, 4000)
 	app.cfg.Provider = map[string]config.Provider{
 		"remote": {
-			Kind:         "openrouter",
-			BaseURL:      srv.URL,
-			Class:        string(provider.ClassCloud),
-			APIKey:       "secret-key",
-			DefaultModel: "remote-model",
+			Kind:    "openrouter",
+			BaseURL: srv.URL,
+			Class:   string(provider.ClassCloud),
+			APIKey:  "secret-key",
 		},
 	}
 	// A cached catalogue would answer the request this test counts, so point

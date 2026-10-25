@@ -31,9 +31,10 @@ type DevcontainerExecutor struct {
 	cfgErr error
 	// project is the host directory mounted into the container.
 	project string
-	// settings are sent to every worker; catalog advertises the same tools
-	// before the container exists.
-	settings worker.Settings
+	// settings are built and sent as each worker starts, so they reflect the
+	// model of the moment; catalog advertises the same tools before the
+	// container exists.
+	settings func() worker.Settings
 	catalog  *tool.LocalExecutor
 	// workerPath is the worker on this machine, mounted into the container.
 	workerPath string
@@ -158,9 +159,9 @@ func (o *outputLines) failure() string {
 
 // NewDevcontainerExecutor wires up a lazily-started devcontainer executor.
 // project is the mount source; cwd is the launch directory.
-func NewDevcontainerExecutor(cfg *devcontainer.Config, cfgErr error, project, cwd string, settings worker.Settings) *DevcontainerExecutor {
+func NewDevcontainerExecutor(cfg *devcontainer.Config, cfgErr error, project, cwd string, settings func() worker.Settings) *DevcontainerExecutor {
 	e := &DevcontainerExecutor{cfg: cfg, cfgErr: cfgErr, project: project,
-		settings: settings, catalog: worker.Tools(settings, "")}
+		settings: settings, catalog: worker.Tools(settings(), "")}
 	if cfg != nil {
 		e.workdir = mountCwd(project, cwd, cfg.WorkspaceFolder)
 	} else {
@@ -313,7 +314,7 @@ func (e *DevcontainerExecutor) start(ctx context.Context) error {
 	}()
 
 	e.cmd = cmd
-	if e.client, err = worker.NewClient(stdin, stdout, e.settings); err != nil {
+	if e.client, err = worker.NewClient(stdin, stdout, e.settings()); err != nil {
 		e.init = fmt.Errorf("the worker in the container did not start: %w", err)
 		return e.init
 	}
@@ -525,7 +526,7 @@ func (e *DevcontainerExecutor) startForked(ctx context.Context) error {
 	go func() { io.Copy(stderr, stderrPipe) }()
 
 	e.cmd = cmd
-	if e.client, err = worker.NewClient(stdin, stdout, e.settings); err != nil {
+	if e.client, err = worker.NewClient(stdin, stdout, e.settings()); err != nil {
 		e.init = fmt.Errorf("the worker shell in the container did not start: %w", err)
 		return e.init
 	}

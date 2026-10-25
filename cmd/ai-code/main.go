@@ -340,11 +340,21 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	model, err := resolveModel(ctx, client, f.model, pc.DefaultModel)
-	if err != nil {
-		return err
+	// No model is chosen here: asking the provider can be slow, and the prompt
+	// comes first. AI_CODE_MODEL is --model spelled as a variable.
+	requested := f.model
+	if requested == "" {
+		requested = os.Getenv("AI_CODE_MODEL")
 	}
-	limit, limitSource := contextLimitFor(model, cfg.Agent.ContextOverride)
+	// The window, once the model is known, sizes what one bash command may
+	// return. Tools only run after a model is.
+	var app *App
+	window := func() int {
+		if app == nil || app.agent == nil {
+			return 0
+		}
+		return app.agent.Window()
+	}
 
 	modeName := f.mode
 	if modeName == "" {
@@ -394,7 +404,7 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 		if rt.Config != nil {
 			rt.Config.SubstituteAll(projectRoot, devcontainerID(projectRoot))
 		}
-		dc := NewDevcontainerExecutor(rt.Config, rt.ConfigErr, projectRoot, cwd, toolSettings(cfg, limit))
+		dc := NewDevcontainerExecutor(rt.Config, rt.ConfigErr, projectRoot, cwd, func() worker.Settings { return toolSettings(cfg, window) })
 		exe = dc
 		mcpWorker = dc.MCPCommand
 		defer dc.Close()
@@ -439,7 +449,7 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 			}
 		}
 	case runtime.KindSSH:
-		ssh := NewSSHExecutor(rt, f.sshConfig, toolSettings(cfg, limit))
+		ssh := NewSSHExecutor(rt, f.sshConfig, func() worker.Settings { return toolSettings(cfg, window) })
 		remoteExec = ssh
 		exe = ssh
 		mcpWorker = ssh.MCPCommand
@@ -453,7 +463,7 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 		}
 		showPath = func(string) (string, bool) { return "", false }
 	case runtime.KindHost:
-		local := worker.Tools(toolSettings(cfg, limit), cwd)
+		local := worker.Tools(toolSettings(cfg, window), cwd)
 		exe, toolState = local, local.State()
 	default:
 		return fmt.Errorf("no executor for runtime %q", rt.Kind)
@@ -523,7 +533,6 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 		carried = host.Carried()
 		exe = host
 	}
-	var app *App
 	if f.imageModel != "" {
 		if !choice.allow("write") {
 			return fmt.Errorf("--image-gen-model saves pictures with the write tool, which --disable-tools turns off")
@@ -597,7 +606,6 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 		client:         client,
 		providerName:   providerName,
 		providerCfg:    pc,
-		model:          model,
 		modeName:       modeName,
 		exec:           exe,
 		toolState:      toolState,
@@ -605,7 +613,6 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 		interactive:    interactive,
 		verbosity:      verbosity,
 		env:            env,
-		limitSource:    limitSource,
 		noCloud:        nocloud,
 		gate:           gate,
 		rt:             rt,
@@ -634,7 +641,7 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 	// An instance that cannot reach the others runs as if alone.
 	joined := time.Now().UnixNano()
 	if bus, err := coord.Join(coord.DefaultDir(), coord.Peer{
-		Cwd: workspace, Server: serverKey(client, pc), Model: model.ID,
+		Cwd: workspace, Server: serverKey(client, pc),
 	}); err == nil {
 		defer bus.Close()
 		app.share = newModelShare(bus, joined)
@@ -644,16 +651,15 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 		coord.Trace("not coordinated: %v", err)
 	}
 
-	app.agent = agent.New(client, model.ID, exe,
+	// The model and its window arrive with adoptModel.
+	app.agent = agent.New(client, "", exe,
 		agent.MultiSink{sink, agent.SinkFunc(app.noteContext)}, agent.Options{
-			MaxIterations:   cfg.Agent.MaxIterations,
-			MaxTokens:       cfg.Agent.MaxTokens,
-			MaxOutputTokens: model.MaxOutputTokens,
-			Temperature:     cfg.Agent.Temperature,
-			TopP:            cfg.Agent.TopP,
-			ParallelReads:   cfg.Agent.ParallelReads == nil || *cfg.Agent.ParallelReads,
-			LoopGuard:       cfg.Agent.LoopGuard,
-			ContextLimit:    limit,
+			MaxIterations: cfg.Agent.MaxIterations,
+			MaxTokens:     cfg.Agent.MaxTokens,
+			Temperature:   cfg.Agent.Temperature,
+			TopP:          cfg.Agent.TopP,
+			ParallelReads: cfg.Agent.ParallelReads == nil || *cfg.Agent.ParallelReads,
+			LoopGuard:     cfg.Agent.LoopGuard,
 
 			Effort: thinking,
 
@@ -697,11 +703,21 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 		if opening == "" {
 			return errors.New("nothing to do: pass a prompt, or pipe one in")
 		}
+		// Nobody is waiting at a prompt, so the model is settled up front.
+		choice, err := chooseModel(ctx, client, requested, session.PreviousModel(sessionProject, providerName))
+		if err != nil {
+			return err
+		}
+		app.adoptModel(choice)
+		if err := app.checkServer(ctx); err != nil {
+			return err
+		}
 		lim := app.startLimits(f.limits, started, saveTerminal(screen.ClearTransient))
 		defer lim.stop()
 		return app.runPrint(ctx, opening, lim)
 	}
 
+	app.requestedModel = requested
 	return app.repl(ctx, cancel, opening)
 }
 
@@ -824,9 +840,6 @@ func cmdConfig(cwd string, nocloud bool) error {
 		if p.TLSInsecure {
 			fmt.Print("  tls=insecure")
 		}
-		if p.DefaultModel != "" {
-			fmt.Printf("  model=%s", p.DefaultModel)
-		}
 		fmt.Println()
 	}
 
@@ -872,7 +885,7 @@ func cmdModels(f *flags, cwd string, nocloud bool) error {
 		return err
 	}
 
-	models, err := fetchModels(context.Background(), client, false)
+	models, err := liveModels(context.Background(), client)
 	if err != nil {
 		return err
 	}

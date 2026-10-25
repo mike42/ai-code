@@ -12,6 +12,7 @@ import (
 	"ai-code/internal/config"
 	"ai-code/internal/provider"
 	"ai-code/internal/render"
+	"ai-code/internal/session"
 )
 
 // cmdModel shows or changes the model.
@@ -19,11 +20,15 @@ func (a *App) cmdModel(ctx context.Context, args string) error {
 	style := render.NewStyle(a.screen.Color())
 
 	if args == "" {
-		models, err := fetchModels(ctx, a.client, true)
+		models, err := liveModels(ctx, a.client)
 		if err != nil {
 			return err
 		}
-		lines := []string{"", fmt.Sprintf("  Current: %s on %s", style.Bold(a.model.ID), a.providerName), ""}
+		current := style.Bold(a.model.ID)
+		if a.model.ID == "" {
+			current = "none yet"
+		}
+		lines := []string{"", fmt.Sprintf("  Current: %s on %s", current, a.providerName), ""}
 		for _, l := range strings.Split(formatModelList(models, 40), "\n") {
 			lines = append(lines, style.Dim(l))
 		}
@@ -32,7 +37,7 @@ func (a *App) cmdModel(ctx context.Context, args string) error {
 		return nil
 	}
 
-	models, err := fetchModels(ctx, a.client, true)
+	models, err := liveModels(ctx, a.client)
 	if err != nil {
 		return err
 	}
@@ -47,7 +52,15 @@ func (a *App) cmdModel(ctx context.Context, args string) error {
 		return fmt.Errorf("model %q is not available on %s.\n\nAvailable:\n%s",
 			args, a.providerName, formatModelList(models, 20))
 	}
-	return a.switchTo(ctx, a.client, a.providerName, a.providerCfg, *target, false)
+	if err := a.switchTo(ctx, a.client, a.providerName, a.providerCfg, *target, false); err != nil {
+		return err
+	}
+	// Named by the user, so it may replace whatever the server holds, until
+	// the server reports it loaded.
+	if a.model.ID == target.ID {
+		a.modelExplicit = true
+	}
+	return nil
 }
 
 // cmdProvider shows or changes the provider.
@@ -96,9 +109,10 @@ func (a *App) cmdProvider(ctx context.Context, args string) error {
 	if a.cloudForbidden() && class == provider.ClassCloud {
 		return errCloudForbiddenHere
 	}
+	previous := session.PreviousModel(a.sessionProject, args)
 	confirmed := false
 	if class == provider.ClassCloud && len(a.agent.Messages()) > 0 {
-		if !a.confirmCloudSwitch(args, class, pc.DefaultModel) {
+		if !a.confirmCloudSwitch(args, class, previous) {
 			a.out("", "Cancelled. Nothing was sent.", "")
 			return nil
 		}
@@ -113,11 +127,21 @@ func (a *App) cmdProvider(ctx context.Context, args string) error {
 		client = a.gate.wrap(client)
 	}
 	client = a.share.wrap(client)
-	model, err := resolveModel(ctx, client, "", pc.DefaultModel)
+	choice, err := chooseModel(ctx, client, "", previous)
+	if isNoModel(err) {
+		// On the provider with no model: nothing is sent until one is chosen.
+		a.client, a.providerName, a.providerCfg = client, args, pc
+		a.model = provider.ModelInfo{}
+		a.agent.SetClient(client)
+		a.agent.SetModel("", 0, 0)
+		a.modelExplicit = false
+		a.out(fmt.Sprintf("Now on %s, with no model: %v.", args, err))
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	return a.switchTo(ctx, client, args, pc, model, confirmed)
+	return a.switchTo(ctx, client, args, pc, choice.Model, confirmed)
 }
 
 // errCloudForbiddenHere is what a .nocloud tree answers.
@@ -128,6 +152,13 @@ var errCloudForbiddenHere = errors.New(
 // to a cloud provider is confirmed explicitly, with the payload stated;
 // confirmed says the caller already asked and was told to go ahead.
 func (a *App) switchTo(ctx context.Context, client provider.Client, name string, pc config.Provider, model provider.ModelInfo, confirmed bool) error {
+	return a.changeModel(ctx, client, name, pc, model, confirmed, true)
+}
+
+// changeModel is switchTo, with load false for a model the server already
+// holds: following it must not tell the other instances to make way for a
+// swap that is not happening.
+func (a *App) changeModel(ctx context.Context, client provider.Client, name string, pc config.Provider, model provider.ModelInfo, confirmed, load bool) error {
 	style := render.NewStyle(a.screen.Color())
 
 	// In a .nocloud tree a cloud provider is unavailable, not merely confirmed
@@ -169,17 +200,21 @@ func (a *App) switchTo(ctx context.Context, client provider.Client, name string,
 	// From here the swap happens: the other instances make way, then the
 	// weights load, because the load is the eviction they make way for.
 	server := serverKey(client, pc)
-	a.swapTo(ctx, client, server, model, newLimit)
+	if load {
+		a.swapTo(ctx, client, server, model, newLimit)
+	}
 
 	a.client = client
 	a.providerName = name
 	a.providerCfg = pc
 	a.model = model
+	a.modelExplicit = false
 	a.agent.SetClient(client)
 	a.agent.SetModel(model.ID, newLimit, model.MaxOutputTokens)
 	if a.share != nil {
 		a.share.chose(server, model.ID)
 	}
+	a.recordModel()
 	a.agent.SetResumeFromTranscript(fromTranscript)
 
 	a.out(fmt.Sprintf("Now using %s on %s (%s, %s ctx — %s).",
@@ -283,9 +318,9 @@ func tokenCount(n int) string {
 	return fmt.Sprint(n)
 }
 
-// confirmCloudSwitch asks before moving a live session to a cloud provider.
-// model is the model being moved to, or "" when the provider has not been asked
-// because asking would itself be the first contact with it.
+// confirmCloudSwitch asks before moving a live session to a cloud provider,
+// which has not been contacted yet: asking it anything is the first contact.
+// model is the one last used there from this project, or "" for none.
 func (a *App) confirmCloudSwitch(name string, class provider.Class, model string) bool {
 	style := render.NewStyle(a.screen.Color())
 	msgs := a.agent.Messages()
@@ -293,7 +328,7 @@ func (a *App) confirmCloudSwitch(name string, class provider.Class, model string
 	used := a.contextState().Projected
 
 	if model == "" {
-		model = "chosen from " + name + "'s catalogue"
+		model = "none yet; choose one with /model once moved"
 	}
 	lines := []string{
 		"",

@@ -34,7 +34,7 @@ func TestDevcontainerExecutorEndToEnd(t *testing.T) {
 	cfg := &devcontainer.Config{Image: image, WorkspaceFolder: "/workspace"}
 	project := t.TempDir()
 	removeOwn(t, engine, project)
-	dc := NewDevcontainerExecutor(cfg, nil, project, project, worker.Settings{})
+	dc := NewDevcontainerExecutor(cfg, nil, project, project, noSettings)
 
 	dc.mu.Lock()
 	started := dc.cmd != nil
@@ -132,7 +132,7 @@ func TestTeardownLetsTheNextCallStartFresh(t *testing.T) {
 // each phase is named as it starts.
 func TestDevcontainerStartupNamesItsPhases(t *testing.T) {
 	var notes []tool.Phase
-	e := NewDevcontainerExecutor(nil, nil, t.TempDir(), t.TempDir(), worker.Settings{})
+	e := NewDevcontainerExecutor(nil, nil, t.TempDir(), t.TempDir(), noSettings)
 	e.SetProgress(func(p tool.Phase) { notes = append(notes, p) })
 
 	// Configuration that never loaded means no container work began, so no
@@ -163,7 +163,7 @@ func TestDevcontainerStartupNamesItsPhases(t *testing.T) {
 // it reports progress, so the wrapper must pass SetProgress through.
 func TestProgressSurvivesTheTaskWrapper(t *testing.T) {
 	var notes []tool.Phase
-	inner := NewDevcontainerExecutor(nil, nil, t.TempDir(), t.TempDir(), worker.Settings{})
+	inner := NewDevcontainerExecutor(nil, nil, t.TempDir(), t.TempDir(), noSettings)
 	wrapped := agent.NewTaskExecutor(inner)
 
 	pr, ok := tool.Executor(wrapped).(tool.ProgressReporter)
@@ -182,7 +182,7 @@ func TestProgressSurvivesTheTaskWrapper(t *testing.T) {
 // it cannot run while the container is still starting.
 func TestStartupSaysTheTimeoutIsNotRunning(t *testing.T) {
 	var notes []tool.Phase
-	e := NewDevcontainerExecutor(nil, nil, t.TempDir(), t.TempDir(), worker.Settings{})
+	e := NewDevcontainerExecutor(nil, nil, t.TempDir(), t.TempDir(), noSettings)
 	e.SetProgress(func(p tool.Phase) { notes = append(notes, p) })
 	e.report("devcontainer: preparing the container with %s. The command has not started yet, "+
 		"so its timeout is not running.", "docker")
@@ -195,7 +195,7 @@ func TestStartupSaysTheTimeoutIsNotRunning(t *testing.T) {
 func TestDevcontainerProgressIsOptional(t *testing.T) {
 	var _ tool.ProgressReporter = (*DevcontainerExecutor)(nil)
 
-	e := NewDevcontainerExecutor(nil, nil, t.TempDir(), t.TempDir(), worker.Settings{})
+	e := NewDevcontainerExecutor(nil, nil, t.TempDir(), t.TempDir(), noSettings)
 	e.report("devcontainer: starting a container from %s.", "example-image")
 }
 
@@ -248,17 +248,17 @@ func TestContainerIsKeptBetweenSessions(t *testing.T) {
 		return &devcontainer.Config{Image: image, WorkspaceFolder: "/workspace", ContainerEnv: map[string]string{"V": env}}
 	}
 
-	first := NewDevcontainerExecutor(cfg("1"), nil, project, project, worker.Settings{})
+	first := NewDevcontainerExecutor(cfg("1"), nil, project, project, noSettings)
 	bash(t, first, "echo installed > /opt/marker")
 	first.Close()
 
-	second := NewDevcontainerExecutor(cfg("1"), nil, project, project, worker.Settings{})
+	second := NewDevcontainerExecutor(cfg("1"), nil, project, project, noSettings)
 	if out := bash(t, second, "cat /opt/marker 2>&1 || echo missing"); !strings.Contains(out, "installed") {
 		t.Fatalf("the next session lost what the last one put in /opt: %q", out)
 	}
 	second.Close()
 
-	changed := NewDevcontainerExecutor(cfg("2"), nil, project, project, worker.Settings{})
+	changed := NewDevcontainerExecutor(cfg("2"), nil, project, project, noSettings)
 	defer changed.Close()
 	if out := bash(t, changed, "cat /opt/marker 2>&1 || echo missing"); !strings.Contains(out, "missing") {
 		t.Fatalf("a changed configuration reused the old container: %q", out)
@@ -274,7 +274,7 @@ func TestForeignContainerWithTheSameNameIsLeftAlone(t *testing.T) {
 	if out, err := exec.Command(engine, "create", "--name", containerName(project), image, "true").CombinedOutput(); err != nil {
 		t.Fatalf("creating the stand-in container: %v %s", err, out)
 	}
-	e := NewDevcontainerExecutor(&devcontainer.Config{Image: image, WorkspaceFolder: "/workspace"}, nil, project, project, worker.Settings{})
+	e := NewDevcontainerExecutor(&devcontainer.Config{Image: image, WorkspaceFolder: "/workspace"}, nil, project, project, noSettings)
 	defer e.Close()
 	_, err := e.Execute(context.Background(), tool.Request{CallID: "1", Name: "bash", Args: []byte(`{"command":"true"}`)})
 	var unavailable *tool.Unavailable

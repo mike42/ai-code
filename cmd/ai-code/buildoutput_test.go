@@ -11,7 +11,6 @@ import (
 
 	airt "ai-code/internal/runtime"
 	"ai-code/internal/tool"
-	"ai-code/internal/worker"
 )
 
 type phases struct {
@@ -90,7 +89,7 @@ esac
 	for _, fail := range []string{"0", "1"} {
 		t.Setenv("FAIL", fail)
 		var got phases
-		e := NewDevcontainerExecutor(rt.Config, nil, dir, dir, worker.Settings{})
+		e := NewDevcontainerExecutor(rt.Config, nil, dir, dir, noSettings)
 		e.SetProgress(got.add)
 
 		_, err := e.resolveImage(context.Background(), engine)

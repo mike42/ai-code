@@ -58,24 +58,28 @@ func buildClient(name string, p config.Provider) (provider.Client, error) {
 }
 
 // toolSettings are sent to the worker; the remote machine's own configuration is
-// never read.
-func toolSettings(cfg *config.Config, window int) worker.Settings {
-	maxOutput := cfg.Tools.Bash.MaxOutputBytes
-	if maxOutput <= 0 {
-		maxOutput = agent.BudgetFor(window).MaxToolResultBytes()
-	}
-	return worker.Settings{
+// never read. window is read when the settings are built, and, for tools in
+// this process, again each time a command's output is bounded, since the
+// model and so its window may be chosen or changed after the tools exist.
+func toolSettings(cfg *config.Config, window func() int) worker.Settings {
+	s := worker.Settings{
 		BashTimeout:    cfg.Tools.Bash.Timeout.Duration,
-		BashMaxOutput:  maxOutput,
+		BashMaxOutput:  cfg.Tools.Bash.MaxOutputBytes,
 		Shell:          cfg.Tools.Bash.Shell,
 		ReadMaxBytes:   cfg.Tools.Read.MaxBytes,
 		ReadMaxLines:   cfg.Tools.Read.MaxLines,
 		GrepMaxResults: cfg.Tools.Grep.MaxResults,
 	}
+	if s.BashMaxOutput <= 0 {
+		derive := func() int { return agent.BudgetFor(window()).MaxToolResultBytes() }
+		s.BashMaxOutput = derive()
+		s.BashMaxOutputFunc = derive
+	}
+	return s
 }
 
-const modelCacheTTL = 6 * time.Hour
-
+// modelCache is the last catalogue the provider sent, for Tab completion, which
+// must not wait on the network. Nothing that picks a model reads it.
 type modelCache struct {
 	Fetched time.Time            `json:"fetched"`
 	Models  []provider.ModelInfo `json:"models"`
@@ -98,20 +102,20 @@ func sanitise(s string) string {
 	}, s)
 }
 
-func loadModelCache(providerName string) (*modelCache, bool) {
+func loadModelCache(providerName string) *modelCache {
 	path, err := modelCachePath(providerName)
 	if err != nil {
-		return nil, false
+		return nil
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, false
+		return nil
 	}
 	var c modelCache
 	if json.Unmarshal(raw, &c) != nil {
-		return nil, false
+		return nil
 	}
-	return &c, time.Since(c.Fetched) < modelCacheTTL
+	return &c
 }
 
 func saveModelCache(providerName string, models []provider.ModelInfo) {
@@ -129,81 +133,93 @@ func saveModelCache(providerName string, models []provider.ModelInfo) {
 	_ = os.WriteFile(path, raw, 0o600)
 }
 
-func fetchModels(ctx context.Context, c provider.Client, allowCache bool) ([]provider.ModelInfo, error) {
-	if allowCache {
-		if cached, fresh := loadModelCache(c.Name()); fresh && len(cached.Models) > 0 {
-			return cached.Models, nil
-		}
-	}
+// liveModels asks the provider for its catalogue. Every decision about which
+// model to use reads this; the copy it leaves on disk is for Tab completion
+// only, which must not wait on the network.
+func liveModels(ctx context.Context, c provider.Client) ([]provider.ModelInfo, error) {
 	models, err := c.Models(ctx)
 	if err != nil {
-		// Stale cache beats no information: an unreachable server should not
-		// stop work from starting.
-		if cached, _ := loadModelCache(c.Name()); cached != nil && len(cached.Models) > 0 {
-			return cached.Models, nil
-		}
-		return nil, err
+		return nil, fmt.Errorf("%s did not list its models: %w", c.Name(), err)
 	}
 	saveModelCache(c.Name(), models)
 	return models, nil
 }
 
-// resolveModel decides which model to use, in order:
-//
-//  1. --model on the command line
-//  2. default_model for the provider
-//  3. whatever the server currently has resident (single-slot servers)
-//  4. the first tool-capable model it offers
-func resolveModel(ctx context.Context, c provider.Client, requested, configured string) (provider.ModelInfo, error) {
-	models, err := fetchModels(ctx, c, true)
-	if err != nil {
-		if requested != "" || configured != "" {
-			// A named model still works without a catalogue; the window stays
-			// unknown until a response reports usage.
-			name := requested
-			if name == "" {
-				name = configured
-			}
-			return provider.ModelInfo{ID: name, SupportsTools: true}, nil
-		}
-		return provider.ModelInfo{}, fmt.Errorf(
-			"could not reach %s to list models: %w", c.Name(), err)
-	}
+// modelChoice is the model a session uses and why.
+type modelChoice struct {
+	Model provider.ModelInfo
+	// Why says where the choice came from, for the line announcing it.
+	Why string
+	// Explicit marks a model the user named. Only that may replace one the
+	// server has loaded.
+	Explicit bool
+}
 
+// chooseModel picks the model from what is true now, never from a default:
+//
+//  1. the one the user named (--model, AI_CODE_MODEL)
+//  2. the one the server has loaded
+//  3. with nothing loaded, the one last used in this project
+//
+// Anything else is an error that says so; there is no fallback, because a
+// guessed model is a model swap on the user's server.
+func chooseModel(ctx context.Context, c provider.Client, requested, previous string) (modelChoice, error) {
+	models, err := liveModels(ctx, c)
+	if err != nil {
+		return modelChoice{}, err
+	}
 	byID := map[string]provider.ModelInfo{}
 	for _, m := range models {
 		byID[m.ID] = m
 	}
 
-	for _, want := range []string{requested, configured} {
-		if want == "" {
-			continue
+	if requested != "" {
+		m, ok := byID[requested]
+		if !ok {
+			return modelChoice{}, fmt.Errorf("model %q is not available on %s.\n\nAvailable models:\n%s",
+				requested, c.Name(), formatModelList(models, 15))
 		}
-		if m, ok := byID[want]; ok {
-			return m, nil
-		}
-		return provider.ModelInfo{}, fmt.Errorf(
-			"model %q is not available on %s.\n\nAvailable models:\n%s",
-			want, c.Name(), formatModelList(models, 15))
+		return modelChoice{Model: m, Why: "named with --model", Explicit: true}, nil
 	}
 
-	if intro, ok := c.(provider.Introspector); ok {
-		if h, err := intro.Health(ctx); err == nil && h.ModelLoaded != "" {
-			if m, ok := byID[h.ModelLoaded]; ok {
-				return m, nil
+	intro, ok := c.(provider.Introspector)
+	if !ok {
+		if m, ok := byID[previous]; ok && previous != "" {
+			return modelChoice{Model: m, Why: "last used here"}, nil
+		}
+		return modelChoice{}, noModel("%s cannot say which model is loaded and none was used here before: "+
+			"choose one with /model NAME", c.Name())
+	}
+
+	h, err := intro.Health(ctx)
+	if err != nil {
+		return modelChoice{}, fmt.Errorf("could not ask %s which model is loaded: %w", c.Name(), err)
+	}
+	var loaded []provider.ModelInfo
+	for _, id := range h.Loaded {
+		if m, ok := byID[id]; ok {
+			loaded = append(loaded, m)
+		}
+	}
+	switch {
+	case len(loaded) == 1:
+		return modelChoice{Model: loaded[0], Why: "loaded on " + c.Name()}, nil
+	case len(loaded) > 1:
+		names := make([]string, len(loaded))
+		for i, m := range loaded {
+			if m.ID == previous {
+				return modelChoice{Model: m, Why: "loaded on " + c.Name() + ", last used here"}, nil
 			}
+			names[i] = m.ID
 		}
+		return modelChoice{}, noModel("%s has %s loaded: choose one with /model NAME",
+			c.Name(), joinAnd(names))
 	}
-
-	for _, m := range models {
-		if m.SupportsTools {
-			return m, nil
-		}
+	if m, ok := byID[previous]; ok && previous != "" {
+		return modelChoice{Model: m, Why: "last used here; nothing is loaded on " + c.Name()}, nil
 	}
-	if len(models) > 0 {
-		return models[0], nil
-	}
-	return provider.ModelInfo{}, fmt.Errorf("%s offers no models", c.Name())
+	return modelChoice{}, noModel("nothing is loaded on %s and no model was used here before: "+
+		"choose one with /model NAME", c.Name())
 }
 
 func formatModelList(models []provider.ModelInfo, limit int) string {

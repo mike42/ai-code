@@ -11,6 +11,8 @@ import (
 	"ai-code/internal/worker"
 )
 
+func noSettings() worker.Settings { return worker.Settings{} }
+
 func TestPlatformOf(t *testing.T) {
 	for in, want := range map[string]string{
 		"Linux x86_64\n": "linux/amd64",
@@ -47,7 +49,7 @@ func TestSSHArgvKeepsTheHostOutOfOptionPosition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := NewSSHExecutor(rt, "/cfg", worker.Settings{})
+	e := NewSSHExecutor(rt, "/cfg", noSettings)
 	got := strings.Join(e.sshArgv("true"), " ")
 	want := "-T -o BatchMode=yes -o ClearAllForwardings=yes -o ForwardAgent=no -o ForwardX11=no " +
 		"-o PermitLocalCommand=no -F /cfg -p 2222 -l agent -- vm sh -c 'true'"

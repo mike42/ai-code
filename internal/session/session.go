@@ -35,6 +35,8 @@ const (
 	// non-destructive counterpart of EntryCompaction, which replay must not
 	// treat as a reset.
 	EntryCheckpoint EntryType = "checkpoint"
+	// EntryModel records the model the session moved to, and on which provider.
+	EntryModel EntryType = "model"
 )
 
 type Entry struct {
@@ -45,6 +47,9 @@ type Entry struct {
 	Meta    *Meta             `json:"meta,omitempty"`
 	Note    string            `json:"note,omitempty"`
 	Input   string            `json:"input,omitempty"`
+
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
 
 	// Summary is what a compaction replaced, so the pre-compaction history stays
 	// on disk.
@@ -364,11 +369,12 @@ func List(project string) ([]Info, error) {
 			continue
 		}
 
+		model, _ := lastModel(items, meta, "")
 		info := Info{
 			ID:       strings.TrimSuffix(de.Name(), ".jsonl"),
 			Path:     path,
 			Project:  meta.Project,
-			Model:    meta.Model,
+			Model:    model,
 			Started:  meta.Started,
 			Modified: fi.ModTime(),
 			Size:     fi.Size(),
@@ -440,6 +446,46 @@ func PreviousInputs(project string) ([]string, error) {
 		}
 	}
 	return nil, nil
+}
+
+// lastModel reports the model a session was last on, and the last model that
+// answered in it, counting only provider when one is named.
+func lastModel(entries []Entry, meta Meta, on string) (current, answered string) {
+	if on == "" || meta.Provider == on {
+		current = meta.Model
+	}
+	for _, e := range entries {
+		switch {
+		case e.Type == EntryModel && e.Model != "":
+			current = ""
+			if on == "" || e.Provider == on {
+				current = e.Model
+			}
+		case e.Type == EntryMessage && e.Message != nil && e.Message.Role == provider.RoleAssistant && current != "":
+			answered = current
+		}
+	}
+	return current, answered
+}
+
+// PreviousModel is the last model that answered in the newest session for
+// project that has one, on provider on, or "". A session about to start has
+// had no answers, so it is never the source.
+func PreviousModel(project, on string) string {
+	list, err := List(project)
+	if err != nil {
+		return ""
+	}
+	for _, info := range list {
+		entries, meta, err := readFile(info.Path)
+		if err != nil || meta.Project != project {
+			continue
+		}
+		if _, answered := lastModel(entries, meta, on); answered != "" {
+			return answered
+		}
+	}
+	return ""
 }
 
 func firstLine(s string, max int) string {

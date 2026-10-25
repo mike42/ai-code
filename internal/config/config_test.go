@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -50,7 +51,6 @@ kind = "lemonade"
 base_url = "https://ai.example.internal/api/v1"
 class = "on-premises"
 tls_insecure = true
-default_model = "Qwen3.6-27B"
 `,
 		`
 default_mode = "research"
@@ -75,8 +75,8 @@ default_mode = "research"
 }
 
 func TestProjectLayerMergesIntoExistingProvider(t *testing.T) {
-	// A project overriding just the model must keep the URL, class and TLS
-	// settings from the user config.
+	// A project overriding one key must keep the URL, class and TLS settings
+	// from the user config.
 	cfg := setupLayers(t,
 		`
 [provider.home]
@@ -84,16 +84,16 @@ kind = "lemonade"
 base_url = "https://ai.example.internal/api/v1"
 class = "on-premises"
 tls_insecure = true
-default_model = "Qwen3.6-27B"
+timeout = "5s"
 `,
 		`
 [provider.home]
-default_model = "Qwen3.8-27B-Coder"
+timeout = "9s"
 `)
 
 	p := cfg.Provider["home"]
-	if p.DefaultModel != "Qwen3.8-27B-Coder" {
-		t.Errorf("default_model = %q, want the project override", p.DefaultModel)
+	if p.Timeout.Duration != 9*time.Second {
+		t.Errorf("timeout = %v, want the project override", p.Timeout.Duration)
 	}
 	if p.BaseURL != "https://ai.example.internal/api/v1" {
 		t.Errorf("base_url = %q, want it preserved from the user layer", p.BaseURL)
@@ -103,6 +103,28 @@ default_model = "Qwen3.8-27B-Coder"
 	}
 	if !p.TLSInsecure {
 		t.Error("tls_insecure was lost when the project layer overrode one key")
+	}
+}
+
+// There is no default model: the loaded one, or the one typed, is used. A file
+// that still names one is refused rather than ignored, at either layer.
+func TestDefaultModelIsRefused(t *testing.T) {
+	for _, layer := range []string{"user", "project"} {
+		t.Run(layer, func(t *testing.T) {
+			userDir, projDir := t.TempDir(), t.TempDir()
+			t.Setenv("AI_CODE_CONFIG_DIR", userDir)
+			body := "[provider.home]\nkind = \"lemonade\"\nbase_url = \"https://ai.example.internal\"\n" +
+				"class = \"on-premises\"\ndefault_model = \"some-model\"\n"
+			if layer == "user" {
+				write(t, userDir, "config.toml", body)
+			} else {
+				write(t, projDir, ".ai-code/config.toml", body)
+			}
+			_, err := Load(projDir)
+			if err == nil || !strings.Contains(err.Error(), "provider.home.default_model is not supported") {
+				t.Errorf("Load = %v, want default_model refused by name", err)
+			}
+		})
 	}
 }
 

@@ -11,7 +11,6 @@ import (
 	"ai-code/internal/devcontainer"
 	"ai-code/internal/runtime"
 	"ai-code/internal/tool"
-	"ai-code/internal/worker"
 )
 
 // Unit tests over argv cannot prove the image really builds, the daemon starts
@@ -56,7 +55,7 @@ func TestDockerfileDevcontainerRunsTools(t *testing.T) {
 	requireWorker(t)
 
 	removeOwn(t, engine, example)
-	dc := NewDevcontainerExecutor(rt.Config, nil, example, example, worker.Settings{})
+	dc := NewDevcontainerExecutor(rt.Config, nil, example, example, noSettings)
 	defer dc.Close()
 
 	// Build and container start are deferred to the first tool call, never to

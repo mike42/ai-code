@@ -21,7 +21,7 @@ import (
 type SSHExecutor struct {
 	rt        *runtime.Runtime
 	sshConfig string
-	settings  worker.Settings
+	settings  func() worker.Settings
 	catalog   *tool.LocalExecutor
 	progress  tool.Progress
 
@@ -40,8 +40,8 @@ type SSHExecutor struct {
 	answered bool
 }
 
-func NewSSHExecutor(rt *runtime.Runtime, sshConfig string, settings worker.Settings) *SSHExecutor {
-	return &SSHExecutor{rt: rt, sshConfig: sshConfig, settings: settings, catalog: worker.Tools(settings, "")}
+func NewSSHExecutor(rt *runtime.Runtime, sshConfig string, settings func() worker.Settings) *SSHExecutor {
+	return &SSHExecutor{rt: rt, sshConfig: sshConfig, settings: settings, catalog: worker.Tools(settings(), "")}
 }
 
 func (e *SSHExecutor) SetProgress(p tool.Progress) { e.progress = p }
@@ -283,7 +283,7 @@ func (e *SSHExecutor) start(ctx context.Context) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("starting ssh: %w", err)
 	}
-	client, err := worker.NewClient(stdin, stdout, e.settings)
+	client, err := worker.NewClient(stdin, stdout, e.settings())
 	if err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()

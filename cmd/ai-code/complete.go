@@ -71,8 +71,8 @@ func (a *App) modelCandidates(prefix string) []string {
 	if a.cloudForbidden() && a.client.Class() == provider.ClassCloud {
 		return nil
 	}
-	// Tab never reaches the network: only the on-disk catalogue is read, expiry ignored.
-	cached, _ := loadModelCache(a.client.Name())
+	// Tab never reaches the network: only the on-disk catalogue is read.
+	cached := loadModelCache(a.client.Name())
 	if cached == nil {
 		return nil
 	}

@@ -392,3 +392,47 @@ func TestPreviousInputsComeFromTheLastSessionThatHadAny(t *testing.T) {
 		t.Errorf("PreviousInputs for a new project = %q, %v; want nothing", got, err)
 	}
 }
+
+// The model to bring back when nothing is loaded is one that answered here,
+// on the same provider: not one a session moved to and never used, and not a
+// newer session that never got as far as a reply.
+func TestPreviousModelIsTheLastOneThatAnswered(t *testing.T) {
+	tempRoot(t)
+	base := time.Now().Add(-time.Hour)
+	n := 0
+	mk := func(project string, entries ...Entry) {
+		t.Helper()
+		s, err := Create(Meta{Project: project, Provider: "home"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			_ = s.Append(e)
+		}
+		s.Close()
+		n++
+		mod := base.Add(time.Duration(n) * time.Minute)
+		if err := os.Chtimes(s.Path(), mod, mod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	moveTo := func(prov, model string) Entry { return Entry{Type: EntryModel, Provider: prov, Model: model} }
+	answer := Entry{Type: EntryMessage, Message: &provider.Message{Role: provider.RoleAssistant, Content: "ok"}}
+	ask := Entry{Type: EntryMessage, Message: &provider.Message{Role: provider.RoleUser, Content: "hi"}}
+
+	mk("/p", moveTo("home", "old"), ask, answer)
+	mk("/p", moveTo("home", "answered"), ask, answer, moveTo("home", "never-used"))
+	mk("/p", moveTo("cloud", "elsewhere"), ask, answer)
+	mk("/p", moveTo("home", "no-reply"), ask)
+	mk("/p") // the session just created
+
+	if got := PreviousModel("/p", "home"); got != "answered" {
+		t.Errorf("PreviousModel(home) = %q, want the last model that answered on home", got)
+	}
+	if got := PreviousModel("/p", "cloud"); got != "elsewhere" {
+		t.Errorf("PreviousModel(cloud) = %q, want the one used there", got)
+	}
+	if got := PreviousModel("/new", "home"); got != "" {
+		t.Errorf("PreviousModel for a new project = %q, want nothing", got)
+	}
+}
