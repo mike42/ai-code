@@ -14,6 +14,7 @@ import (
 
 	"ai-code/internal/agent"
 	"ai-code/internal/config"
+	"ai-code/internal/mcp"
 	"ai-code/internal/prompt"
 	"ai-code/internal/provider"
 	"ai-code/internal/render"
@@ -118,6 +119,17 @@ type App struct {
 
 	// flags is what this process was launched with, for /restart.
 	flags *flags
+
+	// mcp runs the session's MCP servers.
+	mcp *mcp.Manager
+	// mcpHolding: a request is waiting for servers to finish starting.
+	mcpHolding atomic.Bool
+	// mcpSent: a request has gone out, so the server has a prefix cached.
+	mcpSent atomic.Bool
+	// mcpAtLaunch names servers --mcp started, whose first report carries no
+	// re-read cost: they are part of the session's first tool list.
+	mcpMu       sync.Mutex
+	mcpAtLaunch map[string]bool
 
 	// share is this instance's part in taking turns on a shared model server;
 	// nil when it runs alone.
@@ -447,7 +459,7 @@ func (a *App) steerSubmit(text string) {
 		// A slash command runs at the turn boundary, where steering is folded in.
 		if strings.HasPrefix(strings.TrimSpace(text), "/") {
 			// Only output drawing: no conversation change, so no need to wait.
-			if renderOnlyCommand(text) {
+			if renderOnlyCommand(text) || a.mcpImmediate(strings.TrimSpace(text)) {
 				if err := a.command(context.Background(), text); err != nil {
 					a.reportError(err)
 				}
@@ -714,6 +726,7 @@ func init() {
 		{"model", "Show or switch the model", (*App).cmdModel},
 		{"provider", "Show or switch the provider", (*App).cmdProvider},
 		{"mode", "Show or switch the mode", (*App).cmdMode},
+		{"mcp", "List, add, remove, start and stop MCP servers", (*App).cmdMCP},
 		{"compact", "Summarise the session to free context", (*App).cmdCompact},
 		{"consult", "Ask the model to argue against the work so far", (*App).cmdConsult},
 		{"think", "Show or change how hard the model thinks", (*App).cmdThink},
@@ -996,6 +1009,9 @@ func (a *App) restartArgv(binary string) []string {
 		if a.flags.noStatus {
 			argv = append(argv, "--no-status")
 		}
+	}
+	if a.mcp != nil {
+		argv = append(argv, a.mcp.RestartArgs()...)
 	}
 	return argv
 }

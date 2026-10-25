@@ -65,8 +65,6 @@ type Agent struct {
 	charsPerToken float64
 	// requestChangedAt is the transcript length when the request prefix last moved.
 	requestChangedAt int
-	// toolChars caches the size of the tool definitions, constant per session.
-	toolChars int
 	// roundFrom is where the round being measured began; largestRound is the
 	// most one round of replies and tool results has added in this session.
 	roundFrom    int
@@ -106,6 +104,8 @@ type Agent struct {
 
 	// atBoundary is consulted between iterations, where the message list is complete.
 	atBoundary func(context.Context) bool
+	// beforeRequest runs before the tool list is read for each request.
+	beforeRequest func(context.Context) error
 }
 
 func New(client provider.Client, model string, exec tool.Executor, sink Sink, opts Options) *Agent {
@@ -188,13 +188,16 @@ func charsOf(msgs []provider.Message) int {
 // transcriptChars is the size of the whole conversation, sent or not.
 func (a *Agent) transcriptChars() int { return a.fixedChars() + charsOf(a.messages) }
 
+// toolDefChars is measured each time: MCP servers add and remove tools
+// during a session.
 func (a *Agent) toolDefChars() int {
-	if a.toolChars == 0 && a.exec != nil {
+	n := 0
+	if a.exec != nil {
 		for _, d := range a.exec.Definitions() {
-			a.toolChars += len(d.Name) + len(d.Description) + len(d.Schema) + messageOverheadChars
+			n += len(d.Name) + len(d.Description) + len(d.Schema) + messageOverheadChars
 		}
 	}
-	return a.toolChars
+	return n
 }
 
 func (a *Agent) Messages() []provider.Message { return a.messages }
@@ -245,6 +248,14 @@ func (a *Agent) Model() string { return a.model }
 // the tool results and before the next request. That is the only point at
 // which a stop leaves a well-formed message list behind.
 func (a *Agent) SetTurnBoundary(fn func(context.Context) bool) { a.atBoundary = fn }
+
+// SetBeforeRequest installs fn to run before each request reads the tool
+// list; an error from it ends the request.
+func (a *Agent) SetBeforeRequest(fn func(context.Context) error) { a.beforeRequest = fn }
+
+// RoughTokens sizes text at the default ratio, for figures shown off the
+// agent's goroutine, where the calibrated ratio cannot be read safely.
+func RoughTokens(chars int) int { return int(float64(chars) / defaultCharsPerToken) }
 
 // SetModel points the agent at a different model. The backend's own output
 // limit travels with it: it is a property of the model being swapped to.
@@ -357,6 +368,15 @@ func (a *Agent) Run(ctx context.Context, userInput string) error {
 	for turn := 1; a.opts.MaxIterations <= 0 || turn <= a.opts.MaxIterations; turn++ {
 		if err := ctx.Err(); err != nil {
 			return a.finishInterrupted()
+		}
+		// Settled before the guard measures the request, tools included.
+		if a.beforeRequest != nil {
+			if err := a.beforeRequest(ctx); err != nil {
+				if ctx.Err() != nil {
+					return a.finishInterrupted()
+				}
+				return err
+			}
 		}
 		if err := a.guardContext(ctx); err != nil {
 			return err
@@ -494,6 +514,11 @@ func (a *Agent) Run(ctx context.Context, userInput string) error {
 // reports that the model emitted thinking, which collapsed mode never shows,
 // so a turn that only reasoned is distinguishable from one that did nothing.
 func (a *Agent) streamTurn(ctx context.Context, turn int) (msg provider.Message, stop provider.StopReason, usageKnown, reasoned bool, err error) {
+	if a.beforeRequest != nil {
+		if err := a.beforeRequest(ctx); err != nil {
+			return provider.Message{}, "", false, false, err
+		}
+	}
 	// What goes on the wire is decided here rather than held in a.messages:
 	// the window belongs to the loaded model, the transcript to the session.
 	sending := a.messagesToSend()

@@ -36,3 +36,6 @@ func killProcessGroup(c *exec.Cmd, graceful bool) {
 // terminal sends to ai-code's group -- Ctrl-C in a run that left the terminal
 // in its normal mode -- does not also reach it.
 func OwnProcessGroup(c *exec.Cmd) { setProcessGroup(c) }
+
+// TerminateProcessGroup asks c's process group to exit.
+func TerminateProcessGroup(c *exec.Cmd) { killProcessGroup(c, true) }

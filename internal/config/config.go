@@ -29,6 +29,9 @@ type Config struct {
 	Tools    Tools               `toml:"tools"`
 	Provider map[string]Provider `toml:"provider"`
 	Mode     map[string]Mode     `toml:"mode"`
+	// MCP servers by name. Unlike the other maps, each name takes its whole
+	// entry from the highest layer that defines it; fields are never combined.
+	MCP map[string]MCPServer `toml:"mcp"`
 
 	// Sources records which files contributed, for `ai-code config`.
 	Sources []string `toml:"-"`
@@ -144,6 +147,20 @@ type Provider struct {
 
 // Mode is prompt steering and nothing else: every tool remains available in
 // every mode, because gathering information legitimately involves commands.
+// MCPServer is a binary to run or a URL to connect to.
+type MCPServer struct {
+	URL     string            `toml:"url"`
+	Headers map[string]string `toml:"headers"`
+	Binary  string            `toml:"binary"`
+	Args    []string          `toml:"args"`
+
+	// Source is "global" or "local"; Path is the file it came from; Hides is
+	// the source of a lower entry of the same name that this one replaces.
+	Source string `toml:"-"`
+	Path   string `toml:"-"`
+	Hides  string `toml:"-"`
+}
+
 type Mode struct {
 	Description string `toml:"description"`
 	Prompt      string `toml:"prompt"`
@@ -241,7 +258,11 @@ func Load(projectDir string) (*Config, error) {
 	cfg := Defaults()
 
 	for _, path := range candidatePaths(projectDir) {
-		if err := overlayFile(&cfg, path); err != nil {
+		source := "local"
+		if path == UserConfigPath() {
+			source = "global"
+		}
+		if err := overlayFile(&cfg, path, source); err != nil {
 			return nil, err
 		}
 	}
@@ -309,7 +330,7 @@ func candidatePaths(projectDir string) []string {
 // overlayFile merges one file over cfg. BurntSushi/toml assigns only the keys
 // present in the document, so absent keys retain the lower layer's value --
 // except maps, where Provider and Mode are merged field by field.
-func overlayFile(cfg *Config, path string) error {
+func overlayFile(cfg *Config, path, source string) error {
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -320,8 +341,10 @@ func overlayFile(cfg *Config, path string) error {
 
 	existingProviders := cfg.Provider
 	existingModes := cfg.Mode
+	existingMCP := cfg.MCP
 	cfg.Provider = map[string]Provider{}
 	cfg.Mode = map[string]Mode{}
+	cfg.MCP = nil
 
 	if _, err := toml.Decode(string(raw), cfg); err != nil {
 		return fmt.Errorf("parsing %s: %w", path, err)
@@ -329,6 +352,18 @@ func overlayFile(cfg *Config, path string) error {
 
 	cfg.Provider = mergeProviders(existingProviders, cfg.Provider)
 	cfg.Mode = mergeModes(existingModes, cfg.Mode)
+	layer := cfg.MCP
+	cfg.MCP = existingMCP
+	for name, m := range layer {
+		if cfg.MCP == nil {
+			cfg.MCP = map[string]MCPServer{}
+		}
+		m.Source, m.Path = source, path
+		if lower, ok := cfg.MCP[name]; ok {
+			m.Hides = lower.Source
+		}
+		cfg.MCP[name] = m
+	}
 	cfg.Sources = append(cfg.Sources, path)
 	return nil
 }
@@ -447,6 +482,11 @@ func overlayEnv(cfg *Config) error {
 }
 
 func (c *Config) Validate() error {
+	for name, m := range c.MCP {
+		if err := ValidateMCP(name, m); err != nil {
+			return fmt.Errorf("%s: %w", m.Path, err)
+		}
+	}
 	if len(c.Provider) == 0 {
 		return nil // Reported with better guidance at the point of use.
 	}

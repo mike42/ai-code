@@ -13,3 +13,6 @@ func killProcessGroup(c *exec.Cmd, graceful bool) {
 		_ = c.Process.Kill()
 	}
 }
+
+// TerminateProcessGroup ends c; Windows has no signal to ask politely.
+func TerminateProcessGroup(c *exec.Cmd) { killProcessGroup(c, true) }

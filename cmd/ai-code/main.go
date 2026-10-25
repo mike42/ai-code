@@ -17,6 +17,7 @@ import (
 	"ai-code/internal/config"
 	"ai-code/internal/coord"
 	"ai-code/internal/hosttool"
+	"ai-code/internal/mcp"
 	"ai-code/internal/prompt"
 	"ai-code/internal/provider"
 	"ai-code/internal/render"
@@ -50,6 +51,8 @@ type flags struct {
 	limits       timeLimits
 	appendPrompt string
 	noCloud      bool
+	// mcp is each --mcp value: NAME, or NAME=VALUE.
+	mcp []string
 	args         []string
 }
 
@@ -186,6 +189,10 @@ Flags:
       --no-cloud       Use on-premises providers only, as a .nocloud file does. With
                        --runtime ssh://, a .nocloud in the remote working directory or
                        any directory above it is checked before anything is sent
+      --mcp NAME       Start the MCP server NAME from config; repeatable
+      --mcp NAME=VALUE Start an MCP server for this session only, overriding any
+                       config of that name. VALUE is an http(s):// URL, or a binary
+                       and its arguments, split like shell words and run without a shell
       --append-system-prompt TEXT  Add TEXT to the system prompt, e.g. who this agent is
       --state-dir DIR  Keep this session's transcript, todo list and status
                        updates in DIR instead of under the data directory
@@ -266,6 +273,11 @@ func parseFlags(args []string) (*flags, error) {
 			f.noCloud = true
 		case "--append-system-prompt":
 			f.appendPrompt, err = next()
+		case "--mcp":
+			var v string
+			if v, err = next(); err == nil {
+				f.mcp = append(f.mcp, v)
+			}
 		case "--enable-tools", "--disable-tools":
 			var v string
 			if v, err = next(); err == nil {
@@ -293,6 +305,10 @@ func parseFlags(args []string) (*flags, error) {
 
 // startSession builds everything and hands off to the REPL or a single run.
 func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, started time.Time) error {
+	mcpSet, err := parseMCPFlags(f.mcp, cfg)
+	if err != nil {
+		return err
+	}
 	providerName := f.provider
 	if providerName == "" {
 		providerName = cfg.DefaultProvider
@@ -458,6 +474,18 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 		return err
 	}
 	exe = tool.Filter(exe, choice.allow)
+
+	// MCP servers run where bash runs, and their tools join the chain here, so
+	// sub-agents see them too.
+	mcpOff := mcpUnsupported(rt)
+	if mcpOff != "" && len(mcpSet.start) > 0 {
+		return errors.New("--mcp: " + mcpOff)
+	}
+	mcpMgr := mcp.NewManager(mcpResolver(cwd, mcpSet.cli), os.Environ())
+	mcpMgr.SetUnsupported(mcpOff)
+	defer mcpMgr.Close()
+	exe = mcp.Wrap(exe, mcpMgr)
+
 	workspace := cwd
 	sessionProject := projectRoot
 	if rt.Kind == runtime.KindSSH {
@@ -502,6 +530,21 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 		exe = hosttool.WithImages(exe, f.imageModel, func(ctx context.Context) (provider.ImageGenerator, error) {
 			return app.imageGenerator(ctx)
 		})
+	}
+
+	// --mcp servers start now, in the background; the first request waits for
+	// them, typing does not.
+	reserved := []string{"task"}
+	for _, d := range exe.Definitions() {
+		reserved = append(reserved, d.Name)
+	}
+	mcpMgr.SetReserved(reserved)
+	mcpAtLaunch := map[string]bool{}
+	for _, name := range mcpSet.start {
+		if err := mcpMgr.Start(name); err != nil {
+			return err
+		}
+		mcpAtLaunch[name] = true
 	}
 
 	// Non-interactive output consumes the same event stream as the terminal.
@@ -563,6 +606,8 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 		gate:           gate,
 		rt:             rt,
 		flags:          f,
+		mcp:            mcpMgr,
+		mcpAtLaunch:    mcpAtLaunch,
 	}
 	gate.found = app.remoteNoCloud
 
@@ -626,6 +671,8 @@ func startSession(f *flags, cfg *config.Config, cwd string, nocloud bool, starte
 	// The loop boundary is the only place a long agentic run can be stopped
 	// from outside.
 	app.agent.SetTurnBoundary(app.atBoundary)
+	app.agent.SetBeforeRequest(app.mcpSettle)
+	mcpMgr.SetReporter(app.mcpReport)
 	if app.share != nil {
 		go app.answerSwaps(ctx)
 	}
